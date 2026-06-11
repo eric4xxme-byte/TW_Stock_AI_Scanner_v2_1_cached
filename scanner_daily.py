@@ -69,6 +69,21 @@ FALLBACK_CANDIDATES = [
 ]
 
 
+# 上櫃備援清單：只作為上櫃來源測試失敗時的輔助候選。
+FALLBACK_OTC_CANDIDATES = [
+    {"代號": "8021", "名稱": "尖點", "產業": "電子零組件業", "市場": "上櫃"},
+    {"代號": "5347", "名稱": "世界", "產業": "半導體業", "市場": "上櫃"},
+    {"代號": "6488", "名稱": "環球晶", "產業": "半導體業", "市場": "上櫃"},
+    {"代號": "3260", "名稱": "威剛", "產業": "電子通路業", "市場": "上櫃"},
+    {"代號": "3293", "名稱": "鈊象", "產業": "文化創意業", "市場": "上櫃"},
+    {"代號": "6147", "名稱": "頎邦", "產業": "半導體業", "市場": "上櫃"},
+    {"代號": "6244", "名稱": "茂迪", "產業": "光電業", "市場": "上櫃"},
+    {"代號": "3105", "名稱": "穩懋", "產業": "半導體業", "市場": "上櫃"},
+    {"代號": "8069", "名稱": "元太", "產業": "光電業", "市場": "上櫃"},
+    {"代號": "6187", "名稱": "萬潤", "產業": "其他電子業", "市場": "上櫃"},
+]
+
+
 def now_tw() -> datetime:
     return datetime.now(TW_TZ)
 
@@ -111,7 +126,73 @@ def request_json(url: str, timeout: int = 15) -> Optional[Any]:
         return None
 
 
-def fetch_twse_stock_day_all_openapi(limit: int) -> Tuple[List[Dict[str, str]], str]:
+
+
+def roc_date_string(day) -> str:
+    """轉成櫃買常見民國日期格式，例如 113/09/03。"""
+    return f"{day.year - 1911}/{day.month:02d}/{day.day:02d}"
+
+
+def pick_value(row: Dict[str, Any], keywords: List[str]) -> Any:
+    """從不同 OpenAPI 欄位名稱中找出最可能的值。"""
+    lower_items = [(str(k), str(k).lower(), v) for k, v in row.items()]
+    for key, key_lower, value in lower_items:
+        for kw in keywords:
+            kw_lower = kw.lower()
+            if kw in key or kw_lower in key_lower:
+                return value
+    return None
+
+
+def parse_market_rows(data: Any, market: str, limit: int) -> List[Dict[str, Any]]:
+    """解析上市 / 上櫃 OpenAPI 回傳，輸出統一格式。"""
+    if not isinstance(data, list) or not data:
+        return []
+
+    rows: List[Dict[str, Any]] = []
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+
+        code = (
+            pick_value(row, ["證券代號", "代號", "SecuritiesCompanyCode", "Code", "code", "stock_id"])
+            or row.get("證券代號")
+        )
+        name = (
+            pick_value(row, ["證券名稱", "名稱", "CompanyName", "Name", "name", "stock_name"])
+            or code
+        )
+        money = pick_value(row, ["成交金額", "TradeValue", "trade_value", "Trading_money", "Amount"])
+        volume = pick_value(row, ["成交股數", "成交股", "TradeVolume", "trade_volume", "Trading_Volume", "Volume"])
+        close = pick_value(row, ["收盤價", "收盤", "Close", "ClosingPrice", "close"])
+
+        if code is None:
+            continue
+        code = normalize_stock_id(code)
+        if not re.match(r"^\d{4}$", code):
+            continue
+
+        money_num = clean_number(money)
+        close_num = clean_number(close)
+        volume_num = clean_number(volume)
+        if money_num <= 0 and close_num > 0 and volume_num > 0:
+            money_num = close_num * volume_num
+
+        rows.append(
+            {
+                "代號": code,
+                "名稱": str(name).strip() if name else code,
+                "產業": "未知",
+                "市場": market,
+                "成交金額": money_num,
+                "收盤價來源": close_num,
+            }
+        )
+
+    rows = sorted(rows, key=lambda x: x.get("成交金額", 0), reverse=True)
+    return rows[:limit]
+
+def fetch_twse_stock_day_all_openapi(limit: int) -> Tuple[List[Dict[str, Any]], str]:
     """抓證交所 OpenAPI 上市個股日成交資訊。"""
     urls = [
         "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
@@ -121,59 +202,78 @@ def fetch_twse_stock_day_all_openapi(limit: int) -> Tuple[List[Dict[str, str]], 
 
     for url in urls:
         data = request_json(url, timeout=15)
-        if not isinstance(data, list) or not data:
-            continue
-
-        rows = []
-        for row in data:
-            if not isinstance(row, dict):
-                continue
-            # OpenAPI / open_data 欄位有時是中文，有時是英文代稱，這裡都支援。
-            code = row.get("證券代號") or row.get("Code") or row.get("code") or row.get("stock_id")
-            name = row.get("證券名稱") or row.get("Name") or row.get("name") or row.get("stock_name")
-            money = (
-                row.get("成交金額")
-                or row.get("TradeValue")
-                or row.get("trade_value")
-                or row.get("Trading_money")
-            )
-            close = row.get("收盤價") or row.get("ClosingPrice") or row.get("close")
-
-            if code is None:
-                continue
-            code = normalize_stock_id(code)
-            if not re.match(r"^\d{4}$", code):
-                continue
-
-            rows.append(
-                {
-                    "代號": code,
-                    "名稱": str(name).strip() if name else code,
-                    "產業": "未知",
-                    "成交金額": clean_number(money),
-                    "收盤價來源": clean_number(close),
-                }
-            )
-
+        rows = parse_market_rows(data, market="上市", limit=limit)
         if rows:
-            rows = sorted(rows, key=lambda x: x["成交金額"], reverse=True)
             return rows[:limit], "證交所上市成交金額排行（STOCK_DAY_ALL）"
 
     return [], "證交所 STOCK_DAY_ALL 抓取失敗"
 
 
+def fetch_tpex_mainboard_quotes(limit: int) -> Tuple[List[Dict[str, Any]], str]:
+    """抓櫃買中心 OpenAPI 上櫃股票收盤行情。
+
+    優先使用不需日期的 tpex_mainboard_quotes；若失敗，再用每日收盤行情日期格式往前找。
+    """
+    urls = [
+        "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes",
+    ]
+
+    for url in urls:
+        data = request_json(url, timeout=15)
+        rows = parse_market_rows(data, market="上櫃", limit=limit)
+        if rows:
+            return rows[:limit], "櫃買中心上櫃成交金額排行（tpex_mainboard_quotes）"
+
+    # 日期版 fallback：往前找最近 10 天，避開假日與資料尚未更新。
+    today = now_tw().date()
+    for i in range(0, 10):
+        d = roc_date_string(today - timedelta(days=i))
+        url = f"https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes?l=zh-tw&d={d}&s=0,asc,0"
+        data = request_json(url, timeout=15)
+        rows = parse_market_rows(data, market="上櫃", limit=limit)
+        if rows:
+            return rows[:limit], f"櫃買中心上櫃成交金額排行（日收盤行情 {d}）"
+
+    return [], "櫃買中心上櫃來源抓取失敗"
+
+
 def get_candidates(limit: int) -> Tuple[List[str], Dict[str, Dict[str, str]], str]:
-    candidate_rows, source = fetch_twse_stock_day_all_openapi(limit)
+    """抓上市 + 上櫃熱門股候選，依成交金額合併排序後取前 limit 檔。"""
+    twse_rows, twse_source = fetch_twse_stock_day_all_openapi(limit)
+    tpex_rows, tpex_source = fetch_tpex_mainboard_quotes(limit)
+
+    candidate_rows = []
+    candidate_rows.extend(twse_rows)
+    candidate_rows.extend(tpex_rows)
 
     if not candidate_rows:
-        candidate_rows = FALLBACK_CANDIDATES[:limit]
+        candidate_rows = []
+        for r in FALLBACK_CANDIDATES[:limit]:
+            rr = dict(r)
+            rr["市場"] = "上市"
+            rr["成交金額"] = 0
+            candidate_rows.append(rr)
         source = "備援熱門股清單"
+    else:
+        # 合併去重：若同一代號重複，保留成交金額較大的那筆。
+        by_code: Dict[str, Dict[str, Any]] = {}
+        for row in candidate_rows:
+            sid = normalize_stock_id(row.get("代號"))
+            if not re.match(r"^\d{4}$", sid):
+                continue
+            row["代號"] = sid
+            if sid not in by_code or clean_number(row.get("成交金額")) > clean_number(by_code[sid].get("成交金額")):
+                by_code[sid] = row
+
+        candidate_rows = sorted(by_code.values(), key=lambda x: clean_number(x.get("成交金額")), reverse=True)[:limit]
+        source = f"上市+上櫃成交金額排行｜{twse_source}；{tpex_source}"
 
     candidates = unique_keep_order([r["代號"] for r in candidate_rows])[:limit]
     info_map = {
         normalize_stock_id(r["代號"]): {
             "名稱": str(r.get("名稱") or r["代號"]).strip(),
             "產業": str(r.get("產業") or "未知").strip(),
+            "市場": str(r.get("市場") or "未知").strip(),
         }
         for r in candidate_rows
     }
@@ -225,24 +325,28 @@ def get_stock_info(candidate_info: Dict[str, Dict[str, str]]) -> pd.DataFrame:
                     "代號": sid,
                     "名稱": r.get("stock_name") if "stock_name" in cols else sid,
                     "產業": r.get("industry_category") if "industry_category" in cols else "未知",
+                    "市場": "未知",
                 }
             )
 
     # 候選來源名稱作為 fallback，避免名稱突然變回代號。
     for sid, info in candidate_info.items():
-        rows.append({"代號": sid, "名稱": info.get("名稱", sid), "產業": info.get("產業", "未知")})
+        rows.append({"代號": sid, "名稱": info.get("名稱", sid), "產業": info.get("產業", "未知"), "市場": info.get("市場", "未知")})
 
     # 常用備援表最後補。
     for r in FALLBACK_CANDIDATES:
-        rows.append({"代號": r["代號"], "名稱": r["名稱"], "產業": r["產業"]})
+        rows.append({"代號": r["代號"], "名稱": r["名稱"], "產業": r["產業"], "市場": r.get("市場", "上市")})
 
     out = pd.DataFrame(rows)
     if out.empty:
-        return pd.DataFrame(columns=["代號", "名稱", "產業"])
+        return pd.DataFrame(columns=["代號", "名稱", "產業", "市場"])
 
     out["代號"] = out["代號"].astype(str).map(normalize_stock_id)
     out["名稱"] = out["名稱"].fillna(out["代號"]).astype(str)
     out["產業"] = out["產業"].fillna("未知").astype(str)
+    if "市場" not in out.columns:
+        out["市場"] = "未知"
+    out["市場"] = out["市場"].fillna("未知").astype(str)
 
     # 保留第一個出現的名稱。FinMind 資料優先，其次候選來源，再其次 fallback。
     out = out.drop_duplicates(subset=["代號"], keep="first")
@@ -451,7 +555,7 @@ def scan(limit: int = 30, chip_limit: int = 10) -> None:
 
     candidates, candidate_info, candidate_source = get_candidates(limit)
     stock_info = get_stock_info(candidate_info)
-    info_map = stock_info.set_index("代號")[["名稱", "產業"]].to_dict("index") if not stock_info.empty else {}
+    info_map = stock_info.set_index("代號")[["名稱", "產業", "市場"]].to_dict("index") if not stock_info.empty else {}
 
     results: List[Dict[str, Any]] = []
     histories: List[pd.DataFrame] = []
@@ -478,6 +582,7 @@ def scan(limit: int = 30, chip_limit: int = 10) -> None:
         info = info_map.get(base["代號"], {})
         base["名稱"] = info.get("名稱", base["代號"])
         base["產業"] = info.get("產業", "未知")
+        base["市場"] = info.get("市場", candidate_info.get(base["代號"], {}).get("市場", "未知"))
         results.append(base)
 
         if not hist.empty:
@@ -532,7 +637,7 @@ def scan(limit: int = 30, chip_limit: int = 10) -> None:
     result_df = result_df.sort_values("AI總分", ascending=False).reset_index(drop=True)
 
     show_order = [
-        "日期", "代號", "名稱", "產業", "收盤價", "AI總分", "技術分", "籌碼分", "風險分", "量比",
+        "日期", "代號", "名稱", "市場", "產業", "收盤價", "AI總分", "技術分", "籌碼分", "風險分", "量比",
         "法人單日買賣超", "法人近3日買賣超", "融資變化", "融券變化", "籌碼狀態",
         "AI進場判斷", "停損參考", "壓力參考", "技術面原因", "技術風險", "籌碼面原因", "籌碼風險",
         "5日乖離率", "20日乖離率", "突破20日高點",
@@ -552,6 +657,9 @@ def scan(limit: int = 30, chip_limit: int = 10) -> None:
     else:
         pd.DataFrame().to_csv(DATA_DIR / "latest_price_history.csv", index=False, encoding="utf-8-sig")
 
+
+    market_counts = result_df["市場"].value_counts().to_dict() if "市場" in result_df.columns else {}
+
     meta = {
         "updated_at": now_tw().isoformat(timespec="seconds"),
         "candidate_source": candidate_source,
@@ -563,6 +671,7 @@ def scan(limit: int = 30, chip_limit: int = 10) -> None:
         "chip_fetched_count": int(chip_fetched),
         "skipped_stock_ids": skipped,
         "has_finmind_token": bool(os.getenv("FINMIND_TOKEN", "").strip()),
+        "market_counts": market_counts,
     }
     (DATA_DIR / "latest_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
