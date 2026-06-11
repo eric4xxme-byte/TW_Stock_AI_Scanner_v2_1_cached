@@ -1,5 +1,5 @@
 {
-  "updated_at": "2026-06-12T03:33:43+08:00",
+  "updated_at": "2026-06-12T03:52:01+08:00",
   "candidate_source": "證交所上市成交金額排行（STOCK_DAY_ALL）",
   "requested_limit": 30,
   "candidate_count": 30,
@@ -8,5 +8,5 @@
   "chip_detail_limit": 10,
   "chip_fetched_count": 10,
   "skipped_stock_ids": [],
-  "has_finmind_token": false
+  "has_finmind_token": true
 }
