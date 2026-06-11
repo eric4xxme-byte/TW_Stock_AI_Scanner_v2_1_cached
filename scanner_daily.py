@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-台股 AI Scanner v2.2.1 - 後台掃描器（上市來源修正版）
+台股 AI Scanner v2.3 - 後台掃描器（每日快照 + 回測資料收集）
 
 用途：
 1. 盤後抓熱門股候選清單
@@ -33,6 +33,7 @@ import requests
 API_URL = "https://api.finmindtrade.com/api/v4/data"
 TW_TZ = timezone(timedelta(hours=8))
 DATA_DIR = Path("data")
+SNAPSHOT_DIR = DATA_DIR / "snapshots"
 
 # 備援熱門股清單：只在證交所來源失敗時使用，避免前台完全空白。
 FALLBACK_CANDIDATES = [
@@ -669,6 +670,7 @@ def compute_ai_score(technical_score: float, chip_score: float, risk_score: floa
 
 def scan(limit: int = 30, chip_limit: int = 10) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
     end = now_tw().date()
     start = end - timedelta(days=220)
 
@@ -722,6 +724,10 @@ def scan(limit: int = 30, chip_limit: int = 10) -> None:
             "skipped_stock_ids": skipped,
         }
         (DATA_DIR / "latest_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        (SNAPSHOT_DIR / f"meta_{end.strftime('%Y%m%d')}.json").write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
         pd.DataFrame().to_csv(DATA_DIR / "latest_rank.csv", index=False, encoding="utf-8-sig")
         pd.DataFrame().to_csv(DATA_DIR / "latest_risk.csv", index=False, encoding="utf-8-sig")
         return
@@ -769,6 +775,12 @@ def scan(limit: int = 30, chip_limit: int = 10) -> None:
     result_df.to_csv(DATA_DIR / "latest_rank.csv", index=False, encoding="utf-8-sig")
     risk_df.to_csv(DATA_DIR / "latest_risk.csv", index=False, encoding="utf-8-sig")
 
+    # v2.3：保留每日快照，供未來 backtest_daily.py 計算隔日 / 3日 / 5日績效。
+    # 同一天重跑會覆蓋同一天快照，避免 GitHub data 資料夾無限膨脹。
+    snapshot_key = end.strftime("%Y%m%d")
+    result_df.to_csv(SNAPSHOT_DIR / f"rank_{snapshot_key}.csv", index=False, encoding="utf-8-sig")
+    risk_df.to_csv(SNAPSHOT_DIR / f"risk_{snapshot_key}.csv", index=False, encoding="utf-8-sig")
+
     if histories:
         hist_df = pd.concat(histories, ignore_index=True)
         hist_df["date"] = pd.to_datetime(hist_df["date"]).dt.strftime("%Y-%m-%d")
@@ -793,12 +805,17 @@ def scan(limit: int = 30, chip_limit: int = 10) -> None:
         "market_counts": market_counts,
     }
     (DATA_DIR / "latest_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    (SNAPSHOT_DIR / f"meta_{end.strftime('%Y%m%d')}.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
     print("完成輸出：")
     print(DATA_DIR / "latest_rank.csv")
     print(DATA_DIR / "latest_risk.csv")
     print(DATA_DIR / "latest_price_history.csv")
     print(DATA_DIR / "latest_meta.json")
+    print(SNAPSHOT_DIR / f"rank_{end.strftime('%Y%m%d')}.csv")
 
 
 def main() -> None:
