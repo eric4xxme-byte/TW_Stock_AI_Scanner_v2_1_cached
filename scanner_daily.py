@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-台股 AI Scanner v2.1 - 後台掃描器
+台股 AI Scanner v2.2.1 - 後台掃描器（上市來源修正版）
 
 用途：
 1. 盤後抓熱門股候選清單
@@ -116,12 +116,25 @@ def unique_keep_order(items: List[str]) -> List[str]:
 
 
 def request_json(url: str, timeout: int = 15) -> Optional[Any]:
-    headers = {"User-Agent": "Mozilla/5.0"}
+    """安全抓 JSON。某些 TWSE / TPEx 端點 content-type 不固定，所以用 text 備援解析。"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json,text/plain,*/*",
+    }
     try:
         resp = requests.get(url, headers=headers, timeout=timeout)
         if resp.status_code != 200:
             return None
-        return resp.json()
+        try:
+            return resp.json()
+        except Exception:
+            text = resp.text.strip().lstrip("\ufeff")
+            if not text:
+                return None
+            try:
+                return json.loads(text)
+            except Exception:
+                return None
     except Exception:
         return None
 
@@ -192,8 +205,92 @@ def parse_market_rows(data: Any, market: str, limit: int) -> List[Dict[str, Any]
     rows = sorted(rows, key=lambda x: x.get("成交金額", 0), reverse=True)
     return rows[:limit]
 
+def parse_twse_mi_index_payload(payload: Any, market: str = "上市", limit: int = 100) -> List[Dict[str, Any]]:
+    """解析證交所 MI_INDEX JSON。支援新版 rwd 與舊版 exchangeReport data9/fields9。"""
+    if not isinstance(payload, dict):
+        return []
+
+    # 舊版 exchangeReport/MI_INDEX 常見格式：fields9 + data9
+    fields = payload.get("fields9") or payload.get("fields")
+    data = payload.get("data9") or payload.get("data")
+
+    # 新版 rwd 有時會包在 tables 裡。
+    if (not fields or not data) and isinstance(payload.get("tables"), list):
+        for table in payload.get("tables", []):
+            if not isinstance(table, dict):
+                continue
+            f = table.get("fields") or table.get("fields9")
+            d = table.get("data") or table.get("data9")
+            if f and d and any("證券代號" in str(x) for x in f):
+                fields, data = f, d
+                break
+
+    if not fields or not data:
+        return []
+
+    rows: List[Dict[str, Any]] = []
+    for raw in data:
+        if not isinstance(raw, list):
+            continue
+        col_len = min(len(fields), len(raw))
+        row = {str(fields[i]): raw[i] for i in range(col_len)}
+        code = row.get("證券代號") or row.get("Code") or row.get("code")
+        name = row.get("證券名稱") or row.get("Name") or row.get("name") or code
+        money = row.get("成交金額") or row.get("TradeValue") or row.get("trade_value")
+        close = row.get("收盤價") or row.get("ClosingPrice") or row.get("close")
+        volume = row.get("成交股數") or row.get("成交股") or row.get("TradeVolume") or row.get("Trading_Volume")
+
+        if code is None:
+            continue
+        code = normalize_stock_id(code)
+        if not re.match(r"^\d{4}$", code):
+            continue
+
+        money_num = clean_number(money)
+        close_num = clean_number(close)
+        volume_num = clean_number(volume)
+        if money_num <= 0 and close_num > 0 and volume_num > 0:
+            money_num = close_num * volume_num
+
+        rows.append({
+            "代號": code,
+            "名稱": str(name).strip() if name else code,
+            "產業": "未知",
+            "市場": market,
+            "成交金額": money_num,
+            "收盤價來源": close_num,
+        })
+
+    rows = sorted(rows, key=lambda x: clean_number(x.get("成交金額")), reverse=True)
+    return rows[:limit]
+
+
+def fetch_twse_mi_index(limit: int) -> Tuple[List[Dict[str, Any]], str]:
+    """MI_INDEX 備援：往前找最近交易日的每日收盤行情。"""
+    today = now_tw().date()
+    for i in range(0, 15):
+        day = today - timedelta(days=i)
+        date_str = day.strftime("%Y%m%d")
+        urls = [
+            f"https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date={date_str}&type=ALLBUT0999&response=json",
+            f"https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&date={date_str}&type=ALLBUT0999",
+        ]
+        for url in urls:
+            payload = request_json(url, timeout=15)
+            rows = parse_twse_mi_index_payload(payload, market="上市", limit=limit)
+            if rows:
+                return rows[:limit], f"證交所上市成交金額排行（MI_INDEX {date_str}）"
+    return [], "證交所 MI_INDEX 抓取失敗"
+
+
 def fetch_twse_stock_day_all_openapi(limit: int) -> Tuple[List[Dict[str, Any]], str]:
-    """抓證交所 OpenAPI 上市個股日成交資訊。"""
+    """抓證交所上市個股日成交資訊。
+
+    v2.2.1 修正：
+    1. 先用原本 v2.1 成功過的 STOCK_DAY_ALL 來源。
+    2. 如果該端點短暫失敗，再往前找 MI_INDEX 最近交易日。
+    3. 最後才回傳失敗，讓上櫃或備援清單接手。
+    """
     urls = [
         "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
         "https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=open_data",
@@ -206,7 +303,12 @@ def fetch_twse_stock_day_all_openapi(limit: int) -> Tuple[List[Dict[str, Any]], 
         if rows:
             return rows[:limit], "證交所上市成交金額排行（STOCK_DAY_ALL）"
 
-    return [], "證交所 STOCK_DAY_ALL 抓取失敗"
+    # STOCK_DAY_ALL 有時會暫時抓不到，改用 MI_INDEX 最近交易日資料。
+    mi_rows, mi_source = fetch_twse_mi_index(limit)
+    if mi_rows:
+        return mi_rows[:limit], mi_source
+
+    return [], "證交所 STOCK_DAY_ALL / MI_INDEX 皆抓取失敗"
 
 
 def fetch_tpex_mainboard_quotes(limit: int) -> Tuple[List[Dict[str, Any]], str]:
@@ -238,15 +340,15 @@ def fetch_tpex_mainboard_quotes(limit: int) -> Tuple[List[Dict[str, Any]], str]:
 
 
 def get_candidates(limit: int) -> Tuple[List[str], Dict[str, Dict[str, str]], str]:
-    """抓上市 + 上櫃熱門股候選，依成交金額合併排序後取前 limit 檔。"""
+    """抓上市 + 上櫃熱門股候選。
+
+    若上市來源成功：上市與上櫃依成交金額合併排序。
+    若上市來源失敗但上櫃成功：保留部分上市備援清單，避免候選股全部變成上櫃。
+    """
     twse_rows, twse_source = fetch_twse_stock_day_all_openapi(limit)
     tpex_rows, tpex_source = fetch_tpex_mainboard_quotes(limit)
 
-    candidate_rows = []
-    candidate_rows.extend(twse_rows)
-    candidate_rows.extend(tpex_rows)
-
-    if not candidate_rows:
+    if not twse_rows and not tpex_rows:
         candidate_rows = []
         for r in FALLBACK_CANDIDATES[:limit]:
             rr = dict(r)
@@ -254,17 +356,34 @@ def get_candidates(limit: int) -> Tuple[List[str], Dict[str, Dict[str, str]], st
             rr["成交金額"] = 0
             candidate_rows.append(rr)
         source = "備援熱門股清單"
+
+    elif not twse_rows and tpex_rows:
+        # 上市來源短暫失敗時，不讓候選清單全部變上櫃；保留一部分原本穩定的上市備援。
+        fallback_count = min(max(5, limit // 3), len(FALLBACK_CANDIDATES), limit)
+        tpex_count = max(0, limit - fallback_count)
+        candidate_rows = []
+        candidate_rows.extend(tpex_rows[:tpex_count])
+        for r in FALLBACK_CANDIDATES[:fallback_count]:
+            rr = dict(r)
+            rr["市場"] = "上市"
+            rr["成交金額"] = 0
+            candidate_rows.append(rr)
+        source = f"上櫃成交金額排行 + 上市備援清單｜{twse_source}；{tpex_source}"
+
+    elif twse_rows and not tpex_rows:
+        candidate_rows = twse_rows[:limit]
+        source = f"上市成交金額排行｜{twse_source}；{tpex_source}"
+
     else:
-        # 合併去重：若同一代號重複，保留成交金額較大的那筆。
+        # 上市與上櫃都成功：依成交金額合併排序後取前 limit。
         by_code: Dict[str, Dict[str, Any]] = {}
-        for row in candidate_rows:
+        for row in [*twse_rows, *tpex_rows]:
             sid = normalize_stock_id(row.get("代號"))
             if not re.match(r"^\d{4}$", sid):
                 continue
             row["代號"] = sid
             if sid not in by_code or clean_number(row.get("成交金額")) > clean_number(by_code[sid].get("成交金額")):
                 by_code[sid] = row
-
         candidate_rows = sorted(by_code.values(), key=lambda x: clean_number(x.get("成交金額")), reverse=True)[:limit]
         source = f"上市+上櫃成交金額排行｜{twse_source}；{tpex_source}"
 
