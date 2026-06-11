@@ -1,6 +1,6 @@
 {
-  "updated_at": "2026-06-12T04:00:58+08:00",
-  "candidate_source": "上市+上櫃成交金額排行｜證交所 STOCK_DAY_ALL 抓取失敗；櫃買中心上櫃成交金額排行（tpex_mainboard_quotes）",
+  "updated_at": "2026-06-12T04:08:46+08:00",
+  "candidate_source": "上市+上櫃成交金額排行｜證交所上市成交金額排行（STOCK_DAY_ALL）；櫃買中心上櫃成交金額排行（tpex_mainboard_quotes）",
   "requested_limit": 30,
   "candidate_count": 30,
   "success_count": 30,
