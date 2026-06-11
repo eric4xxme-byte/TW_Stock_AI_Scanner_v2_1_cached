@@ -1,0 +1,14 @@
+{
+  "updated_at": "2026-06-12T04:26:04+08:00",
+  "status": "ok",
+  "snapshot_count": 1,
+  "trade_rows": 10,
+  "summary_rows": 6,
+  "top_n": 10,
+  "horizons": [
+    1,
+    3,
+    5
+  ],
+  "has_finmind_token": true
+}
