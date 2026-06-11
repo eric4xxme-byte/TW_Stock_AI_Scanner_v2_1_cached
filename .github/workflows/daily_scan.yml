@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: daily-stock-scan
+  cancel-in-progress: true
+
 jobs:
   scan:
     runs-on: ubuntu-latest
@@ -15,6 +19,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -25,7 +31,13 @@ jobs:
         run: |
           pip install -r requirements.txt
 
+      - name: Sync latest main before scan
+        run: |
+          git pull --rebase origin main
+
       - name: Run scanner
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
         run: |
           python scanner_daily.py --limit 30 --chip-limit 10
 
@@ -33,6 +45,13 @@ jobs:
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
+
           git add data/
-          git commit -m "Update stock scan data" || echo "No changes to commit"
-          git push
+
+          if git diff --cached --quiet; then
+            echo "No generated data changes to commit"
+          else
+            git commit -m "Update stock scan data"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
