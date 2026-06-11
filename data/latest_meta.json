@@ -1,6 +1,6 @@
 {
-  "updated_at": "2026-06-12T03:52:01+08:00",
-  "candidate_source": "證交所上市成交金額排行（STOCK_DAY_ALL）",
+  "updated_at": "2026-06-12T04:00:58+08:00",
+  "candidate_source": "上市+上櫃成交金額排行｜證交所 STOCK_DAY_ALL 抓取失敗；櫃買中心上櫃成交金額排行（tpex_mainboard_quotes）",
   "requested_limit": 30,
   "candidate_count": 30,
   "success_count": 30,
@@ -8,5 +8,8 @@
   "chip_detail_limit": 10,
   "chip_fetched_count": 10,
   "skipped_stock_ids": [],
-  "has_finmind_token": true
+  "has_finmind_token": true,
+  "market_counts": {
+    "未知": 30
+  }
 }
