@@ -35,11 +35,12 @@ jobs:
         run: |
           git pull --rebase origin main
 
-      - name: Run scanner
+      - name: Run scanner and backtest
         env:
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
         run: |
           python scanner_daily.py --limit 30 --chip-limit 10
+          python backtest_daily.py --top-n 10 --horizons 1,3,5
 
       - name: Commit generated data
         run: |
@@ -51,7 +52,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No generated data changes to commit"
           else
-            git commit -m "Update stock scan data"
+            git commit -m "Update stock scan and backtest data"
             git pull --rebase origin main
             git push origin HEAD:main
           fi
