@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -125,6 +126,75 @@ def fetch_yahoo(symbol: str, label: str, interval: str = "1m", range_: str = "1d
         return {"symbol": symbol, "label": label, "ok": False, "error": str(exc), "source": "Yahoo chart"}
 
 
+def fetch_tw_yahoo_futures() -> Dict[str, Any]:
+    """Fetch Taiwan futures from Yahoo Taiwan futures page.
+
+    The Yahoo Finance global chart symbol for Taiwan futures is not stable for
+    near-month/night-session quotes. Yahoo Taiwan futures page usually exposes
+    WTX& (台指期近一) and related contracts in page text. This parser is deliberately
+    defensive: if the page layout changes, it falls back to IX0126.TW so the
+    dashboard does not break.
+    """
+    result = {
+        "TXF": {"symbol": "WTX&", "label": "台指期近一", "ok": False, "source": "Yahoo Taiwan futures"},
+        "MTX": {"symbol": "MTX&", "label": "小台近一", "ok": False, "source": "Yahoo Taiwan futures"},
+    }
+    urls = [
+        "https://tw.stock.yahoo.com/future",
+        "https://tw.stock.yahoo.com/future/futures.html",
+    ]
+
+    def clean_num(x: str) -> Optional[float]:
+        return safe_float(str(x).replace(",", ""), None)
+
+    try:
+        text = ""
+        for url in urls:
+            try:
+                r = requests.get(url, headers={"User-Agent": UA}, timeout=12)
+                if r.ok and r.text:
+                    text = r.text
+                    break
+            except Exception:
+                continue
+        if text:
+            # Remove tags enough for regex scanning while preserving order.
+            flat = re.sub(r"<[^>]+>", " ", text)
+            flat = re.sub(r"\s+", " ", flat)
+            contracts = [
+                ("TXF", "台指期近一", r"台指期近一\s*WTX[^0-9-]*([0-9,]+(?:\.[0-9]+)?)\s*([0-9,]+(?:\.[0-9]+)?)\s*([0-9,]+(?:\.[0-9]+)?)\s*([+-]?[0-9,]+(?:\.[0-9]+)?)\s*([+-]?[0-9]+(?:\.[0-9]+)?)%"),
+                ("MTX", "小台近一", r"小台(?:指)?近一\s*[^0-9-]*([0-9,]+(?:\.[0-9]+)?)\s*([0-9,]+(?:\.[0-9]+)?)\s*([0-9,]+(?:\.[0-9]+)?)\s*([+-]?[0-9,]+(?:\.[0-9]+)?)\s*([+-]?[0-9]+(?:\.[0-9]+)?)%"),
+            ]
+            for key, label, pattern in contracts:
+                m = re.search(pattern, flat)
+                if m:
+                    bid, ask, price, change, pct = m.groups()[:5]
+                    price_f = clean_num(price)
+                    change_f = clean_num(change)
+                    pct_f = clean_num(pct)
+                    prev = price_f - change_f if price_f is not None and change_f is not None else None
+                    result[key].update({
+                        "ok": price_f is not None,
+                        "price": price_f,
+                        "previous_close": prev,
+                        "change": change_f,
+                        "change_pct": pct_f,
+                        "bid": clean_num(bid),
+                        "ask": clean_num(ask),
+                        "source": "Yahoo Taiwan futures page",
+                        "updated_at": now_tw().strftime("%Y-%m-%d %H:%M:%S"),
+                    })
+        # Backup: TIP TAIFEX index. This is not the near-month tradable contract, but better than blank.
+        if not result["TXF"].get("ok"):
+            backup = fetch_yahoo("IX0126.TW", "TIP TAIFEX TAIEX Futures Index", interval="1m", range_="1d")
+            if backup.get("ok"):
+                result["TXF"].update(backup)
+                result["TXF"].update({"symbol": "IX0126.TW", "label": "台指期參考指數", "source": "Yahoo chart backup: IX0126.TW"})
+    except Exception as exc:
+        result["TXF"].update({"ok": False, "error": str(exc)})
+    return result
+
+
 def market_breadth_from_files() -> Dict[str, Any]:
     df = read_csv_safe(INTRADAY_SNAPSHOT_FILE)
     src = "data/intraday_snapshot.csv"
@@ -169,6 +239,8 @@ def compute_context(dt: datetime) -> Dict[str, Any]:
     mode = session_mode(dt)
     twii = fetch_yahoo("^TWII", "加權指數")
     twoii = fetch_yahoo("^TWOII", "櫃買指數")
+    taiwan_futures = fetch_tw_yahoo_futures()
+    txf = taiwan_futures.get("TXF", {}) or {}
     nq = fetch_yahoo("NQ=F", "NASDAQ 100 期貨")
     es = fetch_yahoo("ES=F", "S&P 500 期貨")
     sox = fetch_yahoo("^SOX", "費半指數")
@@ -179,12 +251,14 @@ def compute_context(dt: datetime) -> Dict[str, Any]:
 
     twii_pct = safe_float(twii.get("change_pct"), 0.0) or 0.0
     twoii_pct = safe_float(twoii.get("change_pct"), 0.0) or 0.0
+    txf_pct = safe_float(txf.get("change_pct"), 0.0) or 0.0
     breadth_avg = safe_float(breadth.get("avg_pct"), 0.0) if breadth.get("ok") else 0.0
     breadth_up = safe_float(breadth.get("up_ratio"), 0.5) if breadth.get("ok") else 0.5
 
     # 50 is neutral. Keep conservative so a single failed source does not distort decisions.
     market_env_score = 50.0
     market_env_score += clamp(twii_pct * 7.0, -14, 14)
+    market_env_score += clamp(txf_pct * 5.0, -10, 10)
     market_env_score += clamp(twoii_pct * 6.0, -12, 12)
     market_env_score += clamp((breadth_up - 0.5) * 35.0, -10, 10)
     market_env_score += clamp((breadth_avg or 0.0) * 3.0, -8, 8)
@@ -246,10 +320,12 @@ def compute_context(dt: datetime) -> Dict[str, Any]:
         "next_day_note": next_day,
         "breadth": breadth,
         "indices": {"TWII": twii, "TWOII": twoii},
-        "night_proxies": {"NQ=F": nq, "ES=F": es, "SOX": sox, "TNX": tnx, "DXY": dxy, "CL=F": oil},
+        "taiwan_futures": taiwan_futures,
+        "night_proxies": {"TXF": taiwan_futures.get("TXF", {}), "MTX": taiwan_futures.get("MTX", {}), "NQ=F": nq, "ES=F": es, "SOX": sox, "TNX": tnx, "DXY": dxy, "CL=F": oil},
         "source_status": {
             "twii_ok": bool(twii.get("ok")),
             "twoii_ok": bool(twoii.get("ok")),
+            "txf_ok": bool(taiwan_futures.get("TXF", {}).get("ok")),
             "nq_ok": bool(nq.get("ok")),
             "es_ok": bool(es.get("ok")),
             "sox_ok": bool(sox.get("ok")),
