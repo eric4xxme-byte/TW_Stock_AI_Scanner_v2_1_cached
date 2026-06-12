@@ -1,5 +1,5 @@
 # pages/live_intraday.py
-# v2.15.6 Live Intraday Permanent Learning DB + Learning Rate Display Fix
+# v2.16 Live Intraday Market / Night Context + Session Split
 # Purpose:
 # - Keep v2.4.x live AI candidate monitoring.
 # - Add a safer "market pool scan" mode: TWSE + TPEx turnover pool + live quotes.
@@ -3255,6 +3255,9 @@ V214_WEIGHT_PROFILE_PATH = DATA_DIR / "v214_weight_profile.json"
 V215_VERIFIED_JOURNAL_PATH = DATA_DIR / "v215_verified_signal_journal.csv"
 V215_SYNC_LOG_PATH = DATA_DIR / "v215_google_sheet_sync_log.csv"
 V215_CONFIG_PATH = DATA_DIR / "v215_google_sheet_config.json"
+V216_MARKET_CONTEXT_PATH = DATA_DIR / "v216_market_context.json"
+V216_NIGHT_CONTEXT_PATH = DATA_DIR / "v216_night_session_context.json"
+V216_POST_CLOSE_PATH = DATA_DIR / "v216_post_close_verification.json"
 
 
 def _v213_today() -> str:
@@ -4036,8 +4039,147 @@ def latest_v215_sync_status() -> Dict[str, Any]:
         return {"status": "讀取失敗", "time": "-", "rows": 0, "message": "同步紀錄讀取失敗"}
 
 
-st.title("🧬 盤中即時看盤 v2.15.6 真永久學習資料庫｜學習勝率修正版")
-st.caption("v2.15.6 修正：Google Sheet 同步維持批次寫入；學習勝率改用盤後驗證樣本，不再只看舊版本機 journal 的單一成功標籤。")
+
+def _v216_read_json(path: Path) -> Dict[str, Any]:
+    try:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def _v216_pct_text(v: Any) -> str:
+    try:
+        f = float(v)
+        return f"{f:+.2f}%"
+    except Exception:
+        return "-"
+
+
+def load_v216_context() -> Dict[str, Any]:
+    ctx = _v216_read_json(V216_MARKET_CONTEXT_PATH)
+    night = _v216_read_json(V216_NIGHT_CONTEXT_PATH)
+    post = _v216_read_json(V216_POST_CLOSE_PATH)
+    if night:
+        ctx.setdefault("night_context", night)
+    if post:
+        ctx.setdefault("post_close", post)
+    return ctx
+
+
+def v216_market_bucket(score: float) -> str:
+    if score >= 62:
+        return "🟢 大盤偏多"
+    if score >= 48:
+        return "🟡 大盤震盪"
+    if score >= 35:
+        return "🔴 大盤偏弱"
+    return "⚫ 系統性風險"
+
+
+def v216_night_bucket(score: float) -> str:
+    if score >= 68:
+        return "🔴 夜盤風險高"
+    if score >= 55:
+        return "🟡 夜盤偏保守"
+    if score >= 42:
+        return "⚪ 夜盤中性"
+    return "🟢 夜盤偏多"
+
+
+def apply_v216_market_adjustment(df: pd.DataFrame, ctx: Dict[str, Any]) -> pd.DataFrame:
+    out = df.copy()
+    if out.empty:
+        return out
+    market_score = float(pd.to_numeric(pd.Series([ctx.get("market_env_score", 50)]), errors="coerce").fillna(50).iloc[0])
+    night_score = float(pd.to_numeric(pd.Series([ctx.get("night_risk_score", 50)]), errors="coerce").fillna(50).iloc[0])
+    session = str(ctx.get("session_mode", "unknown"))
+    market_label = str(ctx.get("market_label") or v216_market_bucket(market_score))
+    night_label = str(ctx.get("night_label") or v216_night_bucket(night_score))
+    out["v216大盤分"] = round(market_score, 1)
+    out["v216夜盤風險分"] = round(night_score, 1)
+    out["v216大盤環境"] = market_label
+    out["v216夜盤風險"] = night_label
+    out["v216資料模式"] = session
+
+    def adjust(row: pd.Series) -> pd.Series:
+        state = str(row.get("v212生命週期狀態", ""))
+        decision = str(row.get("v212目前決策", ""))
+        gate = str(row.get("v214信心閘門", ""))
+        note = "維持"
+        adj = 0
+        # Conservative downgrade: broad weakness should not delete a setup, only downgrade sizing/urgency.
+        if market_score < 35 or night_score >= 68:
+            adj = -2
+            note = "大盤/夜盤風險高：可試單降級為觀察，禁止追價"
+        elif market_score < 48 or night_score >= 55:
+            adj = -1
+            note = "環境偏保守：只允許嚴格小量，等止跌確認"
+        elif market_score >= 62 and night_score < 55:
+            adj = 1
+            note = "環境加分：訊號可維持，但仍看停損距離"
+        if adj <= -2 and ("可試單" in state or "到價確認" in state or "高信心" in gate):
+            adj_decision = "🟡 環境降級，等確認"
+        elif adj == -1 and ("可試單" in state or "到價確認" in state):
+            adj_decision = "🟡 嚴格小量 / 等確認"
+        elif adj >= 1 and ("到價" in state or "前兆" in state):
+            adj_decision = decision or "環境支持，照原訊號"
+        else:
+            adj_decision = decision or "等待"
+        row["v216環境修正"] = note
+        row["v216調整後決策"] = adj_decision
+        return row
+
+    try:
+        out = out.apply(adjust, axis=1)
+    except Exception:
+        out["v216環境修正"] = "環境修正計算失敗，維持原訊號"
+        out["v216調整後決策"] = out.get("v212目前決策", "等待")
+    return out
+
+
+def render_v216_context(ctx: Dict[str, Any]) -> None:
+    st.subheader("🌐 v2.16 大盤 / 夜盤 / 盤後分流")
+    if not ctx:
+        st.info("尚未讀到 data/v216_market_context.json。請先讓 v2.16 GitHub Actions 跑一次，或等待下一輪背景任務。")
+        return
+    market_score = float(pd.to_numeric(pd.Series([ctx.get("market_env_score", 50)]), errors="coerce").fillna(50).iloc[0])
+    night_score = float(pd.to_numeric(pd.Series([ctx.get("night_risk_score", 50)]), errors="coerce").fillna(50).iloc[0])
+    session = str(ctx.get("session_mode", "-"))
+    updated = str(ctx.get("updated_at", "-"))
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("目前模式", session)
+    c2.metric("大盤環境分", f"{market_score:.1f}", str(ctx.get("market_label", v216_market_bucket(market_score))))
+    c3.metric("夜盤風險分", f"{night_score:.1f}", str(ctx.get("night_label", v216_night_bucket(night_score))))
+    c4.metric("環境更新", updated[-14:-6] if len(updated) >= 14 else updated)
+
+    idx = ctx.get("indices", {}) or {}
+    night = ctx.get("night_proxies", {}) or {}
+    breadth = ctx.get("breadth", {}) or {}
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("加權 / 櫃買", f"{_v216_pct_text((idx.get('TWII') or {}).get('change_pct'))} / {_v216_pct_text((idx.get('TWOII') or {}).get('change_pct'))}")
+    k2.metric("NASDAQ期 / S&P期", f"{_v216_pct_text((night.get('NQ=F') or {}).get('change_pct'))} / {_v216_pct_text((night.get('ES=F') or {}).get('change_pct'))}")
+    k3.metric("費半 / 美債", f"{_v216_pct_text((night.get('SOX') or {}).get('change_pct'))} / {_v216_pct_text((night.get('TNX') or {}).get('change_pct'))}")
+    if breadth.get("ok"):
+        k4.metric("漲跌家數 / 平均", f"{breadth.get('up_count', 0)} / {breadth.get('down_count', 0)}", f"{breadth.get('avg_pct', 0)}%")
+    else:
+        k4.metric("市場廣度", "尚無", str(breadth.get("message", "-")))
+
+    action = str(ctx.get("market_action", ""))
+    next_day = str(ctx.get("next_day_note", ""))
+    if market_score < 48 or night_score >= 55:
+        st.warning(f"環境提醒：{action}｜{next_day}")
+    else:
+        st.info(f"環境提醒：{action}｜{next_day}")
+
+
+v216_context = load_v216_context()
+
+st.title("🌐 盤中即時看盤 v2.16 大盤 / 夜盤 / 盤後分流引擎")
+st.caption("v2.16 新增：大盤環境分、夜盤風險分、盤後驗證分流；個股訊號會被大盤/夜盤環境保守修正，不再只看單一個股。")
+render_v216_context(v216_context)
+st.divider()
 
 refresh_default = _get_query_int("refresh", 30, 15, 120, 15)
 top_n_default = _get_query_int("top_n", 15, 5, 50, 5)
@@ -4230,6 +4372,7 @@ lifecycle_df = _ensure_columns(lifecycle_df, {
 v213_signal_journal_df = update_v213_signal_journal(lifecycle_df)
 v214_weight_profile = build_v214_weight_profile(v213_signal_journal_df)
 lifecycle_df = apply_v214_auto_weights(lifecycle_df, v214_weight_profile)
+lifecycle_df = apply_v216_market_adjustment(lifecycle_df, v216_context)
 v213_summary = build_v213_journal_summary(v213_signal_journal_df)
 v215_verified_journal_df = build_v215_postclose_verification(v213_signal_journal_df, lifecycle_df)
 _v215_save_verified_journal(v215_verified_journal_df)
@@ -4338,10 +4481,10 @@ else:
     st.warning("學習勝率不是每輪即時變動的『學習率』；要等盤後驗證樣本累積後才有意義。最高只會顯示 🟢 高信心小量，仍必須照防守停損執行。")
 
 # 1) Primary current decision table.
-st.subheader("🧭 v2.14 交易員目前決策")
-st.caption("主表只保留會影響進場的欄位。v2.14 新增『信心閘門』與『調權後分』；🟢 高信心小量仍不是無腦重倉，只是更嚴格的試單條件。")
+st.subheader("🧭 v2.16 交易員目前決策｜含大盤/夜盤修正")
+st.caption("主表只保留會影響進場的欄位。v2.16 會依大盤環境分與夜盤風險分，將可試單訊號保守降級或維持。")
 main_cols = _cols_exist(lifecycle_df, [
-    "代號", "名稱", "市場", "產業", "交易型態", "v214信心閘門", "v212生命週期狀態", "v212目前決策", "我會不會買",
+    "代號", "名稱", "市場", "產業", "交易型態", "v216調整後決策", "v216環境修正", "v216大盤環境", "v216夜盤風險", "v214信心閘門", "v212生命週期狀態", "v212目前決策", "我會不會買",
     "第一買點", "盤中現價", "v214停損距離%", "v212位置判斷", "防守停損", "右側加碼價", "追價上限",
     "盤中漲跌幅", "刷新漲速%", "v214調權後分", "左側低吸分", "盤中資金分", "v29漲停前兆分", "v210決策分",
     "v214下一步", "v212下一步", "還缺什麼確認", "不能買原因", "資料來源", "AI來源", "報價時間"
@@ -4351,7 +4494,7 @@ if main_df.empty:
     st.info("目前沒有符合篩選條件的股票。可以降低左側篩選的 AI / 即時強度門檻，或等待下一輪刷新。")
 else:
     try:
-        st.dataframe(main_df[main_cols].style.applymap(_v212_style_signal, subset=["v214信心閘門", "v212生命週期狀態"]), use_container_width=True, hide_index=True)
+        st.dataframe(main_df[main_cols].style.applymap(_v212_style_signal, subset=["v216調整後決策", "v214信心閘門", "v212生命週期狀態"]), use_container_width=True, hide_index=True)
     except Exception:
         st.dataframe(main_df[main_cols], use_container_width=True, hide_index=True)
 
@@ -4361,7 +4504,7 @@ focus_df = lifecycle_df[lifecycle_df["代號"].astype(str).str.zfill(4).isin(FOC
 focus_df["焦點排序"] = focus_df["代號"].map({"3441": 1, "2382": 2, "2313": 3}).fillna(9)
 focus_df = focus_df.sort_values("焦點排序")
 focus_cols = _cols_exist(focus_df, [
-    "代號", "名稱", "v214信心閘門", "v212生命週期狀態", "v212目前決策", "第一買點", "盤中現價", "v214停損距離%", "防守停損", "右側加碼價", "追價上限",
+    "代號", "名稱", "v216調整後決策", "v216環境修正", "v214信心閘門", "v212生命週期狀態", "v212目前決策", "第一買點", "盤中現價", "v214停損距離%", "防守停損", "右側加碼價", "追價上限",
     "v212位置判斷", "盤中漲跌幅", "刷新漲速%", "回檔幅度%", "v214調權後分", "左側低吸分", "盤中資金分", "v29漲停前兆分", "v214下一步", "v212下一步", "還缺什麼確認", "報價時間"
 ])
 if focus_df.empty:
