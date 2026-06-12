@@ -1,0 +1,57 @@
+name: v2.15.4 Background Learning Sync
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Taiwan market/session window: 08:50-14:20 TWT ~= 00:50-06:20 UTC.
+    # GitHub schedule may be delayed; script itself will skip outside the Taiwan window.
+    - cron: '*/5 0-6 * * 1-5'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: v2154-background-learning-sync
+  cancel-in-progress: true
+
+jobs:
+  background-learning-sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas requests
+
+      - name: Pull latest data before sync
+        run: |
+          git pull --rebase origin main || true
+
+      - name: Run background learning sync
+        env:
+          GSHEET_WEBHOOK_URL: ${{ secrets.GSHEET_WEBHOOK_URL }}
+          BACKGROUND_POOL_LIMIT: '180'
+          BACKGROUND_SYNC_LIMIT: '120'
+          BACKGROUND_BATCH_SIZE: '20'
+        run: |
+          python background_learning_sync.py
+
+      - name: Commit updated learning journal
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/v215_verified_signal_journal.csv data/v215_background_sync_meta.json || true
+          git diff --cached --quiet && echo "No learning journal changes" || git commit -m "chore: update v2.15.4 background learning journal"
+          git pull --rebase origin main || true
+          git push || true
