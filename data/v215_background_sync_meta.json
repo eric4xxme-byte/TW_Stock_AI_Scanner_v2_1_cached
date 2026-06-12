@@ -1,17 +1,6 @@
 {
-  "updated_at": "2026-06-12T18:46:50.101241+08:00",
-  "status": "ok",
-  "session_mode": "night_context",
-  "pool_count": 180,
-  "quote_raw_count": 167,
-  "live_count": 166,
-  "journal_count": 172,
-  "sync": {
-    "ok": true,
-    "inserted": 0,
-    "updated": 120,
-    "skipped": 0,
-    "sent": 120,
-    "message": "1/6 ok; 2/6 ok; 3/6 ok; 4/6 ok; 5/6 ok; 6/6 ok"
-  }
+  "updated_at": "2026-06-13T01:55:07.702374+08:00",
+  "status": "skipped",
+  "session_mode": "weekend",
+  "reason": "outside v2.16 intraday/post-close learning window"
 }
