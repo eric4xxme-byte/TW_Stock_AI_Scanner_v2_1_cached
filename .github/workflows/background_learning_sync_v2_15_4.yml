@@ -1,4 +1,4 @@
-name: v2.16 Market Context + Background Learning Sync
+name: v2.16.1 Market Context + Background Learning Sync
 
 on:
   workflow_dispatch:
@@ -18,7 +18,6 @@ on:
     - cron: '30 5,6 * * 1-5'
     - cron: '0 8 * * 1-5'
     # Night / next-day risk context: Taiwan 15:00-04:30 ~= UTC 07:00-20:30.
-    # This updates market/night context only; background_learning_sync.py skips journal outside its own window.
     - cron: '*/30 7-20 * * 1-5'
 
 permissions:
@@ -50,7 +49,7 @@ jobs:
 
       - name: Pull latest data before sync
         run: |
-          git pull --rebase origin main
+          git pull --rebase --autostash origin main
 
       - name: Build v2.16 market / night context
         run: |
@@ -66,6 +65,23 @@ jobs:
         run: |
           python background_learning_sync.py
 
+      - name: Ensure optional v2.16 files exist
+        run: |
+          mkdir -p data
+          if [ ! -f data/v216_post_close_verification.json ]; then
+            python - <<'PY'
+          import json
+          from datetime import datetime, timezone, timedelta
+          from pathlib import Path
+          tw = timezone(timedelta(hours=8))
+          Path('data/v216_post_close_verification.json').write_text(json.dumps({
+              'updated_at': datetime.now(tw).isoformat(),
+              'status': 'not_post_close_window',
+              'note': 'created by workflow fallback so git add will not fail'
+          }, ensure_ascii=False, indent=2), encoding='utf-8')
+          PY
+          fi
+
       - name: Show generated v2.16 files
         run: |
           echo "=== data folder ==="
@@ -74,6 +90,8 @@ jobs:
           cat data/v216_market_context.json || true
           echo "=== v216 night session context ==="
           cat data/v216_night_session_context.json || true
+          echo "=== v216 post close verification ==="
+          cat data/v216_post_close_verification.json || true
           echo "=== v215 background sync meta ==="
           cat data/v215_background_sync_meta.json || true
           echo "=== journal preview ==="
@@ -94,19 +112,13 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A \
-            data/v215_verified_signal_journal.csv \
-            data/v215_background_sync_meta.json \
-            data/v216_market_context.json \
-            data/v216_night_session_context.json \
-            data/v216_post_close_verification.json \
-            data/v216_market_context_history.csv
+          git add -A data
           echo "=== git status before commit ==="
           git status --short
           if git diff --cached --quiet; then
             echo "No v2.16 learning/context changes to commit."
           else
             git commit -m "chore: update v2.16 market context and learning data"
-            git pull --rebase origin main
+            git pull --rebase --autostash origin main
             git push
           fi
