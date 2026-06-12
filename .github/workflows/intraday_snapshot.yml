@@ -1,0 +1,60 @@
+name: Intraday Taiwan Stock Snapshot
+
+on:
+  workflow_dispatch:
+  schedule:
+    # GitHub Actions cron 使用 UTC；以下約等於台灣時間 09:10、10:00、11:00、12:00、13:20。
+    - cron: "10 1 * * 1-5"
+    - cron: "0 2 * * 1-5"
+    - cron: "0 3 * * 1-5"
+    - cron: "0 4 * * 1-5"
+    - cron: "20 5 * * 1-5"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: intraday-stock-snapshot
+  cancel-in-progress: true
+
+jobs:
+  intraday:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Sync latest main before snapshot
+        run: |
+          git pull --rebase origin main
+
+      - name: Run intraday snapshot
+        run: |
+          python intraday_snapshot.py --limit 30
+
+      - name: Commit intraday data
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          git add data/intraday_snapshot.csv data/intraday_meta.json
+
+          if git diff --cached --quiet; then
+            echo "No intraday data changes to commit"
+          else
+            git commit -m "Update intraday stock snapshot"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
