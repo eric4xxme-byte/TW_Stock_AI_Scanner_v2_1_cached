@@ -1,5 +1,5 @@
 # pages/live_intraday.py
-# v2.6 Live Intraday Signal Tracking
+# v2.6.2 Live Intraday Signal Quality + Surge Radar
 # Purpose:
 # - Keep v2.4.x live AI candidate monitoring.
 # - Add a safer "market pool scan" mode: TWSE + TPEx turnover pool + live quotes.
@@ -13,6 +13,7 @@ import math
 import re
 import time
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -27,6 +28,12 @@ st.set_page_config(page_title="盤中即時看盤", page_icon="⚡", layout="wid
 DATA_DIR = Path("data")
 RANK_PATH = DATA_DIR / "latest_rank.csv"
 META_PATH = DATA_DIR / "latest_meta.json"
+TAIPEI_TZ = ZoneInfo("Asia/Taipei")
+
+
+def now_taipei() -> datetime:
+    return datetime.now(TAIPEI_TZ)
+
 
 QUOTE_URL = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
 TWSE_STOCK_DAY_URLS = [
@@ -778,6 +785,8 @@ def append_manual_codes(df: pd.DataFrame, codes: List[str], manual_ai_score: int
 # ---------- Intraday signal tracking ----------
 
 SIGNAL_LOG_PATH = DATA_DIR / "intraday_signal_log_runtime.csv"
+SURGE_SNAPSHOT_PATH = DATA_DIR / "intraday_last_snapshot_runtime.csv"
+SURGE_EVENT_LOG_PATH = DATA_DIR / "intraday_surge_events_runtime.csv"
 IMPORTANT_ALERTS = {"強勢進攻", "觀察偏強", "AI高分轉弱", "不要追高", "高風險上漲", "盤中轉弱"}
 IMPORTANT_ENTRIES = {
     "強勢進攻，可盯突破",
@@ -820,13 +829,57 @@ def _save_runtime_signal_log(df: pd.DataFrame) -> None:
         pass
 
 
+
+def should_track_signal(row: pd.Series, alert_name: str, entry_name: str) -> bool:
+    """v2.6.1: tighten signal quality so the log does not record every neutral name.
+
+    We keep high-value alerts, but only log 觀察偏強 when it has enough strength,
+    positive momentum and volume support. This makes the tracking table useful in practice.
+    """
+    try:
+        strength = float(row.get("即時強度分", 0) or 0)
+        pct = float(row.get("盤中漲跌幅", 0) or 0)
+        vol_score = float(row.get("盤中量能分", 0) or 0)
+        risk = float(row.get("風險分", 0) or 0)
+        ai = float(row.get("AI總分", 0) or 0)
+        ai_source = _safe_text(row.get("AI來源"), "")
+    except Exception:
+        return False
+
+    if alert_name in {"強勢進攻", "AI高分轉弱", "不要追高", "高風險上漲", "盤中轉弱"}:
+        return True
+
+    if entry_name == "強勢進攻，可盯突破":
+        return True
+
+    if alert_name == "觀察偏強" or entry_name == "觀察偏強，等回測確認":
+        # Market-pool estimates need stronger evidence than fully scored AI names.
+        if ai_source == "盤後AI":
+            return strength >= 58 and pct >= 0.8 and vol_score >= 45 and risk < 40 and ai >= 45
+        return strength >= 62 and pct >= 1.2 and vol_score >= 60 and risk < 35 and ai >= 55
+
+    return False
+
+
+def classify_signal_group(alert_name: str, entry_name: str) -> str:
+    if alert_name == "強勢進攻" or entry_name == "強勢進攻，可盯突破":
+        return "有效進攻"
+    if alert_name == "觀察偏強" or entry_name == "觀察偏強，等回測確認":
+        return "觀察訊號"
+    if alert_name in {"AI高分轉弱", "盤中轉弱"} or entry_name in {"AI高分但盤中轉弱", "盤中轉弱，避開"}:
+        return "轉弱訊號"
+    if alert_name in {"不要追高", "高風險上漲"} or entry_name in {"漲幅偏高，不追", "風險偏高，暫不追"}:
+        return "風險訊號"
+    return "其他"
+
+
 def update_runtime_signal_log(live_df: pd.DataFrame) -> pd.DataFrame:
     """Keep a local runtime signal log.
 
     This file is written by the Streamlit app instance. It survives browser refreshes,
     but it is not committed to GitHub and may reset after Streamlit reboot/redeploy.
     """
-    now = datetime.now()
+    now = now_taipei()
     today = now.strftime("%Y-%m-%d")
     now_time = now.strftime("%H:%M:%S")
 
@@ -852,11 +905,12 @@ def update_runtime_signal_log(live_df: pd.DataFrame) -> pd.DataFrame:
         alert_name = _safe_text(row.get("盤中警示"), "中性")
         entry_name = _safe_text(row.get("盤中入場判斷"), "僅觀察，未達入場條件")
 
-        should_log = (alert_name in IMPORTANT_ALERTS) or (entry_name in IMPORTANT_ENTRIES)
+        should_log = should_track_signal(row, alert_name, entry_name)
         if not should_log or math.isnan(px) or px <= 0:
             continue
 
-        signal_key = f"{today}|{code}|{alert_name}|{entry_name}"
+        signal_group = classify_signal_group(alert_name, entry_name)
+        signal_key = f"{today}|{code}|{signal_group}|{alert_name}|{entry_name}"
         if signal_key in existing_keys:
             continue
 
@@ -871,6 +925,7 @@ def update_runtime_signal_log(live_df: pd.DataFrame) -> pd.DataFrame:
                 "產業": _safe_text(row.get("產業"), "未知"),
                 "AI來源": _safe_text(row.get("AI來源"), ""),
                 "資料來源": _safe_text(row.get("資料來源"), ""),
+                "訊號類型": signal_group,
                 "首次訊號": alert_name,
                 "首次入場判斷": entry_name,
                 "首次標籤": _safe_text(row.get("盤中標籤"), alert_name),
@@ -966,10 +1021,129 @@ def clear_runtime_signal_log() -> None:
         pass
 
 
+
+# ---------- Surge radar ----------
+
+def _load_last_snapshot() -> pd.DataFrame:
+    if SURGE_SNAPSHOT_PATH.exists():
+        try:
+            df = pd.read_csv(SURGE_SNAPSHOT_PATH, dtype={"代號": str})
+            if "代號" in df.columns:
+                df["代號"] = df["代號"].astype(str).str.zfill(4)
+            return df
+        except Exception:
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+
+def _save_last_snapshot(live_df: pd.DataFrame) -> None:
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        now = now_taipei()
+        cols = ["代號", "名稱", "市場", "盤中現價", "盤中成交量", "盤中漲跌幅", "最高", "最低", "報價時間"]
+        cols = [c for c in cols if c in live_df.columns]
+        snap = live_df[cols].copy()
+        snap["快照日期"] = now.strftime("%Y-%m-%d")
+        snap["快照時間"] = now.strftime("%H:%M:%S")
+        snap.to_csv(SURGE_SNAPSHOT_PATH, index=False, encoding="utf-8-sig")
+    except Exception:
+        pass
+
+
+def update_surge_radar(live_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, bool]:
+    """v2.6.2: detect short-window acceleration by comparing current quotes with previous refresh.
+
+    This is a front-end/runtime radar. It detects *sudden change* between refreshes,
+    not just the current strongest names.
+    """
+    df = live_df.copy()
+    prev = _load_last_snapshot()
+    has_prev = not prev.empty and {"代號", "盤中現價"}.issubset(prev.columns)
+
+    for col, default in {
+        "上一輪價格": np.nan,
+        "上一輪成交量": np.nan,
+        "上一輪漲跌幅": np.nan,
+        "刷新漲速%": 0.0,
+        "量能增量": 0.0,
+        "量能跳升分": 0.0,
+        "突破日內高": False,
+        "爆衝警示": "",
+        "爆衝建議": "",
+    }.items():
+        df[col] = default
+
+    if has_prev:
+        prev_cols = ["代號", "盤中現價", "盤中成交量", "盤中漲跌幅", "快照時間"]
+        prev_cols = [c for c in prev_cols if c in prev.columns]
+        pm = prev[prev_cols].copy().rename(
+            columns={
+                "盤中現價": "上一輪價格",
+                "盤中成交量": "上一輪成交量",
+                "盤中漲跌幅": "上一輪漲跌幅",
+                "快照時間": "上一輪時間",
+            }
+        )
+        df = df.drop(columns=[c for c in ["上一輪價格", "上一輪成交量", "上一輪漲跌幅"] if c in df.columns])
+        df = df.merge(pm, on="代號", how="left")
+
+        current_px = pd.to_numeric(df.get("盤中現價"), errors="coerce")
+        prev_px = pd.to_numeric(df.get("上一輪價格"), errors="coerce")
+        current_vol = pd.to_numeric(df.get("盤中成交量"), errors="coerce").fillna(0)
+        prev_vol = pd.to_numeric(df.get("上一輪成交量"), errors="coerce").fillna(0)
+        day_high = pd.to_numeric(df.get("最高"), errors="coerce")
+
+        df["刷新漲速%"] = np.where(
+            (current_px > 0) & (prev_px > 0),
+            ((current_px - prev_px) / prev_px * 100).round(2),
+            0.0,
+        )
+        df["量能增量"] = (current_vol - prev_vol).clip(lower=0).round(0)
+        if df["量能增量"].max() > 0:
+            df["量能跳升分"] = (df["量能增量"].rank(pct=True) * 100).round(1)
+        else:
+            df["量能跳升分"] = 0.0
+        df["突破日內高"] = np.where((current_px > 0) & (day_high > 0), current_px >= day_high * 0.998, False)
+
+        def surge_label(row):
+            speed = float(row.get("刷新漲速%", 0) or 0)
+            vol_jump = float(row.get("量能跳升分", 0) or 0)
+            pct = float(row.get("盤中漲跌幅", 0) or 0)
+            risk = float(row.get("風險分", 0) or 0)
+            strength = float(row.get("即時強度分", 0) or 0)
+            is_manual = bool(row.get("手動加入", False))
+            high_break = bool(row.get("突破日內高", False))
+
+            if speed <= -1.2:
+                return "⚫ 急轉弱", "短時間價格下滑，先避開，不急著接。"
+            if pct >= 7.0 and speed >= 0.3:
+                return "🔴 已漲偏高", "已接近高漲幅區，先不追，等拉回或尾盤確認。"
+            if speed >= 2.0:
+                return "🟢 瞬間爆衝", "短線加速度明顯；只盯突破後是否站穩，勿市價亂追。"
+            if speed >= 1.0 and (vol_jump >= 55 or high_break or is_manual):
+                return "🟢 剛起漲", "短線價格轉強，可盯量能是否延續與回測不破。"
+            if speed >= 0.5 and pct > 0 and (vol_jump >= 60 or high_break) and strength >= 45:
+                return "🟡 爆量轉強", "量價同步轉強，等突破或回測確認。"
+            return "", ""
+
+        surge = df.apply(surge_label, axis=1)
+        df["爆衝警示"] = [x[0] for x in surge]
+        df["爆衝建議"] = [x[1] for x in surge]
+
+    surge_df = df[df["爆衝警示"].astype(str).str.len() > 0].copy()
+    if not surge_df.empty:
+        priority = {"🟢 瞬間爆衝": 1, "🟢 剛起漲": 2, "🟡 爆量轉強": 3, "🔴 已漲偏高": 4, "⚫ 急轉弱": 5}
+        surge_df["爆衝排序"] = surge_df["爆衝警示"].map(priority).fillna(9)
+        surge_df = surge_df.sort_values(["爆衝排序", "刷新漲速%", "量能跳升分"], ascending=[True, False, False])
+
+    _save_last_snapshot(df)
+    return df, surge_df, has_prev
+
+
 # ---------- UI ----------
 
-st.title("⚡ 盤中即時看盤 v2.6 訊號追蹤")
-st.caption("盤後 AI 候選 + 盤中市場池掃描 + 前台即時報價 + 入場時機輔助判斷 + 今日訊號追蹤。")
+st.title("⚡ 盤中即時看盤 v2.6.2 訊號品質 + 爆衝雷達")
+st.caption("盤後 AI 候選 + 盤中市場池掃描 + 前台即時報價 + 入場時機輔助判斷 + 訊號追蹤 + 短線爆衝雷達。")
 
 refresh_default = _get_query_int("refresh", 30, 15, 120, 15)
 top_n_default = _get_query_int("top_n", 15, 5, 50, 5)
@@ -1065,6 +1239,7 @@ else:
 
 live_df = compute_live_strength(merged, attack_threshold, watch_threshold, weak_drop, chase_pct)
 live_df = add_entry_timing(live_df, chase_pct=chase_pct)
+live_df, surge_df, surge_has_prev = update_surge_radar(live_df)
 # v2.5.1: Keep the internal boolean, but show a readable text column instead of a non-clickable checkbox.
 if "手動加入" in live_df.columns:
     live_df["加入來源"] = np.where(live_df["手動加入"].astype(bool), "手動監控", "自動掃描")
@@ -1104,10 +1279,20 @@ c11.metric("等回測確認", entry_pullback_count)
 c12.metric("自動刷新", f"{refresh_seconds} 秒")
 
 c13, c14, c15, c16 = st.columns(4)
-c13.metric("最後刷新", datetime.now().strftime("%H:%M:%S"))
+c13.metric("最後刷新", now_taipei().strftime("%H:%M:%S"))
 c14.metric("資料模式", scan_mode)
 c15.metric("市場池股數", market_pool_count)
 c16.metric("含盤後AI分數", daily_ai_count)
+
+surge_count = int(len(surge_df)) if "surge_df" in globals() else 0
+surge_manual_count = int(surge_df.get("手動加入", pd.Series(dtype=bool)).astype(bool).sum()) if surge_count else 0
+max_speed = float(pd.to_numeric(live_df.get("刷新漲速%", 0), errors="coerce").fillna(0).max()) if len(live_df) else 0.0
+vol_jump_count = int((pd.to_numeric(live_df.get("量能跳升分", 0), errors="coerce").fillna(0) >= 80).sum()) if len(live_df) else 0
+c17, c18, c19, c20 = st.columns(4)
+c17.metric("爆衝雷達", surge_count)
+c18.metric("手動爆衝", surge_manual_count)
+c19.metric("最高刷新漲速", f"{max_speed:.2f}%")
+c20.metric("量能跳升前段", vol_jump_count)
 
 st.caption(f"掃描來源：{universe_source}")
 if scan_mode == "盤中市場池掃描":
@@ -1116,11 +1301,25 @@ if scan_mode == "盤中市場池掃描":
 
 st.divider()
 
-# v2.6: signal tracking
+st.subheader("盤中爆衝雷達")
+st.caption("v2.6.2：比較上一輪與目前報價，抓短時間價格加速度、量能跳升、日內高點突破。這用來補足『突然爆衝』，不是單純看目前漲幅排行。")
+if not surge_has_prev:
+    st.info("這是本次啟動後第一輪快照，還沒有上一輪價格可比較。等下一次自動刷新後，爆衝雷達才會開始判斷。")
+elif surge_df.empty:
+    st.info("目前沒有偵測到明顯爆衝或急轉弱。")
+else:
+    surge_cols = [
+        "代號", "名稱", "市場", "產業", "加入來源", "資料來源", "AI來源", "爆衝警示", "刷新漲速%", "上一輪價格", "盤中現價",
+        "量能增量", "量能跳升分", "突破日內高", "盤中漲跌幅", "即時強度分", "盤中入場判斷", "觸發價", "停損參考", "壓力參考", "爆衝建議", "報價時間"
+    ]
+    surge_cols = [c for c in surge_cols if c in surge_df.columns]
+    st.dataframe(surge_df[surge_cols].head(top_n), use_container_width=True, hide_index=True)
+
+# v2.6.1/2: signal tracking
 signal_log_df = update_runtime_signal_log(live_df)
 
 st.subheader("今日訊號追蹤")
-st.caption("系統會紀錄盤中警示第一次出現的時間與價格，並追蹤目前報酬、最高報酬與最大回撤。這是前台即時紀錄；Streamlit 重開或重新部署後可能會重置，長期統計仍要靠後台回測。")
+st.caption("v2.6.1：只記錄有效進攻、觀察訊號、轉弱訊號與風險訊號，不再把大量普通中性股塞進紀錄。時間統一使用台灣時間。這是前台即時紀錄；Streamlit 重開或重新部署後可能會重置，長期統計仍要靠後台回測。")
 
 if signal_log_df.empty:
     st.info("目前尚未出現可追蹤的盤中訊號。")
@@ -1131,13 +1330,20 @@ else:
     best_ret = float(pd.to_numeric(signal_log_df.get("最高報酬%", 0), errors="coerce").fillna(0).max())
 
     s1, s2, s3, s4 = st.columns(4)
-    s1.metric("今日訊號數", sig_total)
+    s1.metric("今日有效訊號數", sig_total)
     s2.metric("目前為正", sig_effective)
     s3.metric("失效訊號", sig_failed)
     s4.metric("最高訊號報酬", f"{best_ret:.2f}%")
 
+    type_counts = signal_log_df.get("訊號類型", pd.Series(dtype=str)).astype(str).value_counts()
+    t1, t2, t3, t4 = st.columns(4)
+    t1.metric("有效進攻", int(type_counts.get("有效進攻", 0)))
+    t2.metric("觀察訊號", int(type_counts.get("觀察訊號", 0)))
+    t3.metric("轉弱訊號", int(type_counts.get("轉弱訊號", 0)))
+    t4.metric("風險訊號", int(type_counts.get("風險訊號", 0)))
+
     track_cols = [
-        "首次時間", "代號", "名稱", "市場", "首次標籤", "首次入場判斷", "首次訊號價", "目前價格",
+        "首次時間", "代號", "名稱", "市場", "訊號類型", "首次標籤", "首次入場判斷", "首次訊號價", "目前價格",
         "目前報酬%", "最高報酬%", "最大回撤%", "目前狀態", "AI總分", "風險分",
         "首次即時強度分", "最新即時強度分", "最新盤中漲跌幅", "觸發價", "停損參考", "壓力參考", "建議動作", "最新時間"
     ]
@@ -1151,7 +1357,7 @@ else:
     st.download_button(
         "下載今日訊號紀錄 CSV",
         data=csv_bytes,
-        file_name=f"intraday_signal_log_{datetime.now().strftime('%Y%m%d')}.csv",
+        file_name=f"intraday_signal_log_{now_taipei().strftime('%Y%m%d')}.csv",
         mime="text/csv",
     )
 
@@ -1166,7 +1372,7 @@ if manual_codes:
     st.subheader("手動監控股票即時狀態")
     st.caption("這區固定顯示你左側輸入的股票；即使它沒有進入今日AI候選或市場池前段，也會顯示。表格不需要勾選，加入來源會顯示為「手動監控」。")
     manual_cols = [
-        "代號", "名稱", "市場", "產業", "資料來源", "AI來源", "加入來源", "市場池排名", "盤中標籤", "盤中入場判斷", "入場型態",
+        "代號", "名稱", "市場", "產業", "資料來源", "AI來源", "加入來源", "市場池排名", "盤中標籤", "爆衝警示", "刷新漲速%", "量能跳升分", "盤中入場判斷", "入場型態",
         "觸發價", "停損參考", "壓力參考", "AI總分", "風險分", "即時強度分",
         "盤中現價", "盤中漲跌幅", "盤中成交量", "報價時間", "即時判斷", "建議動作"
     ]
@@ -1204,7 +1410,7 @@ entry_df["入場排序"] = entry_df["盤中入場判斷"].map(entry_priority).fi
 entry_df = entry_df.sort_values(["入場排序", "即時強度分"], ascending=[True, False])
 
 common_cols = [
-    "代號", "名稱", "市場", "產業", "資料來源", "AI來源", "加入來源", "市場池排名", "盤中標籤", "盤中入場判斷", "入場型態",
+    "代號", "名稱", "市場", "產業", "資料來源", "AI來源", "加入來源", "市場池排名", "盤中標籤", "爆衝警示", "刷新漲速%", "量能跳升分", "盤中入場判斷", "入場型態",
     "觸發價", "停損參考", "壓力參考", "AI總分", "風險分", "即時強度分",
     "盤中現價", "盤中漲跌幅", "盤中成交量", "報價時間", "即時判斷", "不追原因", "建議動作"
 ]
@@ -1231,4 +1437,4 @@ st.dataframe(filtered.sort_values(["警示排序", "即時強度分"], ascending
 st.subheader("全部掃描池即時快照")
 st.dataframe(live_df[market_cols], use_container_width=True, hide_index=True)
 
-st.caption("提醒：這是網頁快照更新，不是券商逐筆成交資料。市場池估分股沒有完整盤後籌碼驗證；觸發價、停損與壓力是規則化參考，不等於下單建議。")
+st.caption("提醒：這是網頁快照更新，不是券商逐筆成交資料。市場池估分股沒有完整盤後籌碼驗證；爆衝雷達抓的是短時間加速度，可能有假突破；觸發價、停損與壓力是規則化參考，不等於下單建議。")
