@@ -1,5 +1,5 @@
 # pages/live_intraday.py
-# v2.15 Live Intraday Permanent Learning DB + Post-close Verifier
+# v2.15.2 Live Intraday Permanent Learning DB + Sync Persistence Status
 # Purpose:
 # - Keep v2.4.x live AI candidate monitoring.
 # - Add a safer "market pool scan" mode: TWSE + TPEx turnover pool + live quotes.
@@ -3254,6 +3254,7 @@ V213_SIGNAL_JOURNAL_PATH = DATA_DIR / "v213_signal_journal.csv"
 V214_WEIGHT_PROFILE_PATH = DATA_DIR / "v214_weight_profile.json"
 V215_VERIFIED_JOURNAL_PATH = DATA_DIR / "v215_verified_signal_journal.csv"
 V215_SYNC_LOG_PATH = DATA_DIR / "v215_google_sheet_sync_log.csv"
+V215_CONFIG_PATH = DATA_DIR / "v215_google_sheet_config.json"
 
 
 def _v213_today() -> str:
@@ -3926,8 +3927,63 @@ def load_v215_sync_log() -> pd.DataFrame:
     return pd.DataFrame()
 
 
-st.title("🧬 盤中即時看盤 v2.15.1 真永久學習資料庫 + 盤後驗證器｜穩定紀錄修正版")
-st.caption("v2.15 把訊號紀錄升級成：本機 CSV + 可選 Google Sheet Webhook 同步 + 盤後/盤中驗證。重點是讓系統長記性；最高信號仍是小量試單，不是無腦重倉。")
+def load_v215_gsheet_config() -> Dict[str, Any]:
+    """Load Google Sheet sync settings from local data folder.
+
+    Streamlit query/session state can reset on a full browser reload.
+    This tiny config file keeps the webhook URL and auto-sync setting stable
+    during the app instance lifetime without putting the webhook into the URL.
+    """
+    try:
+        if V215_CONFIG_PATH.exists():
+            data = json.loads(V215_CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def save_v215_gsheet_config(webhook_url: str = "", enable: bool = False, auto_sync: bool = False) -> None:
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "webhook_url": str(webhook_url or "").strip(),
+            "enable": bool(enable),
+            "auto_sync": bool(auto_sync),
+            "updated_at": now_taipei().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        V215_CONFIG_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def clear_v215_gsheet_config() -> None:
+    try:
+        if V215_CONFIG_PATH.exists():
+            V215_CONFIG_PATH.unlink()
+    except Exception:
+        pass
+
+
+def latest_v215_sync_status() -> Dict[str, Any]:
+    df = load_v215_sync_log()
+    if df.empty:
+        return {"status": "尚未同步", "time": "-", "rows": 0, "message": "尚未送出 Google Sheet 同步"}
+    try:
+        row = df.tail(1).iloc[0].to_dict()
+        return {
+            "status": str(row.get("狀態", row.get("status", "-"))),
+            "time": str(row.get("時間", row.get("time", "-"))),
+            "rows": row.get("筆數", row.get("rows", 0)),
+            "message": str(row.get("訊息", row.get("message", ""))),
+        }
+    except Exception:
+        return {"status": "讀取失敗", "time": "-", "rows": 0, "message": "同步紀錄讀取失敗"}
+
+
+st.title("🧬 盤中即時看盤 v2.15.2 真永久學習資料庫｜同步狀態固定版")
+st.caption("v2.15.2 修正：Google Sheet URL / 自動同步開關會保存，不會刷新就消失；同步狀態、最後同步時間、同步筆數固定顯示。最高信號仍是小量試單，不是無腦重倉。")
 
 refresh_default = _get_query_int("refresh", 30, 15, 120, 15)
 top_n_default = _get_query_int("top_n", 15, 5, 50, 5)
@@ -3984,10 +4040,41 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("v2.15 永久學習")
+    _saved_gsheet_cfg = load_v215_gsheet_config()
     default_webhook = _v215_secret_value("GSHEET_WEBHOOK_URL", "google_sheet.webhook_url", default="")
-    v215_enable_gsheet = st.toggle("啟用 Google Sheet 同步", value=bool(default_webhook))
-    v215_webhook_url = st.text_input("Google Sheet Webhook URL", value=default_webhook, type="password", help="可放在 Streamlit secrets：GSHEET_WEBHOOK_URL。未設定時仍會保留本機 CSV 與下載功能。")
-    v215_auto_sync = st.toggle("每輪自動同步最近紀錄", value=False, help="建議先手動同步；確認 Apps Script 有 upsert 後再開自動。")
+    if not default_webhook:
+        default_webhook = str(_saved_gsheet_cfg.get("webhook_url", "") or "")
+    default_enable = bool(_saved_gsheet_cfg.get("enable", bool(default_webhook)))
+    default_auto_sync = bool(_saved_gsheet_cfg.get("auto_sync", False))
+
+    v215_enable_gsheet = st.toggle("啟用 Google Sheet 同步", value=default_enable, key="v215_enable_gsheet_persist")
+    v215_webhook_url = st.text_input(
+        "Google Sheet Webhook URL",
+        value=default_webhook,
+        type="password",
+        key="v215_webhook_url_persist",
+        help="會保存到 data/v215_google_sheet_config.json；刷新頁面不會消失。也可放 Streamlit secrets：GSHEET_WEBHOOK_URL。",
+    )
+    v215_auto_sync = st.toggle(
+        "每輪自動同步最近紀錄",
+        value=default_auto_sync,
+        key="v215_auto_sync_persist",
+        help="開啟後會跟著自動刷新秒數同步；例如刷新 60 秒，約每 60 秒同步一次。",
+    )
+
+    # Auto-save the URL/toggles so full browser reloads do not wipe them.
+    if str(v215_webhook_url or "").strip() or v215_enable_gsheet or v215_auto_sync:
+        save_v215_gsheet_config(v215_webhook_url, v215_enable_gsheet, v215_auto_sync)
+
+    st.caption(f"刷新頻率：約每 {refresh_seconds} 秒；自動同步：{'已開啟' if v215_auto_sync and v215_enable_gsheet else '未開啟'}")
+    _sync_status_sidebar = latest_v215_sync_status()
+    st.caption(f"最後同步：{_sync_status_sidebar.get('time', '-')}｜{_sync_status_sidebar.get('status', '-') }｜{_sync_status_sidebar.get('rows', 0)} 筆")
+    if st.button("儲存 Google Sheet 設定", type="secondary", key="v215_save_gsheet_config_btn"):
+        save_v215_gsheet_config(v215_webhook_url, v215_enable_gsheet, v215_auto_sync)
+        st.success("已儲存 Google Sheet 同步設定。")
+    if st.button("清除 Google Sheet 設定", type="secondary", key="v215_clear_gsheet_config_btn"):
+        clear_v215_gsheet_config()
+        st.success("已清除本機保存設定，請重新整理。")
 
 _set_query_if_changed({
     "view": view_mode,
@@ -4097,7 +4184,8 @@ v215_stats = build_v215_stats(v215_verified_journal_df)
 if "v215_enable_gsheet" in globals() and v215_enable_gsheet and v215_auto_sync:
     # Auto-sync only the latest rows to reduce repeated traffic. The webhook should upsert by 驗證Key.
     try:
-        push_v215_to_google_sheet(v215_verified_journal_df.tail(120), v215_webhook_url)
+        if str(v215_webhook_url or "").strip():
+            push_v215_to_google_sheet(v215_verified_journal_df.tail(120), v215_webhook_url)
     except Exception:
         pass
 
@@ -4143,10 +4231,19 @@ vm5, vm6 = st.columns(2)
 vm5.info(f"目前較有效型態：{_safe_text(v215_stats.get('best_type'), '樣本不足')}")
 vm6.warning(f"目前較弱型態：{_safe_text(v215_stats.get('weak_type'), '樣本不足')}")
 
+# v2.15.2: Sync status is always visible, so the user does not need to guess whether it is working.
+st.markdown("#### 🔁 Google Sheet 同步狀態")
+sync_status = latest_v215_sync_status()
+sm1, sm2, sm3, sm4 = st.columns(4)
+sm1.metric("同步開關", "開啟" if ('v215_enable_gsheet' in globals() and v215_enable_gsheet) else "關閉")
+sm2.metric("自動同步", "開啟" if ('v215_auto_sync' in globals() and v215_auto_sync and v215_enable_gsheet) else "關閉")
+sm3.metric("最後同步", _safe_text(sync_status.get("time"), "-"))
+sm4.metric("最後筆數", sync_status.get("rows", 0))
+
 if 'v215_enable_gsheet' in globals() and v215_enable_gsheet:
     c_sync, c_log = st.columns([1, 2])
     with c_sync:
-        if st.button("同步到 Google Sheet", type="primary"):
+        if st.button("立即同步到 Google Sheet", type="primary"):
             ok, msg = push_v215_to_google_sheet(v215_verified_journal_df, v215_webhook_url)
             if ok:
                 st.success("已送出 Google Sheet 同步。")
@@ -4156,19 +4253,27 @@ if 'v215_enable_gsheet' in globals() and v215_enable_gsheet:
         sync_log = load_v215_sync_log()
         if not sync_log.empty:
             st.caption("最近同步紀錄")
-            st.dataframe(sync_log.tail(3), use_container_width=True, hide_index=True)
+            st.dataframe(sync_log.tail(5), use_container_width=True, hide_index=True)
+        else:
+            st.caption("尚未有同步紀錄。")
 else:
     st.info("尚未啟用 Google Sheet 同步；目前仍會保留本機 CSV，並可在下方下載。")
 
 # v2.14 compact weight-learning status.
 st.subheader("🧠 v2.14 / v2.15 自動調權狀態")
 wm1, wm2, wm3, wm4 = st.columns(4)
-wm1.metric("樣本數", int(v214_weight_profile.get("sample_size", 0)))
-wm2.metric("學習勝率", f"{float(v214_weight_profile.get('success_rate', 0)):.1f}%")
-wm3.metric("左側/資金權重", f"{float(v214_weight_profile.get('left_weight', 1)):.2f} / {float(v214_weight_profile.get('money_weight', 1)):.2f}")
-wm4.metric("前兆/風險權重", f"{float(v214_weight_profile.get('limit_weight', 1)):.2f} / {float(v214_weight_profile.get('risk_penalty', 1)):.2f}")
+sample_size = int(v214_weight_profile.get("sample_size", 0))
+verified_n = int(v215_stats.get("verified", 0))
+learning_ready = "資料不足" if sample_size < 30 or verified_n < 30 else "可開始參考"
+wm1.metric("學習樣本", f"{sample_size} / 30")
+wm2.metric("驗證樣本", f"{verified_n} / 30")
+wm3.metric("學習勝率", f"{float(v214_weight_profile.get('success_rate', 0)):.1f}%")
+wm4.metric("學習成熟度", learning_ready)
+wm5, wm6 = st.columns(2)
+wm5.metric("左側/資金權重", f"{float(v214_weight_profile.get('left_weight', 1)):.2f} / {float(v214_weight_profile.get('money_weight', 1)):.2f}")
+wm6.metric("前兆/風險權重", f"{float(v214_weight_profile.get('limit_weight', 1)):.2f} / {float(v214_weight_profile.get('risk_penalty', 1)):.2f}")
 st.caption(_safe_text(v214_weight_profile.get("confidence"), "") + "｜" + _safe_text(v214_weight_profile.get("note"), ""))
-st.warning("我不會把它寫成『無腦買入』按鈕。最高只會顯示 🟢 高信心小量，仍必須照防守停損執行；沒有任何盤中模型能保證漲停或保證獲利。")
+st.warning("學習勝率不是每輪即時變動的『學習率』；要等盤後驗證樣本累積後才有意義。最高只會顯示 🟢 高信心小量，仍必須照防守停損執行。")
 
 # 1) Primary current decision table.
 st.subheader("🧭 v2.14 交易員目前決策")
