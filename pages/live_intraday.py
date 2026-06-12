@@ -85,6 +85,10 @@ def load_rank() -> pd.DataFrame:
         df["市場"] = "未知"
     if "產業" not in df.columns:
         df["產業"] = "未知"
+    if "資料來源" not in df.columns:
+        df["資料來源"] = "盤後AI候選"
+    if "手動加入" not in df.columns:
+        df["手動加入"] = False
     return df
 
 
@@ -450,26 +454,189 @@ def add_entry_timing(df: pd.DataFrame, chase_pct=7.0) -> pd.DataFrame:
     return df
 
 
+
+# ---------- Persistent settings and manual watchlist ----------
+
+LOCAL_STOCK_INFO = {
+    "3441": ("聯一光", "光電業"),
+    "2330": ("台積電", "半導體業"),
+    "2313": ("華通", "電子工業"),
+    "2382": ("廣達", "電子工業"),
+    "2327": ("國巨*", "電子工業"),
+    "2884": ("玉山金", "金融保險"),
+    "2892": ("第一金", "金融保險"),
+    "2379": ("瑞昱", "半導體業"),
+    "4938": ("和碩", "電子工業"),
+    "2881": ("富邦金", "金融保險"),
+}
+
+
+def _get_query_value(name: str, default: str = "") -> str:
+    """Read a single value from st.query_params safely."""
+    try:
+        value = st.query_params.get(name, default)
+        if isinstance(value, list):
+            return str(value[0]) if value else default
+        return str(value)
+    except Exception:
+        return default
+
+
+def _get_query_int(name: str, default: int, min_value: int, max_value: int, step: int = 1) -> int:
+    try:
+        value = int(float(_get_query_value(name, str(default))))
+    except Exception:
+        value = default
+    value = max(min_value, min(max_value, value))
+    if step > 1:
+        value = int(round(value / step) * step)
+        value = max(min_value, min(max_value, value))
+    return value
+
+
+def _get_query_float(name: str, default: float, min_value: float, max_value: float, step: float = 0.5) -> float:
+    try:
+        value = float(_get_query_value(name, str(default)))
+    except Exception:
+        value = default
+    value = max(min_value, min(max_value, value))
+    if step:
+        value = round(value / step) * step
+        value = max(min_value, min(max_value, value))
+    return float(value)
+
+
+def _set_query_if_changed(values: Dict[str, str]) -> None:
+    """Persist sidebar settings into the URL so browser auto-refresh keeps them."""
+    try:
+        changed = False
+        for key, value in values.items():
+            old = _get_query_value(key, "")
+            if old != str(value):
+                changed = True
+                break
+        if changed:
+            for key, value in values.items():
+                st.query_params[key] = str(value)
+    except Exception:
+        # App should continue even if query params are unavailable on an older Streamlit version.
+        pass
+
+
+def parse_extra_codes(text: str) -> List[str]:
+    """Parse comma / space / newline separated Taiwan stock codes."""
+    if not text:
+        return []
+    cleaned = (
+        str(text)
+        .replace("，", ",")
+        .replace("、", ",")
+        .replace("\n", ",")
+        .replace("\t", ",")
+        .replace(" ", ",")
+    )
+    codes = []
+    for part in cleaned.split(","):
+        code = "".join(ch for ch in part.strip() if ch.isdigit())
+        if len(code) == 4 and code not in codes:
+            codes.append(code)
+    return codes
+
+
+def append_manual_codes(df: pd.DataFrame, codes: List[str], manual_ai_score: int = 50, manual_risk_score: int = 20) -> pd.DataFrame:
+    """Append stocks that are not in the daily AI candidate list.
+
+    Manual additions use a neutral AI score for sorting, because they do not have a full daily AI analysis.
+    Intraday quote fields are still fetched live.
+    """
+    df = df.copy()
+    existing = set(df["代號"].astype(str).str.zfill(4))
+    rows = []
+
+    for code in codes:
+        if code in existing:
+            # Mark existing candidate as manually watched too, but keep its original AI score.
+            df.loc[df["代號"].astype(str).str.zfill(4) == code, "手動加入"] = True
+            continue
+
+        name, industry = LOCAL_STOCK_INFO.get(code, (code, "未知"))
+        rows.append(
+            {
+                "代號": code,
+                "名稱": name,
+                "市場": "未知",
+                "產業": industry,
+                "AI總分": manual_ai_score,
+                "風險分": manual_risk_score,
+                "資料來源": "手動監控",
+                "手動加入": True,
+            }
+        )
+
+    if rows:
+        df = pd.concat([df, pd.DataFrame(rows)], ignore_index=True)
+
+    df["代號"] = df["代號"].astype(str).str.zfill(4)
+    return df
+
 # ---------- UI ----------
 
-st.title("⚡ 盤中即時看盤 v2.4.6")
+st.title("⚡ 盤中即時看盤 v2.4.7")
 st.caption("前台即時刷新頁：盤後 AI 排名 + 盤中報價 + 警示標籤 + 今日優先盯盤 + 入場時機輔助判斷。")
+
+# Defaults are read from URL query parameters.
+refresh_default = _get_query_int("refresh", 30, 15, 120, 15)
+top_n_default = _get_query_int("top_n", 15, 5, 30, 5)
+min_ai_default = _get_query_int("min_ai", 0, 0, 100, 5)
+min_strength_default = _get_query_int("min_strength", 0, 0, 100, 5)
+attack_default = _get_query_int("attack", 65, 50, 85, 5)
+watch_default = _get_query_int("watch", 55, 40, 75, 5)
+weak_default = _get_query_float("weak", -1.0, -5.0, 0.0, 0.5)
+chase_default = _get_query_float("chase", 7.0, 3.0, 10.0, 0.5)
+extra_codes_default = _get_query_value("extra_codes", "")
 
 with st.sidebar:
     st.header("即時設定")
-    refresh_seconds = st.slider("自動刷新秒數", min_value=15, max_value=120, value=30, step=15)
-    top_n = st.slider("顯示前 N 檔", min_value=5, max_value=30, value=15, step=5)
-    min_ai = st.slider("最低 AI 總分", 0, 100, 0, 5)
-    min_strength = st.slider("最低即時強度分", 0, 100, 0, 5)
+    refresh_seconds = st.slider("自動刷新秒數", min_value=15, max_value=120, value=refresh_default, step=15, key="refresh_seconds")
+    top_n = st.slider("顯示前 N 檔", min_value=5, max_value=30, value=top_n_default, step=5, key="top_n")
+    min_ai = st.slider("最低 AI 總分", 0, 100, min_ai_default, 5, key="min_ai")
+    min_strength = st.slider("最低即時強度分", 0, 100, min_strength_default, 5, key="min_strength")
+
+    st.markdown("---")
+    st.subheader("手動監控股票")
+    extra_codes_text = st.text_area(
+        "額外監控代碼",
+        value=extra_codes_default,
+        placeholder="例如：3441, 6285, 2313",
+        help="輸入不在今日 AI 候選清單內的股票，也會一起抓盤中報價。手動加入股採中性 AI 分數，主要看盤中動能。",
+        key="extra_codes_text",
+    )
+    manual_codes = parse_extra_codes(extra_codes_text)
+    if manual_codes:
+        st.caption("已手動加入：" + "、".join(manual_codes))
 
     st.markdown("---")
     st.subheader("警示條件")
-    attack_threshold = st.slider("強勢進攻門檻", 50, 85, 65, 5)
-    watch_threshold = st.slider("觀察偏強門檻", 40, 75, 55, 5)
-    weak_drop = st.slider("AI高分轉弱跌幅", -5.0, 0.0, -1.0, 0.5)
-    chase_pct = st.slider("不要追高漲幅", 3.0, 10.0, 7.0, 0.5)
+    attack_threshold = st.slider("強勢進攻門檻", 50, 85, attack_default, 5, key="attack_threshold")
+    watch_threshold = st.slider("觀察偏強門檻", 40, 75, watch_default, 5, key="watch_threshold")
+    weak_drop = st.slider("AI高分轉弱跌幅", -5.0, 0.0, weak_default, 0.5, key="weak_drop")
+    chase_pct = st.slider("不要追高漲幅", 3.0, 10.0, chase_default, 0.5, key="chase_pct")
 
-    st.info("保持這個頁面開著，它會依設定重新整理並抓最新快照。")
+    st.info("設定會寫進網址參數，所以自動刷新後不會跳回預設值。手動加入股票也會保留。")
+
+_set_query_if_changed(
+    {
+        "refresh": refresh_seconds,
+        "top_n": top_n,
+        "min_ai": min_ai,
+        "min_strength": min_strength,
+        "attack": attack_threshold,
+        "watch": watch_threshold,
+        "weak": weak_drop,
+        "chase": chase_pct,
+        "extra_codes": extra_codes_text.strip(),
+    }
+)
 
 # Browser auto reload. This refreshes this page, not the whole GitHub Action data.
 components.html(
@@ -484,6 +651,7 @@ components.html(
 )
 
 rank_df = load_rank()
+rank_df = append_manual_codes(rank_df, manual_codes)
 symbols, _ = build_symbols(rank_df)
 quotes_df = fetch_twse_mis_quotes(symbols)
 
@@ -563,7 +731,7 @@ entry_df["入場排序"] = entry_df["盤中入場判斷"].map(entry_priority).fi
 entry_df = entry_df.sort_values(["入場排序", "即時強度分"], ascending=[True, False])
 
 entry_cols = [
-    "代號", "名稱", "市場", "產業", "盤中標籤", "盤中入場判斷", "入場型態",
+    "代號", "名稱", "市場", "產業", "資料來源", "手動加入", "盤中標籤", "盤中入場判斷", "入場型態",
     "觸發價", "停損參考", "壓力參考", "AI總分", "風險分", "即時強度分",
     "盤中現價", "盤中漲跌幅", "盤中成交量", "不追原因", "建議動作"
 ]
@@ -582,7 +750,7 @@ st.subheader("今日優先盯盤")
 st.caption("只列出：強勢進攻 / 觀察偏強，且風險分不高、AI 分數不太低、盤中漲幅為正。")
 
 watch_cols = [
-    "代號", "名稱", "市場", "產業", "盤中標籤", "盤中入場判斷", "入場型態", "觸發價", "停損參考", "壓力參考",
+    "代號", "名稱", "市場", "產業", "資料來源", "手動加入", "盤中標籤", "盤中入場判斷", "入場型態", "觸發價", "停損參考", "壓力參考",
     "AI總分", "風險分", "即時強度分", "盤中現價", "盤中漲跌幅", "盤中成交量", "報價時間", "即時判斷"
 ]
 watch_cols = [c for c in watch_cols if c in watch_df.columns]
@@ -600,7 +768,7 @@ st.subheader("盤中警示清單")
 st.caption("優先看：🟢 強勢進攻、🟡 觀察偏強、🟠 AI高分轉弱、🔴 不要追高 / 高風險。這是盤中輔助判斷，不等於下單建議。")
 
 show_cols = [
-    "代號", "名稱", "市場", "產業", "盤中標籤", "盤中入場判斷", "入場型態", "觸發價", "停損參考", "壓力參考",
+    "代號", "名稱", "市場", "產業", "資料來源", "手動加入", "盤中標籤", "盤中入場判斷", "入場型態", "觸發價", "停損參考", "壓力參考",
     "AI總分", "風險分", "即時強度分", "盤中現價", "盤中漲跌幅", "盤中成交量", "報價時間", "即時判斷"
 ]
 show_cols = [c for c in show_cols if c in filtered.columns]
