@@ -1,0 +1,124 @@
+{
+  "updated_at": "2026-06-12T17:59:10.006115+08:00",
+  "session_mode": "night_context",
+  "market_env_score": 77.2,
+  "market_label": "🟢 大盤偏多",
+  "market_action": "可維持左側試單，但仍看停損距離。",
+  "night_risk_score": 33.1,
+  "night_label": "🟢 夜盤偏多",
+  "next_day_note": "隔日 AI / 半導體 / 資金股承接機率較高。",
+  "breadth": {
+    "ok": true,
+    "source": "data/intraday_snapshot.csv",
+    "rows": 30,
+    "valid_pct_rows": 30,
+    "up_count": 23,
+    "down_count": 7,
+    "flat_count": 0,
+    "up_ratio": 0.7667,
+    "avg_pct": -0.013,
+    "median_pct": 2.575,
+    "max_pct": 10.0,
+    "min_pct": -100.0
+  },
+  "indices": {
+    "TWII": {
+      "symbol": "^TWII",
+      "label": "加權指數",
+      "ok": true,
+      "price": 44169.04,
+      "previous_close": 43149.46,
+      "change_pct": 2.3629032669238543,
+      "currency": "TWD",
+      "exchange": "TAI",
+      "source": "Yahoo chart"
+    },
+    "TWOII": {
+      "symbol": "^TWOII",
+      "label": "櫃買指數",
+      "ok": true,
+      "price": 269.45,
+      "previous_close": 267.72,
+      "change_pct": 0.6461975197967882,
+      "currency": "TWD",
+      "exchange": "TWO",
+      "source": "Yahoo chart"
+    }
+  },
+  "night_proxies": {
+    "NQ=F": {
+      "symbol": "NQ=F",
+      "label": "NASDAQ 100 期貨",
+      "ok": true,
+      "price": 29621.75,
+      "previous_close": 29464.75,
+      "change_pct": 0.5328400885804224,
+      "currency": "USD",
+      "exchange": "CME",
+      "source": "Yahoo chart"
+    },
+    "ES=F": {
+      "symbol": "ES=F",
+      "label": "S&P 500 期貨",
+      "ok": true,
+      "price": 7442.25,
+      "previous_close": 7396.0,
+      "change_pct": 0.6253380205516496,
+      "currency": "USD",
+      "exchange": "CME",
+      "source": "Yahoo chart"
+    },
+    "SOX": {
+      "symbol": "^SOX",
+      "label": "費半指數",
+      "ok": true,
+      "price": 13171.438,
+      "previous_close": 12206.462,
+      "change_pct": 7.905452046629077,
+      "currency": "USD",
+      "exchange": "NIM",
+      "source": "Yahoo chart"
+    },
+    "TNX": {
+      "symbol": "^TNX",
+      "label": "美10年殖利率",
+      "ok": true,
+      "price": 4.463,
+      "previous_close": 4.542,
+      "change_pct": -1.7393218846323149,
+      "currency": "USD",
+      "exchange": "CGI",
+      "source": "Yahoo chart"
+    },
+    "DXY": {
+      "symbol": "DX-Y.NYB",
+      "label": "美元指數",
+      "ok": true,
+      "price": 99.672,
+      "previous_close": 99.858,
+      "change_pct": -0.18626449558373595,
+      "currency": "USD",
+      "exchange": "NYB",
+      "source": "Yahoo chart"
+    },
+    "CL=F": {
+      "symbol": "CL=F",
+      "label": "WTI 原油期貨",
+      "ok": true,
+      "price": 84.13,
+      "previous_close": 87.71,
+      "change_pct": -4.081632653061223,
+      "currency": "USD",
+      "exchange": "NYM",
+      "source": "Yahoo chart"
+    }
+  },
+  "source_status": {
+    "twii_ok": true,
+    "twoii_ok": true,
+    "nq_ok": true,
+    "es_ok": true,
+    "sox_ok": true,
+    "breadth_ok": true
+  }
+}

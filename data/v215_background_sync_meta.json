@@ -1,6 +1,7 @@
 {
-  "updated_at": "2026-06-12T16:19:18.498554+08:00",
+  "updated_at": "2026-06-12T17:59:11.196053+08:00",
   "status": "ok",
+  "session_mode": "night_context",
   "pool_count": 180,
   "quote_raw_count": 167,
   "live_count": 166,
