@@ -2,6 +2,15 @@ name: v2.15.4 Background Learning Sync
 
 on:
   workflow_dispatch:
+    inputs:
+      force_run:
+        description: 'Force run even outside Taiwan market window? Use 1 for manual test.'
+        required: false
+        default: '1'
+        type: choice
+        options:
+          - '1'
+          - '0'
   schedule:
     # Taiwan market/session window: 08:50-14:20 TWT ~= 00:50-06:20 UTC.
     # GitHub schedule may be delayed; script itself will skip outside the Taiwan window.
@@ -17,7 +26,7 @@ concurrency:
 jobs:
   background-learning-sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -36,7 +45,7 @@ jobs:
 
       - name: Pull latest data before sync
         run: |
-          git pull --rebase origin main || true
+          git pull --rebase origin main
 
       - name: Run background learning sync
         env:
@@ -44,14 +53,40 @@ jobs:
           BACKGROUND_POOL_LIMIT: '180'
           BACKGROUND_SYNC_LIMIT: '120'
           BACKGROUND_BATCH_SIZE: '20'
+          FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force_run || '0' }}
         run: |
           python background_learning_sync.py
+
+      - name: Show generated learning files
+        run: |
+          echo "=== data folder ==="
+          ls -la data || true
+          echo "=== background sync meta ==="
+          cat data/v215_background_sync_meta.json || true
+          echo "=== journal preview ==="
+          python - <<'PY'
+          import pandas as pd
+          from pathlib import Path
+          p = Path('data/v215_verified_signal_journal.csv')
+          print('exists:', p.exists())
+          if p.exists():
+              df = pd.read_csv(p, dtype=str)
+              print('rows:', len(df))
+              print('columns:', list(df.columns)[:20])
+              print(df.tail(3).to_string(index=False))
+          PY
 
       - name: Commit updated learning journal
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/v215_verified_signal_journal.csv data/v215_background_sync_meta.json || true
-          git diff --cached --quiet && echo "No learning journal changes" || git commit -m "chore: update v2.15.4 background learning journal"
-          git pull --rebase origin main || true
-          git push || true
+          git add -A data/v215_verified_signal_journal.csv data/v215_background_sync_meta.json
+          echo "=== git status before commit ==="
+          git status --short
+          if git diff --cached --quiet; then
+            echo "No learning journal changes to commit."
+          else
+            git commit -m "chore: update v2.15.4 background learning journal"
+            git pull --rebase origin main
+            git push
+          fi
