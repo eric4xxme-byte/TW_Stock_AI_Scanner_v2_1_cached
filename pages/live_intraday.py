@@ -1,5 +1,5 @@
 # pages/live_intraday.py
-# v2.6.2 Live Intraday Signal Quality + Surge Radar
+# v2.7 Live Intraday Decision Dashboard + Limit-Up Surge Radar
 # Purpose:
 # - Keep v2.4.x live AI candidate monitoring.
 # - Add a safer "market pool scan" mode: TWSE + TPEx turnover pool + live quotes.
@@ -680,6 +680,143 @@ def add_entry_timing(df: pd.DataFrame, chase_pct=7.0) -> pd.DataFrame:
     plans = df.apply(plan, axis=1)
     for col in plans.columns:
         df[col] = plans[col]
+
+    return df
+
+
+def add_decision_dashboard(df: pd.DataFrame) -> pd.DataFrame:
+    """v2.7: Convert many intraday signals into a simpler decision layer.
+
+    The goal is not to issue an order, but to answer:
+    - Which stock should be watched first?
+    - Is it a breakout watch, pullback watch, no-chase, or avoid?
+    - How far is it from limit-up?
+    """
+    df = df.copy()
+
+    def decision(row):
+        ai = float(row.get("AI總分", 0) or 0)
+        risk = float(row.get("風險分", 0) or 0)
+        strength = float(row.get("即時強度分", 0) or 0)
+        pct = float(row.get("盤中漲跌幅", 0) or 0)
+        vol_score = float(row.get("盤中量能分", 0) or 0)
+        speed = float(row.get("刷新漲速%", 0) or 0)
+        vol_jump = float(row.get("量能跳升分", 0) or 0)
+        px = _to_float(row.get("盤中現價"))
+        prev = _to_float(row.get("昨收"))
+        high = _to_float(row.get("最高"))
+        low = _to_float(row.get("最低"))
+        alert = str(row.get("盤中警示", ""))
+        entry = str(row.get("盤中入場判斷", ""))
+        surge = str(row.get("爆衝警示", ""))
+        ai_source = str(row.get("AI來源", ""))
+
+        if math.isnan(px) or px <= 0:
+            return pd.Series({
+                "決策等級": "⚪ 無報價",
+                "決策分": 0.0,
+                "漲停參考": "-",
+                "漲停距離%": np.nan,
+                "漲停雷達": "無報價",
+                "是否可入場": "不可判斷",
+                "入場建議": "等待下一次即時報價刷新。",
+                "第一優先原因": "盤中報價不足",
+            })
+
+        limit_up = prev * 1.1 if not math.isnan(prev) and prev > 0 else px * 1.1
+        limit_dist = max(0.0, (limit_up - px) / px * 100) if px > 0 else np.nan
+        near_limit = (pct >= 8.5) or (not math.isnan(limit_dist) and limit_dist <= 1.8)
+        day_high_break = False
+        if not math.isnan(high) and high > 0:
+            day_high_break = px >= high * 0.998
+
+        # 爆衝分：獨立於盤後AI，專抓短線加速度與接近漲停。
+        surge_score = 0.0
+        surge_score += max(0.0, min(35.0, pct * 3.0))
+        surge_score += max(0.0, min(30.0, speed * 12.0))
+        surge_score += min(20.0, vol_jump * 0.20)
+        surge_score += 8.0 if day_high_break else 0.0
+        surge_score += 10.0 if near_limit else 0.0
+        surge_score = round(min(100.0, surge_score), 1)
+
+        # 綜合決策分：盤後AI是品質底，盤中動能是觸發，風險扣分。
+        decision_score = (
+            ai * 0.30
+            + strength * 0.30
+            + surge_score * 0.25
+            + vol_score * 0.10
+            - risk * 0.15
+        )
+        decision_score = round(max(0.0, min(100.0, decision_score)), 1)
+
+        limit_radar = "🔥 接近漲停" if near_limit else "🚀 爆衝觀察" if surge_score >= 55 else "🟡 動能觀察" if surge_score >= 35 else "一般"
+
+        # Clear, one-line decision; favor safety if already too extended.
+        if pct >= 8.0 or (near_limit and speed < 0.6):
+            grade = "🔴 D 不追高"
+            can_enter = "不建議追價"
+            advice = "已進入高漲幅/近漲停區，除非已持有；新進先等拉回、回測不破或尾盤確認。"
+            reason = "漲幅已高，追價風險大"
+        elif risk >= 40 and pct > 0:
+            grade = "🔴 D 高風險"
+            can_enter = "不建議追價"
+            advice = "風險分偏高，即使上漲也先觀察，不用追。"
+            reason = "風險分偏高"
+        elif pct <= -1.5 or strength < 35 or alert == "盤中轉弱":
+            grade = "⚫ E 轉弱避開"
+            can_enter = "不建議"
+            advice = "盤中轉弱或強度不足，先避開，等重新站回再看。"
+            reason = "盤中轉弱"
+        elif alert == "AI高分轉弱" or (ai >= 60 and pct <= -0.5):
+            grade = "🟠 C 高分轉弱"
+            can_enter = "等重新站回"
+            advice = "盤後AI分數不差，但盤中轉弱；等重新站回觸發價且量能回來。"
+            reason = "AI高分但盤中弱"
+        elif (surge_score >= 60 and 0.8 <= pct < 7.5 and risk < 35) or entry == "強勢進攻，可盯突破" or surge in {"🟢 瞬間爆衝", "🟢 剛起漲"}:
+            # 市場池估分股也可以列出，但建議保守。
+            grade = "🟢 A 可盯突破"
+            can_enter = "等觸發，不市價追"
+            extra = "市場池估分股需更小心，先看是否站穩。" if ai_source == "市場池估分" else ""
+            advice = f"若帶量站上觸發價並維持 1～2 輪刷新，可列入優先觀察；沒站穩就放棄。{extra}"
+            reason = "盤中動能與爆衝分同步"
+        elif (strength >= 55 and pct > 0 and risk < 40 and decision_score >= 45) or entry == "觀察偏強，等回測確認":
+            grade = "🟡 B 等回測"
+            can_enter = "等回測確認"
+            advice = "不要追高，等回測昨收/開盤/觸發價附近不破，或重新放量再觀察。"
+            reason = "偏強但未達強攻"
+        else:
+            grade = "🔵 C 僅觀察"
+            can_enter = "先不進"
+            advice = "條件尚未同步，等待下一次刷新或更明確的突破/回測訊號。"
+            reason = "訊號不足"
+
+        return pd.Series({
+            "決策等級": grade,
+            "決策分": decision_score,
+            "爆衝分": surge_score,
+            "漲停參考": _fmt_price(limit_up),
+            "漲停距離%": round(limit_dist, 2) if not math.isnan(limit_dist) else np.nan,
+            "漲停雷達": limit_radar,
+            "是否可入場": can_enter,
+            "入場建議": advice,
+            "第一優先原因": reason,
+        })
+
+    decisions = df.apply(decision, axis=1)
+    for col in decisions.columns:
+        df[col] = decisions[col]
+
+    priority = {
+        "🟢 A 可盯突破": 1,
+        "🟡 B 等回測": 2,
+        "🟠 C 高分轉弱": 3,
+        "🔵 C 僅觀察": 4,
+        "🔴 D 不追高": 5,
+        "🔴 D 高風險": 6,
+        "⚫ E 轉弱避開": 7,
+        "⚪ 無報價": 9,
+    }
+    df["決策排序"] = df["決策等級"].map(priority).fillna(9)
     return df
 
 
@@ -1142,8 +1279,8 @@ def update_surge_radar(live_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFram
 
 # ---------- UI ----------
 
-st.title("⚡ 盤中即時看盤 v2.6.2 訊號品質 + 爆衝雷達")
-st.caption("盤後 AI 候選 + 盤中市場池掃描 + 前台即時報價 + 入場時機輔助判斷 + 訊號追蹤 + 短線爆衝雷達。")
+st.title("⚡ 盤中即時看盤 v2.7 決策中控台 + 漲停爆衝雷達")
+st.caption("把盤中訊號整理成：可盯突破、等回測、不可追、轉弱避開。先看決策中控台，再看詳細表格。")
 
 refresh_default = _get_query_int("refresh", 30, 15, 120, 15)
 top_n_default = _get_query_int("top_n", 15, 5, 50, 5)
@@ -1240,6 +1377,7 @@ else:
 live_df = compute_live_strength(merged, attack_threshold, watch_threshold, weak_drop, chase_pct)
 live_df = add_entry_timing(live_df, chase_pct=chase_pct)
 live_df, surge_df, surge_has_prev = update_surge_radar(live_df)
+live_df = add_decision_dashboard(live_df)
 # v2.5.1: Keep the internal boolean, but show a readable text column instead of a non-clickable checkbox.
 if "手動加入" in live_df.columns:
     live_df["加入來源"] = np.where(live_df["手動加入"].astype(bool), "手動監控", "自動掃描")
@@ -1294,6 +1432,13 @@ c18.metric("手動爆衝", surge_manual_count)
 c19.metric("最高刷新漲速", f"{max_speed:.2f}%")
 c20.metric("量能跳升前段", vol_jump_count)
 
+decision_counts = live_df.get("決策等級", pd.Series(dtype=str)).astype(str).value_counts()
+d1, d2, d3, d4 = st.columns(4)
+d1.metric("A 可盯突破", int(decision_counts.get("🟢 A 可盯突破", 0)))
+d2.metric("B 等回測", int(decision_counts.get("🟡 B 等回測", 0)))
+d3.metric("不追/高風險", int(decision_counts.get("🔴 D 不追高", 0) + decision_counts.get("🔴 D 高風險", 0)))
+d4.metric("轉弱避開", int(decision_counts.get("⚫ E 轉弱避開", 0) + decision_counts.get("🟠 C 高分轉弱", 0)))
+
 st.caption(f"掃描來源：{universe_source}")
 if scan_mode == "盤中市場池掃描":
     st.warning("市場池掃描股若顯示『市場池估分』，代表它只有盤中動能與成交金額排序，沒有完整盤後AI/籌碼驗證。入場判斷要更保守。")
@@ -1301,7 +1446,34 @@ if scan_mode == "盤中市場池掃描":
 
 st.divider()
 
-st.subheader("盤中爆衝雷達")
+st.subheader("🎯 今日入場決策中控台")
+st.caption("先看這區：A 是可盯突破、B 是等回測；D/E 不追。這是盤中輔助判斷，不是自動下單指令。")
+
+decision_cols = [
+    "代號", "名稱", "市場", "產業", "決策等級", "是否可入場", "決策分", "爆衝分", "漲停雷達", "漲停距離%",
+    "盤中現價", "盤中漲跌幅", "刷新漲速%", "盤中成交量", "AI總分", "風險分", "即時強度分",
+    "觸發價", "停損參考", "壓力參考", "第一優先原因", "入場建議", "資料來源", "AI來源", "報價時間"
+]
+decision_cols = [c for c in decision_cols if c in live_df.columns]
+
+ready_df = live_df[live_df["決策等級"].isin(["🟢 A 可盯突破", "🟡 B 等回測"])].copy()
+ready_df = ready_df.sort_values(["決策排序", "決策分", "即時強度分"], ascending=[True, False, False])
+
+risk_df = live_df[live_df["決策等級"].isin(["🔴 D 不追高", "🔴 D 高風險", "🟠 C 高分轉弱", "⚫ E 轉弱避開"])].copy()
+risk_df = risk_df.sort_values(["決策排序", "決策分"], ascending=[True, False])
+
+if ready_df.empty:
+    st.info("目前沒有 A/B 級入場觀察股。先不要硬追，等下一次刷新或等回測訊號。")
+else:
+    st.dataframe(ready_df[decision_cols].head(top_n), use_container_width=True, hide_index=True)
+
+with st.expander("🔴 目前不建議追價 / 轉弱避開", expanded=False):
+    if risk_df.empty:
+        st.caption("目前沒有明顯 D/E 風險股。")
+    else:
+        st.dataframe(risk_df[decision_cols].head(top_n), use_container_width=True, hide_index=True)
+
+st.subheader("🔥 漲停爆衝雷達")
 st.caption("v2.6.2：比較上一輪與目前報價，抓短時間價格加速度、量能跳升、日內高點突破。這用來補足『突然爆衝』，不是單純看目前漲幅排行。")
 if not surge_has_prev:
     st.info("這是本次啟動後第一輪快照，還沒有上一輪價格可比較。等下一次自動刷新後，爆衝雷達才會開始判斷。")
@@ -1410,7 +1582,8 @@ entry_df["入場排序"] = entry_df["盤中入場判斷"].map(entry_priority).fi
 entry_df = entry_df.sort_values(["入場排序", "即時強度分"], ascending=[True, False])
 
 common_cols = [
-    "代號", "名稱", "市場", "產業", "資料來源", "AI來源", "加入來源", "市場池排名", "盤中標籤", "爆衝警示", "刷新漲速%", "量能跳升分", "盤中入場判斷", "入場型態",
+    "代號", "名稱", "市場", "產業", "決策等級", "是否可入場", "決策分", "爆衝分", "漲停雷達", "漲停距離%",
+    "資料來源", "AI來源", "加入來源", "市場池排名", "盤中標籤", "爆衝警示", "刷新漲速%", "量能跳升分", "盤中入場判斷", "入場型態",
     "觸發價", "停損參考", "壓力參考", "AI總分", "風險分", "即時強度分",
     "盤中現價", "盤中漲跌幅", "盤中成交量", "報價時間", "即時判斷", "不追原因", "建議動作"
 ]
@@ -1437,4 +1610,4 @@ st.dataframe(filtered.sort_values(["警示排序", "即時強度分"], ascending
 st.subheader("全部掃描池即時快照")
 st.dataframe(live_df[market_cols], use_container_width=True, hide_index=True)
 
-st.caption("提醒：這是網頁快照更新，不是券商逐筆成交資料。市場池估分股沒有完整盤後籌碼驗證；爆衝雷達抓的是短時間加速度，可能有假突破；觸發價、停損與壓力是規則化參考，不等於下單建議。")
+st.caption("提醒：這是網頁快照更新，不是券商逐筆成交資料。市場池估分股沒有完整盤後籌碼驗證；漲停爆衝雷達抓的是短時間加速度，可能有假突破；決策等級、觸發價、停損與壓力是規則化參考，不等於下單指令。")
