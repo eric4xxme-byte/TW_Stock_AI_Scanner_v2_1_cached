@@ -1,5 +1,5 @@
 # pages/live_intraday.py
-# v2.4.5 Live Intraday Page with Color Labels + Watchlist
+# v2.4.6 Live Intraday Page with Entry Timing Engine
 # Add this file under: pages/live_intraday.py
 
 from __future__ import annotations
@@ -284,10 +284,176 @@ def compute_live_strength(df: pd.DataFrame, attack_threshold=65, watch_threshold
     return df.sort_values(["警示排序", "即時強度分"], ascending=[True, False]).reset_index(drop=True)
 
 
+
+
+def _fmt_price(value):
+    try:
+        if value is None:
+            return "-"
+        v = float(value)
+        if math.isnan(v) or v <= 0:
+            return "-"
+        if v >= 1000:
+            return f"{v:.0f}"
+        if v >= 100:
+            return f"{v:.1f}"
+        return f"{v:.2f}"
+    except Exception:
+        return "-"
+
+
+def _round_tick(value):
+    """Simple display rounding for TW stocks. This is for reference only, not an exchange tick validator."""
+    try:
+        v = float(value)
+        if math.isnan(v) or v <= 0:
+            return np.nan
+        if v < 10:
+            return round(v, 2)
+        if v < 50:
+            return round(v, 2)
+        if v < 100:
+            return round(v, 1)
+        if v < 500:
+            return round(v * 2) / 2
+        if v < 1000:
+            return round(v)
+        return round(v / 5) * 5
+    except Exception:
+        return np.nan
+
+
+def add_entry_timing(df: pd.DataFrame, chase_pct=7.0) -> pd.DataFrame:
+    """Add intraday entry timing reference columns.
+
+    These are rule-based reference notes for watching the setup. They are not buy/sell instructions.
+    """
+    df = df.copy()
+
+    def plan(row):
+        ai = float(row.get("AI總分", 0) or 0)
+        risk = float(row.get("風險分", 0) or 0)
+        strength = float(row.get("即時強度分", 0) or 0)
+        pct = float(row.get("盤中漲跌幅", 0) or 0)
+        vol_score = float(row.get("盤中量能分", 0) or 0)
+        alert = str(row.get("盤中警示", "中性"))
+
+        px = _to_float(row.get("盤中現價"))
+        high = _to_float(row.get("最高"))
+        low = _to_float(row.get("最低"))
+        open_px = _to_float(row.get("開盤"))
+        prev = _to_float(row.get("昨收"))
+
+        if math.isnan(px) or px <= 0:
+            return pd.Series({
+                "盤中入場判斷": "無報價，暫不判斷",
+                "入場型態": "無資料",
+                "觸發價": "-",
+                "停損參考": "-",
+                "壓力參考": "-",
+                "不追原因": "盤中報價不足",
+                "建議動作": "等下一次報價刷新",
+            })
+
+        ref_high = high if not math.isnan(high) and high > 0 else px
+        ref_low = low if not math.isnan(low) and low > 0 else min(px, prev if not math.isnan(prev) and prev > 0 else px)
+        ref_prev = prev if not math.isnan(prev) and prev > 0 else px
+        ref_open = open_px if not math.isnan(open_px) and open_px > 0 else px
+
+        trigger_break = _round_tick(max(px, ref_high) * 1.002)
+        trigger_reclaim = _round_tick(max(px, ref_open, ref_prev) * 1.001)
+        stop_short = _round_tick(min(ref_low, px * 0.985))
+        stop_loose = _round_tick(min(ref_low, ref_prev, px * 0.97))
+        pressure = _round_tick(max(ref_high, px * 1.025))
+
+        # 1) Clear avoid states first.
+        if pct >= chase_pct and (risk >= 25 or ai < 65):
+            return pd.Series({
+                "盤中入場判斷": "漲幅偏高，不追",
+                "入場型態": "追高風險型",
+                "觸發價": "-",
+                "停損參考": _fmt_price(stop_short),
+                "壓力參考": _fmt_price(pressure),
+                "不追原因": f"盤中漲幅 {pct:.2f}% 已偏高，容易震盪",
+                "建議動作": "等拉回、回測不破或尾盤確認",
+            })
+
+        if risk >= 40:
+            return pd.Series({
+                "盤中入場判斷": "風險偏高，暫不追",
+                "入場型態": "高風險觀察型",
+                "觸發價": "-",
+                "停損參考": _fmt_price(stop_loose),
+                "壓力參考": _fmt_price(pressure),
+                "不追原因": f"風險分 {risk:.0f} 偏高",
+                "建議動作": "只觀察，不做追價；等風險下降或回測確認",
+            })
+
+        if alert == "AI高分轉弱" or (ai >= 60 and pct <= -1.0):
+            return pd.Series({
+                "盤中入場判斷": "AI高分但盤中轉弱",
+                "入場型態": "重新站回型",
+                "觸發價": _fmt_price(trigger_reclaim),
+                "停損參考": _fmt_price(stop_loose),
+                "壓力參考": _fmt_price(pressure),
+                "不追原因": "盤中轉弱，尚未止跌確認",
+                "建議動作": "等重新站回開盤價/昨收附近，再觀察量能",
+            })
+
+        if pct <= -2.0 or strength < 35:
+            return pd.Series({
+                "盤中入場判斷": "盤中轉弱，避開",
+                "入場型態": "轉弱避開型",
+                "觸發價": "-",
+                "停損參考": _fmt_price(stop_loose),
+                "壓力參考": _fmt_price(pressure),
+                "不追原因": "盤中強度不足或跌幅擴大",
+                "建議動作": "不急著接，等下一輪重新轉強",
+            })
+
+        # 2) Constructive states.
+        if alert == "強勢進攻" or (ai >= 60 and strength >= 65 and 1.0 <= pct <= chase_pct and vol_score >= 60):
+            return pd.Series({
+                "盤中入場判斷": "強勢進攻，可盯突破",
+                "入場型態": "突破確認型",
+                "觸發價": _fmt_price(trigger_break),
+                "停損參考": _fmt_price(stop_short),
+                "壓力參考": _fmt_price(pressure),
+                "不追原因": "若瞬間急拉超過觸發價太多，不用追",
+                "建議動作": "盯是否帶量突破；突破後未站穩就放棄",
+            })
+
+        if alert == "觀察偏強" or (strength >= 55 and pct > 0 and ai >= 45 and risk < 40):
+            return pd.Series({
+                "盤中入場判斷": "觀察偏強，等回測確認",
+                "入場型態": "回測確認型",
+                "觸發價": _fmt_price(trigger_reclaim),
+                "停損參考": _fmt_price(stop_short),
+                "壓力參考": _fmt_price(pressure),
+                "不追原因": "尚未達強攻條件，追價勝率不夠好",
+                "建議動作": "等回測不破或重新放量，再列入優先盯盤",
+            })
+
+        return pd.Series({
+            "盤中入場判斷": "僅觀察，未達入場條件",
+            "入場型態": "中性觀察型",
+            "觸發價": _fmt_price(trigger_reclaim),
+            "停損參考": _fmt_price(stop_loose),
+            "壓力參考": _fmt_price(pressure),
+            "不追原因": "AI、盤中強度或量能尚未同步",
+            "建議動作": "等待下一次刷新或更明確突破/回測訊號",
+        })
+
+    plans = df.apply(plan, axis=1)
+    for col in plans.columns:
+        df[col] = plans[col]
+    return df
+
+
 # ---------- UI ----------
 
-st.title("⚡ 盤中即時看盤 v2.4.5")
-st.caption("前台即時刷新頁：盤後 AI 排名 + 盤中報價 + 警示標籤 + 今日優先盯盤。")
+st.title("⚡ 盤中即時看盤 v2.4.6")
+st.caption("前台即時刷新頁：盤後 AI 排名 + 盤中報價 + 警示標籤 + 今日優先盯盤 + 入場時機輔助判斷。")
 
 with st.sidebar:
     st.header("即時設定")
@@ -332,6 +498,7 @@ else:
     merged["市場"] = merged.get("報價市場", pd.Series(index=merged.index)).fillna(merged["市場"])
 
 live_df = compute_live_strength(merged, attack_threshold, watch_threshold, weak_drop, chase_pct)
+live_df = add_entry_timing(live_df, chase_pct=chase_pct)
 filtered = live_df[(live_df["AI總分"] >= min_ai) & (live_df["即時強度分"] >= min_strength)].copy()
 
 quote_ok = int(live_df["盤中現價"].notna().sum())
@@ -342,6 +509,8 @@ attack_count = int((live_df["盤中警示"] == "強勢進攻").sum()) if "盤中
 watch_count = int((live_df["盤中警示"] == "觀察偏強").sum()) if "盤中警示" in live_df.columns else 0
 weak_count = int((live_df["盤中警示"] == "AI高分轉弱").sum()) if "盤中警示" in live_df.columns else 0
 no_chase_count = int((live_df["盤中警示"].isin(["不要追高", "高風險上漲"])).sum()) if "盤中警示" in live_df.columns else 0
+entry_break_count = int((live_df["盤中入場判斷"] == "強勢進攻，可盯突破").sum()) if "盤中入場判斷" in live_df.columns else 0
+entry_pullback_count = int((live_df["盤中入場判斷"] == "觀察偏強，等回測確認").sum()) if "盤中入場判斷" in live_df.columns else 0
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("候選股票數", len(rank_df))
@@ -357,9 +526,13 @@ c8.metric("不要追/高風險", no_chase_count)
 
 c9, c10, c11, c12 = st.columns(4)
 c9.metric("觀察偏強", watch_count)
-c10.metric("最後刷新", datetime.now().strftime("%H:%M:%S"))
-c11.metric("自動刷新", f"{refresh_seconds} 秒")
-c12.metric("資料模式", "前台即時")
+c10.metric("可盯突破", entry_break_count)
+c11.metric("等回測確認", entry_pullback_count)
+c12.metric("自動刷新", f"{refresh_seconds} 秒")
+
+c13, c14 = st.columns(2)
+c13.metric("最後刷新", datetime.now().strftime("%H:%M:%S"))
+c14.metric("資料模式", "前台即時")
 
 st.divider()
 
@@ -374,12 +547,43 @@ watch_df = live_df[
 ].copy()
 watch_df = watch_df.sort_values(["警示排序", "即時強度分"], ascending=[True, False])
 
+st.subheader("盤中入場時機判斷")
+st.caption("優先看『可盯突破』與『等回測確認』；觸發價、停損與壓力只做盤中觀察參考，不是下單指令。")
+
+entry_df = live_df[
+    live_df["盤中入場判斷"].isin(["強勢進攻，可盯突破", "觀察偏強，等回測確認", "AI高分但盤中轉弱", "漲幅偏高，不追"])
+].copy()
+entry_priority = {
+    "強勢進攻，可盯突破": 1,
+    "觀察偏強，等回測確認": 2,
+    "AI高分但盤中轉弱": 3,
+    "漲幅偏高，不追": 4,
+}
+entry_df["入場排序"] = entry_df["盤中入場判斷"].map(entry_priority).fillna(9)
+entry_df = entry_df.sort_values(["入場排序", "即時強度分"], ascending=[True, False])
+
+entry_cols = [
+    "代號", "名稱", "市場", "產業", "盤中標籤", "盤中入場判斷", "入場型態",
+    "觸發價", "停損參考", "壓力參考", "AI總分", "風險分", "即時強度分",
+    "盤中現價", "盤中漲跌幅", "盤中成交量", "不追原因", "建議動作"
+]
+entry_cols = [c for c in entry_cols if c in entry_df.columns]
+
+if entry_df.empty:
+    st.info("目前沒有明確入場時機訊號。先觀察，不急著追。")
+else:
+    st.dataframe(
+        entry_df[entry_cols].head(top_n),
+        use_container_width=True,
+        hide_index=True,
+    )
+
 st.subheader("今日優先盯盤")
 st.caption("只列出：強勢進攻 / 觀察偏強，且風險分不高、AI 分數不太低、盤中漲幅為正。")
 
 watch_cols = [
-    "代號", "名稱", "市場", "產業", "盤中標籤", "AI總分", "風險分", "即時強度分",
-    "盤中現價", "盤中漲跌幅", "盤中成交量", "報價時間", "即時判斷"
+    "代號", "名稱", "市場", "產業", "盤中標籤", "盤中入場判斷", "入場型態", "觸發價", "停損參考", "壓力參考",
+    "AI總分", "風險分", "即時強度分", "盤中現價", "盤中漲跌幅", "盤中成交量", "報價時間", "即時判斷"
 ]
 watch_cols = [c for c in watch_cols if c in watch_df.columns]
 
@@ -396,8 +600,8 @@ st.subheader("盤中警示清單")
 st.caption("優先看：🟢 強勢進攻、🟡 觀察偏強、🟠 AI高分轉弱、🔴 不要追高 / 高風險。這是盤中輔助判斷，不等於下單建議。")
 
 show_cols = [
-    "代號", "名稱", "市場", "產業", "盤中標籤", "AI總分", "風險分", "即時強度分",
-    "盤中現價", "盤中漲跌幅", "盤中成交量", "報價時間", "即時判斷"
+    "代號", "名稱", "市場", "產業", "盤中標籤", "盤中入場判斷", "入場型態", "觸發價", "停損參考", "壓力參考",
+    "AI總分", "風險分", "即時強度分", "盤中現價", "盤中漲跌幅", "盤中成交量", "報價時間", "即時判斷"
 ]
 show_cols = [c for c in show_cols if c in filtered.columns]
 
@@ -414,4 +618,4 @@ st.dataframe(
     hide_index=True,
 )
 
-st.caption("提醒：這是網頁快照更新，不是券商逐筆成交資料。法人、融資融券仍以盤後資料為準。")
+st.caption("提醒：這是網頁快照更新，不是券商逐筆成交資料。觸發價、停損與壓力是規則化參考，不等於下單建議；法人、融資融券仍以盤後資料為準。")
