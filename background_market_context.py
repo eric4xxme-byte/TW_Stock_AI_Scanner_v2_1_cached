@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-TW Stock AI Scanner v2.16｜Market / night-session context builder
+TW Stock AI Scanner v2.16.4｜Market / night-session context builder
 
 Purpose:
 - Run from GitHub Actions without opening Streamlit.
@@ -79,6 +79,29 @@ def safe_float(v: Any, default: Optional[float] = None) -> Optional[float]:
     except Exception:
         return default
 
+
+
+
+def valid_taifex_price(value: Any) -> bool:
+    """TXF/MTX near-month quote should never be 0 or a tiny value.
+    If source parsing returns 0/blank, mark it invalid so the dashboard does
+    not treat fake quotes as real futures prices.
+    """
+    v = safe_float(value, None)
+    return bool(v is not None and v >= 1000)
+
+
+def invalidate_taifex_quote(obj: Dict[str, Any], reason: str) -> Dict[str, Any]:
+    obj = dict(obj or {})
+    obj.update({
+        "ok": False,
+        "price": None,
+        "previous_close": None,
+        "change": None,
+        "change_pct": None,
+        "error": reason,
+    })
+    return obj
 
 def read_csv_safe(path: Path) -> pd.DataFrame:
     if not path.exists():
@@ -173,23 +196,28 @@ def fetch_tw_yahoo_futures() -> Dict[str, Any]:
                     change_f = clean_num(change)
                     pct_f = clean_num(pct)
                     prev = price_f - change_f if price_f is not None and change_f is not None else None
-                    result[key].update({
-                        "ok": price_f is not None,
-                        "price": price_f,
-                        "previous_close": prev,
-                        "change": change_f,
-                        "change_pct": pct_f,
+                    parsed_quote = {
+                        "ok": valid_taifex_price(price_f),
+                        "price": price_f if valid_taifex_price(price_f) else None,
+                        "previous_close": prev if valid_taifex_price(price_f) else None,
+                        "change": change_f if valid_taifex_price(price_f) else None,
+                        "change_pct": pct_f if valid_taifex_price(price_f) else None,
                         "bid": clean_num(bid),
                         "ask": clean_num(ask),
                         "source": "Yahoo Taiwan futures page",
                         "updated_at": now_tw().strftime("%Y-%m-%d %H:%M:%S"),
-                    })
+                    }
+                    if not valid_taifex_price(price_f):
+                        parsed_quote.update({"error": f"invalid parsed futures price: {price_f}"})
+                    result[key].update(parsed_quote)
         # Backup: TIP TAIFEX index. This is not the near-month tradable contract, but better than blank.
         if not result["TXF"].get("ok"):
             backup = fetch_yahoo("IX0126.TW", "TIP TAIFEX TAIEX Futures Index", interval="1m", range_="1d")
-            if backup.get("ok"):
+            if backup.get("ok") and valid_taifex_price(backup.get("price")):
                 result["TXF"].update(backup)
                 result["TXF"].update({"symbol": "IX0126.TW", "label": "台指期參考指數", "source": "Yahoo chart backup: IX0126.TW"})
+            else:
+                result["TXF"] = invalidate_taifex_quote(result.get("TXF", {}), "no valid TXF quote from Yahoo Taiwan page or backup")
     except Exception as exc:
         result["TXF"].update({"ok": False, "error": str(exc)})
     return result
