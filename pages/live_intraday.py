@@ -1667,16 +1667,16 @@ def update_runtime_signal_log(live_df: pd.DataFrame) -> pd.DataFrame:
             high_ret = (high_px - first_px) / first_px * 100
             low_ret = (low_px - first_px) / first_px * 100
 
-            log_df.loc[idx, "目前價格"] = round(px, 2)
-            log_df.loc[idx, "最高價格"] = round(high_px, 2)
-            log_df.loc[idx, "最低價格"] = round(low_px, 2)
-            log_df.loc[idx, "目前報酬%"] = round(current_ret, 2)
-            log_df.loc[idx, "最高報酬%"] = round(high_ret, 2)
-            log_df.loc[idx, "最大回撤%"] = round(low_ret, 2)
+            _v211_set_cell(log_df, idx, "目前價格", round(px, 2))
+            _v211_set_cell(log_df, idx, "最高價格", round(high_px, 2))
+            _v211_set_cell(log_df, idx, "最低價格", round(low_px, 2))
+            _v211_set_cell(log_df, idx, "目前報酬%", round(current_ret, 2))
+            _v211_set_cell(log_df, idx, "最高報酬%", round(high_ret, 2))
+            _v211_set_cell(log_df, idx, "最大回撤%", round(low_ret, 2))
             log_df.loc[idx, "最新即時強度分"] = round(float(current_row.get("即時強度分", 0) or 0), 1)
             log_df.loc[idx, "最新盤中漲跌幅"] = round(float(current_row.get("盤中漲跌幅", 0) or 0), 2)
             log_df.loc[idx, "盤中成交量"] = round(float(current_row.get("盤中成交量", 0) or 0), 0)
-            log_df.loc[idx, "最新時間"] = now_time
+            _v211_set_cell(log_df, idx, "最新時間", now_time)
 
         def status(row):
             ret = _clean_number(row.get("目前報酬%"))
@@ -1757,6 +1757,72 @@ def clear_v211_learning_log() -> None:
             V211_SIGNAL_LOG_PATH.unlink()
     except Exception:
         pass
+
+
+# v2.11.4: runtime hardening for pandas scalar assignment.
+# Streamlit reruns and old CSV logs can create duplicate columns / Series values.
+# The learning engine must never crash because one cell is not a scalar.
+def _v211_dedup_columns(df: pd.DataFrame) -> pd.DataFrame:
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return df
+        if df.columns.duplicated().any():
+            return df.loc[:, ~df.columns.duplicated(keep="last")].copy()
+        return df
+    except Exception:
+        return df
+
+
+def _v211_scalar(value: Any, default: Any = "") -> Any:
+    try:
+        if isinstance(value, pd.Series):
+            if value.empty:
+                return default
+            vals = value.dropna()
+            if vals.empty:
+                return default
+            return _v211_scalar(vals.iloc[-1], default)
+        if isinstance(value, np.ndarray):
+            flat = value.ravel().tolist()
+            return _v211_scalar(flat[-1] if flat else default, default)
+        if isinstance(value, (list, tuple)):
+            return _v211_scalar(value[-1] if value else default, default)
+        if isinstance(value, (set, dict)):
+            return str(value)
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, float) and math.isnan(value):
+            return default
+        return value
+    except Exception:
+        return default
+
+
+def _v211_get_cell(df: pd.DataFrame, idx: Any, col: str, default: Any = "") -> Any:
+    try:
+        if col not in df.columns:
+            return default
+        return _v211_scalar(df.loc[idx, col], default)
+    except Exception:
+        return default
+
+
+def _v211_set_cell(df: pd.DataFrame, idx: Any, col: str, value: Any) -> None:
+    val = _v211_scalar(value, "")
+    try:
+        # Keep object dtype for mixed Chinese text / numeric fields to avoid pandas coercion crashes.
+        if col not in df.columns:
+            df[col] = np.nan
+        try:
+            df[col] = df[col].astype("object")
+        except Exception:
+            pass
+        df.at[idx, col] = val
+    except Exception:
+        try:
+            df.loc[idx, col] = str(val)
+        except Exception:
+            pass
 
 
 def _v211_stock_type(row: pd.Series) -> str:
@@ -1891,13 +1957,15 @@ def update_v211_signal_learning(live_df: pd.DataFrame) -> pd.DataFrame:
     today = now.strftime("%Y-%m-%d")
     now_time = now.strftime("%H:%M:%S")
 
-    log_df = _load_v211_learning_log()
+    # v2.11.4: normalize duplicate columns before any row.get()/loc assignment.
+    live_df = _v211_dedup_columns(live_df.copy())
+    log_df = _v211_dedup_columns(_load_v211_learning_log())
     if not log_df.empty and "日期" in log_df.columns:
         log_df = log_df[log_df["日期"].astype(str) == today].copy()
     if log_df.empty:
         log_df = pd.DataFrame()
     else:
-        log_df = _v211_collapse_learning_log(log_df, today)
+        log_df = _v211_dedup_columns(_v211_collapse_learning_log(log_df, today))
 
     current_by_code: Dict[str, Dict[str, Any]] = {}
     if not log_df.empty and "代號" in log_df.columns:
@@ -1935,26 +2003,26 @@ def update_v211_signal_learning(live_df: pd.DataFrame) -> pd.DataFrame:
             idxs = list(log_df.index[mask])
             if idxs:
                 idx = idxs[0]
-                old_signal = _safe_text(log_df.loc[idx, "交易員訊號"] if "交易員訊號" in log_df.columns else "", "")
-                history = _safe_text(log_df.loc[idx, "訊號歷程"] if "訊號歷程" in log_df.columns else old_signal, "")
+                old_signal = _safe_text(_v211_get_cell(log_df, idx, "交易員訊號", ""), "")
+                history = _safe_text(_v211_get_cell(log_df, idx, "訊號歷程", old_signal), "")
                 hist_parts = [h.strip() for h in history.split("→") if h.strip()]
                 if not hist_parts and old_signal:
                     hist_parts = [old_signal]
                 if signal and (not hist_parts or hist_parts[-1] != signal):
                     hist_parts.append(signal)
-                log_df.loc[idx, "學習Key"] = _v211_signal_key(today, code)
-                log_df.loc[idx, "交易員訊號"] = signal
-                log_df.loc[idx, "最新交易員訊號"] = signal
-                log_df.loc[idx, "訊號分類"] = group
-                log_df.loc[idx, "訊號歷程"] = " → ".join(hist_parts[-6:])
-                log_df.loc[idx, "訊號變更次數"] = max(0, len(hist_parts) - 1)
+                _v211_set_cell(log_df, idx, "學習Key", _v211_signal_key(today, code))
+                _v211_set_cell(log_df, idx, "交易員訊號", signal)
+                _v211_set_cell(log_df, idx, "最新交易員訊號", signal)
+                _v211_set_cell(log_df, idx, "訊號分類", group)
+                _v211_set_cell(log_df, idx, "訊號歷程", " → ".join(hist_parts[-6:]))
+                _v211_set_cell(log_df, idx, "訊號變更次數", max(0, len(hist_parts) - 1))
                 # Refresh current decision context, but preserve 首次價格/首次時間.
                 for col, val in {
                     "股票型態": _v211_stock_type(row),
                     "AI來源": _safe_text(row.get("AI來源"), ""),
                     "資料來源": _safe_text(row.get("資料來源"), ""),
                     "目前價格": round(px, 2),
-                    "是否接近漲停": "是" if near_limit else log_df.loc[idx, "是否接近漲停"] if "是否接近漲停" in log_df.columns else "否",
+                    "是否接近漲停": "是" if near_limit else _v211_get_cell(log_df, idx, "是否接近漲停", "否"),
                     "第一買點": first_buy,
                     "防守停損": stop_text,
                     "右側加碼價": right_add,
@@ -1973,7 +2041,7 @@ def update_v211_signal_learning(live_df: pd.DataFrame) -> pd.DataFrame:
                     "還缺什麼確認": _safe_text(row.get("還缺什麼確認"), _v211_missing_confirmation(row)),
                     "最新時間": now_time,
                 }.items():
-                    log_df.loc[idx, col] = val
+                    _v211_set_cell(log_df, idx, col, val)
             continue
 
         key = _v211_signal_key(today, code)
@@ -2028,11 +2096,11 @@ def update_v211_signal_learning(live_df: pd.DataFrame) -> pd.DataFrame:
         existing_codes.add(code)
 
     if new_rows:
-        log_df = pd.concat([log_df, pd.DataFrame(new_rows)], ignore_index=True)
+        log_df = _v211_dedup_columns(pd.concat([log_df, pd.DataFrame(new_rows)], ignore_index=True))
 
     if not log_df.empty:
         # Final safety: one current row per stock before performance update.
-        log_df = _v211_collapse_learning_log(log_df, today)
+        log_df = _v211_dedup_columns(_v211_collapse_learning_log(log_df, today))
         for idx, record in log_df.iterrows():
             code = _normalize_code(record.get("代號"))
             if code not in current_by_code:
@@ -2050,21 +2118,21 @@ def update_v211_signal_learning(live_df: pd.DataFrame) -> pd.DataFrame:
             high_ret = (high_px - first_px) / first_px * 100
             low_ret = (low_px - first_px) / first_px * 100
 
-            log_df.loc[idx, "目前價格"] = round(px, 2)
-            log_df.loc[idx, "最高價格"] = round(high_px, 2)
-            log_df.loc[idx, "最低價格"] = round(low_px, 2)
-            log_df.loc[idx, "目前報酬%"] = round(current_ret, 2)
-            log_df.loc[idx, "最高報酬%"] = round(high_ret, 2)
-            log_df.loc[idx, "最大回撤%"] = round(low_ret, 2)
-            log_df.loc[idx, "最新盤中漲跌幅"] = round(_clean_number(row.get("盤中漲跌幅")), 2)
-            log_df.loc[idx, "最新時間"] = now_time
+            _v211_set_cell(log_df, idx, "目前價格", round(px, 2))
+            _v211_set_cell(log_df, idx, "最高價格", round(high_px, 2))
+            _v211_set_cell(log_df, idx, "最低價格", round(low_px, 2))
+            _v211_set_cell(log_df, idx, "目前報酬%", round(current_ret, 2))
+            _v211_set_cell(log_df, idx, "最高報酬%", round(high_ret, 2))
+            _v211_set_cell(log_df, idx, "最大回撤%", round(low_ret, 2))
+            _v211_set_cell(log_df, idx, "最新盤中漲跌幅", round(_clean_number(row.get("盤中漲跌幅")), 2))
+            _v211_set_cell(log_df, idx, "最新時間", now_time)
 
             limit_dist_now = _to_float(row.get("漲停距離%"), default=np.nan)
             if _clean_number(row.get("盤中漲跌幅")) >= 9.0 or (not math.isnan(limit_dist_now) and 0 < limit_dist_now <= 1.0):
-                log_df.loc[idx, "是否接近漲停"] = "是"
+                _v211_set_cell(log_df, idx, "是否接近漲停", "是")
             stop_num = _clean_number(record.get("防守停損"))
             if stop_num > 0 and low_px <= stop_num:
-                log_df.loc[idx, "是否碰停損"] = "是"
+                _v211_set_cell(log_df, idx, "是否碰停損", "是")
 
             try:
                 first_time = datetime.strptime(str(record.get("首次時間")), "%H:%M:%S").replace(year=now.year, month=now.month, day=now.day, tzinfo=TAIPEI_TZ)
@@ -2074,10 +2142,10 @@ def update_v211_signal_learning(live_df: pd.DataFrame) -> pd.DataFrame:
             for minutes, col in [(5, "5分鐘後報酬%"), (15, "15分鐘後報酬%"), (30, "30分鐘後報酬%"), (60, "60分鐘後報酬%")]:
                 existing = _to_float(record.get(col), default=np.nan)
                 if elapsed_min >= minutes and math.isnan(existing):
-                    log_df.loc[idx, col] = round(current_ret, 2)
+                    _v211_set_cell(log_df, idx, col, round(current_ret, 2))
 
-            signal = _safe_text(log_df.loc[idx, "交易員訊號"] if "交易員訊號" in log_df.columns else record.get("交易員訊號"), "")
-            hit_stop = _safe_text(log_df.loc[idx, "是否碰停損"], "否") == "是"
+            signal = _safe_text(_v211_get_cell(log_df, idx, "交易員訊號", record.get("交易員訊號")), "")
+            hit_stop = _safe_text(_v211_get_cell(log_df, idx, "是否碰停損", "否"), "否") == "是"
             if signal in V211_ACTIONABLE_SIGNALS:
                 if hit_stop or current_ret <= -1.2:
                     status, cause = "❌ 左側失敗", "碰停損或跌幅超過容忍"
@@ -2101,8 +2169,8 @@ def update_v211_signal_learning(live_df: pd.DataFrame) -> pd.DataFrame:
                     status, cause = "❌ 觀察失敗", "早期訊號後轉弱"
                 else:
                     status, cause = "⏳ 追蹤中", "尚未分出勝負"
-            log_df.loc[idx, "學習狀態"] = status
-            log_df.loc[idx, "錯誤歸因"] = cause
+            _v211_set_cell(log_df, idx, "學習狀態", status)
+            _v211_set_cell(log_df, idx, "錯誤歸因", cause)
 
     _save_v211_learning_log(log_df)
     return log_df
@@ -2943,7 +3011,7 @@ def clear_intraday_memory() -> None:
 
 # ---------- UI ----------
 
-st.title("📊 盤中即時看盤 v2.11.3 訊號學習狀態機｜去重修正版")
+st.title("📊 盤中即時看盤 v2.11.4 訊號學習狀態機｜穩定修正版")
 st.caption("v2.11.2 修正核心：到達/低於左側試單價不再自動判失效；只有跌破防守停損才失效。到價後會直接判斷：可小量試單、等止跌確認、或跌破防守不買。")
 
 refresh_default = _get_query_int("refresh", 30, 15, 120, 15)
@@ -3153,7 +3221,7 @@ if scan_mode == "盤中市場池掃描":
 st.divider()
 
 st.subheader("📊 v2.11.3 AI 訊號學習報告")
-st.caption("這區用來檢查系統剛剛給的訊號到底有沒有用。v2.11.3 已改成「每檔股票每天只保留一筆目前學習狀態」，不會再讓同一檔同時出現錯過、可小量、等低吸等互相矛盾訊號。這是前台 runtime 學習紀錄，重開或重新部署可能重置；長期準確率下一版再接後台資料庫。")
+st.caption("這區用來檢查系統剛剛給的訊號到底有沒有用。v2.11.4 已改成「每檔股票每天只保留一筆目前學習狀態」，不會再讓同一檔同時出現錯過、可小量、等低吸等互相矛盾訊號。這是前台 runtime 學習紀錄，重開或重新部署可能重置；v2.11.4 已加強 pandas 型別/重複欄位防呆，避免學習區因舊紀錄或非純量欄位當機。")
 
 l1, l2, l3, l4 = st.columns(4)
 l1.metric("今日學習訊號", int(v211_summary.get("total", 0)))
@@ -3169,7 +3237,7 @@ l7.metric("平均最高報酬", f"{float(v211_summary.get('avg_high', 0.0)):.2f}
 l8.metric("平均最大回撤", f"{float(v211_summary.get('avg_drawdown', 0.0)):.2f}%")
 
 if v211_learning_log_df.empty:
-    st.info("目前還沒有 v2.11.3 學習紀錄。等交易員中控台出現左側試單、前兆等低吸、右側確認或核心股不買訊號後，這裡會開始追蹤。")
+    st.info("目前還沒有 v2.11.4 學習紀錄。等交易員中控台出現左側試單、前兆等低吸、右側確認或核心股不買訊號後，這裡會開始追蹤。")
 else:
     c1, c2 = st.columns(2)
     c1.caption(f"最準訊號類型：{v211_summary.get('best_type', '-')}")
@@ -3181,8 +3249,8 @@ else:
         show_learn = show_learn.sort_values(["首次時間", "最高報酬%"], ascending=[False, False])
     st.dataframe(show_learn[learn_cols], use_container_width=True, hide_index=True)
     csv_bytes = v211_learning_log_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-    st.download_button("下載 v2.11.3 AI 訊號學習 CSV", data=csv_bytes, file_name=f"v211_ai_signal_learning_{now_taipei().strftime('%Y%m%d')}.csv", mime="text/csv")
-    if st.button("清除 v2.11.1 今日學習紀錄", type="secondary"):
+    st.download_button("下載 v2.11.4 AI 訊號學習 CSV", data=csv_bytes, file_name=f"v211_ai_signal_learning_{now_taipei().strftime('%Y%m%d')}.csv", mime="text/csv")
+    if st.button("清除 v2.11.4 今日學習紀錄", type="secondary"):
         clear_v211_learning_log()
         st.rerun()
 
