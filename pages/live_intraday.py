@@ -4216,29 +4216,86 @@ def apply_v216_market_adjustment(df: pd.DataFrame, ctx: Dict[str, Any]) -> pd.Da
     return out
 
 
+
+def _v216_valid_market_price(obj: Dict[str, Any], item: str = "") -> bool:
+    """Avoid showing fake 0.00 as a valid market/futures quote."""
+    try:
+        price = _clean_number((obj or {}).get("price"))
+        if price <= 0:
+            return False
+        item_text = f"{item} {_safe_text((obj or {}).get('label'), '')} {_safe_text((obj or {}).get('symbol'), '')}"
+        # Taiwan index futures should never be a single / two-digit number.
+        if any(k in item_text for k in ["台指", "小台", "TXF", "MTX", "WTX"]):
+            return price >= 1000
+        return True
+    except Exception:
+        return False
+
+
+def _v216_metric_price(obj: Dict[str, Any], item: str = "", digits: int = 2) -> str:
+    return _v216_price_text((obj or {}).get("price"), digits=digits) if _v216_valid_market_price(obj, item) else "-"
+
+
+def _v216_metric_pct(obj: Dict[str, Any], item: str = "") -> str:
+    return _v216_pct_text((obj or {}).get("change_pct")) if _v216_valid_market_price(obj, item) else "抓取失敗"
+
+
+def _v216_short_time(v: Any) -> str:
+    s = _safe_text(v, "-")
+    if not s or s == "-":
+        return "-"
+    try:
+        # ISO format from background json.
+        if "T" in s:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            try:
+                dt = dt.astimezone(TAIPEI_TZ)
+            except Exception:
+                pass
+            return dt.strftime("%m-%d %H:%M")
+        if re.search(r"\d{4}-\d{2}-\d{2}.*\d{2}:\d{2}", s):
+            return s[:16]
+        # Do not show random numeric freshness values as a clock.
+        if re.fullmatch(r"[0-9.]+", s):
+            return "-"
+        return s[:16]
+    except Exception:
+        return s[:16]
+
+
+def _v216_asset_row(obj: Dict[str, Any], fallback_label: str) -> Dict[str, Any]:
+    obj = obj or {}
+    valid = _v216_valid_market_price(obj, fallback_label)
+    return {
+        "項目": str(obj.get("label") or fallback_label),
+        "最新價格": _v216_price_text(obj.get("price")) if valid else "-",
+        "漲跌幅": _v216_pct_text(obj.get("change_pct")) if valid else "-",
+        "昨收/前收": _v216_price_text(obj.get("previous_close")) if valid else "-",
+        "來源": str(obj.get("source") or "-"),
+        "狀態": "✅ 有效" if valid else "⚠️ 未取得有效價",
+    }
+
+
 def render_v216_context(ctx: Dict[str, Any]) -> None:
-    st.subheader("🌐 v2.16 大盤 / 夜盤 / 盤後分流")
+    st.subheader("🌐 市場環境中控台")
     if not ctx:
         st.info("尚未讀到 data/v216_market_context.json。請先讓 v2.16 GitHub Actions 跑一次，或等待下一輪背景任務。")
         return
+
     market_score = float(pd.to_numeric(pd.Series([ctx.get("market_env_score", 50)]), errors="coerce").fillna(50).iloc[0])
     night_score = float(pd.to_numeric(pd.Series([ctx.get("night_risk_score", 50)]), errors="coerce").fillna(50).iloc[0])
     session = str(ctx.get("session_mode", "-"))
-    updated = str(ctx.get("updated_at", "-"))
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("目前模式", session)
-    c2.metric("大盤環境分", f"{market_score:.1f}", str(ctx.get("market_label", v216_market_bucket(market_score))))
-    c3.metric("夜盤風險分", f"{night_score:.1f}", str(ctx.get("night_label", v216_night_bucket(night_score))))
-    c4.metric("環境更新", updated[-14:-6] if len(updated) >= 14 else updated)
+    updated = _v216_short_time(ctx.get("updated_at") or ctx.get("environment_updated_at") or "-")
 
     idx = ctx.get("indices", {}) or {}
     night = ctx.get("night_proxies", {}) or {}
     breadth = ctx.get("breadth", {}) or {}
+    futures = ctx.get("taiwan_futures", {}) or {}
 
     twii = idx.get("TWII") or {}
     twoii = idx.get("TWOII") or {}
-    txf = (ctx.get("taiwan_futures", {}) or {}).get("TXF") or night.get("TXF") or idx.get("TXF") or {}
-    mtx = (ctx.get("taiwan_futures", {}) or {}).get("MTX") or night.get("MTX") or idx.get("MTX") or {}
+    txf = (futures.get("TXF") or night.get("TXF") or idx.get("TXF") or {})
+    mtx = (futures.get("MTX") or night.get("MTX") or idx.get("MTX") or {})
     nq = night.get("NQ=F") or {}
     es = night.get("ES=F") or {}
     sox = night.get("SOX") or {}
@@ -4246,24 +4303,32 @@ def render_v216_context(ctx: Dict[str, Any]) -> None:
     dxy = night.get("DXY") or {}
     oil = night.get("CL=F") or {}
 
+    # 1) Decision-level environment summary. Keep it clean.
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("目前模式", session)
+    s2.metric("大盤環境", f"{market_score:.1f}", str(ctx.get("market_label", v216_market_bucket(market_score))))
+    s3.metric("夜盤風險", f"{night_score:.1f}", str(ctx.get("night_label", v216_night_bucket(night_score))))
+    s4.metric("環境更新", updated)
+
+    # 2) Core prices only. More details go into expander below.
+    st.markdown("#### 核心價格")
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("加權指數", _v216_price_text(twii.get("price")), _v216_pct_text(twii.get("change_pct")))
-    k2.metric("台指期近一", _v216_price_text(txf.get("price")), _v216_pct_text(txf.get("change_pct")))
-    k3.metric("櫃買指數", _v216_price_text(twoii.get("price")), _v216_pct_text(twoii.get("change_pct")))
-    k4.metric("NASDAQ 期貨", _v216_price_text(nq.get("price")), _v216_pct_text(nq.get("change_pct")))
+    k1.metric("加權指數", _v216_metric_price(twii, "加權指數"), _v216_metric_pct(twii, "加權指數"))
+    k2.metric("台指期近一", _v216_metric_price(txf, "台指期近一"), _v216_metric_pct(txf, "台指期近一"))
+    k3.metric("櫃買指數", _v216_metric_price(twoii, "櫃買指數"), _v216_metric_pct(twoii, "櫃買指數"))
+    k4.metric("NASDAQ 期貨", _v216_metric_price(nq, "NASDAQ 期貨"), _v216_metric_pct(nq, "NASDAQ 期貨"))
 
-    p1, p2, p3, p4 = st.columns(4)
-    p1.metric("S&P 500 期貨", _v216_price_text(es.get("price")), _v216_pct_text(es.get("change_pct")))
-    p2.metric("費半指數", _v216_price_text(sox.get("price")), _v216_pct_text(sox.get("change_pct")))
-    p3.metric("美10年殖利率", _v216_price_text(tnx.get("price")), _v216_pct_text(tnx.get("change_pct")))
-    p4.metric("美元指數", _v216_price_text(dxy.get("price")), _v216_pct_text(dxy.get("change_pct")))
+    if not _v216_valid_market_price(txf, "台指期近一"):
+        st.warning("台指期近一目前沒有取得有效即時價，系統不會再用 0.00 當成台指價。大盤環境暫以加權、櫃買、NASDAQ/S&P 期貨、費半與市場廣度輔助判斷。")
 
-    o1, o2, o3, o4 = st.columns(4)
-    o1.metric("WTI 油價", _v216_price_text(oil.get("price")), _v216_pct_text(oil.get("change_pct")))
-    o2.metric("小台近一", _v216_price_text(mtx.get("price")), _v216_pct_text(mtx.get("change_pct")))
-    o3.metric("台指期資料源", _safe_text(txf.get("source"), "-"))
-    o4.metric("台指期時間", _safe_text(txf.get("quote_time") or txf.get("regularMarketTime") or txf.get("updated_at"), "-"))
+    # 3) Secondary macro line, compact.
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("S&P 500 期貨", _v216_metric_price(es, "S&P 500 期貨"), _v216_metric_pct(es, "S&P 500 期貨"))
+    m2.metric("費半指數", _v216_metric_price(sox, "費半指數"), _v216_metric_pct(sox, "費半指數"))
+    m3.metric("美10年殖利率", _v216_metric_price(tnx, "美10年殖利率"), _v216_metric_pct(tnx, "美10年殖利率"))
+    m4.metric("WTI 油價", _v216_metric_price(oil, "WTI 油價"), _v216_metric_pct(oil, "WTI 油價"))
 
+    # 4) Breadth line.
     if breadth.get("ok"):
         b1, b2, b3, b4 = st.columns(4)
         b1.metric("漲 / 跌家數", f"{breadth.get('up_count', 0)} / {breadth.get('down_count', 0)}")
@@ -4273,6 +4338,14 @@ def render_v216_context(ctx: Dict[str, Any]) -> None:
     else:
         st.caption(f"市場廣度：{breadth.get('message', '-')}")
 
+    action = str(ctx.get("market_action", ""))
+    next_day = str(ctx.get("next_day_note", ""))
+    if market_score < 48 or night_score >= 55:
+        st.warning(f"環境提醒：{action}｜{next_day}")
+    else:
+        st.info(f"環境提醒：{action}｜{next_day}")
+
+    # 5) Everything else collapses. This fixes the clutter.
     detail_rows = [
         _v216_asset_row(twii, "加權指數"),
         _v216_asset_row(txf, "台指期近一"),
@@ -4285,21 +4358,15 @@ def render_v216_context(ctx: Dict[str, Any]) -> None:
         _v216_asset_row(dxy, "美元指數"),
         _v216_asset_row(oil, "WTI 原油期貨"),
     ]
-    with st.expander("大盤 / 夜盤價格明細", expanded=False):
+    with st.expander("完整大盤 / 夜盤價格明細", expanded=False):
         st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
-
-    action = str(ctx.get("market_action", ""))
-    next_day = str(ctx.get("next_day_note", ""))
-    if market_score < 48 or night_score >= 55:
-        st.warning(f"環境提醒：{action}｜{next_day}")
-    else:
-        st.info(f"環境提醒：{action}｜{next_day}")
+        st.caption("台指期若顯示『未取得有效價』，代表資料源暫時沒有回傳可用近月期貨價格；系統不會用 0 或錯誤值參與決策。")
 
 
 v216_context = load_v216_context()
 
-st.title("🌐 盤中即時看盤 v2.16.3 台指期即時 + 學習勝率穩定版")
-st.caption("v2.16.3 新增：台指期近一 / 小台近一價格顯示；v2.15 驗證紀錄改成合併背景資料，不再被前台少量 runtime 資料覆蓋導致學習勝率歸零。")
+st.title("🌐 盤中即時看盤 v2.16.4 市場環境中控台｜台指防呆 + 版面精簡")
+st.caption("v2.16.4 修正：台指期若抓不到有效即時價，不再顯示 0.00；大盤/夜盤區改成中控台 + 明細摺疊，避免畫面越來越亂。")
 render_v216_context(v216_context)
 st.divider()
 
