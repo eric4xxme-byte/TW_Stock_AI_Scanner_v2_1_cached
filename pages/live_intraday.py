@@ -1,5 +1,5 @@
 # pages/live_intraday.py
-# v2.4.4 Live Intraday Page with Alerts
+# v2.4.5 Live Intraday Page with Color Labels + Watchlist
 # Add this file under: pages/live_intraday.py
 
 from __future__ import annotations
@@ -260,6 +260,17 @@ def compute_live_strength(df: pd.DataFrame, attack_threshold=65, watch_threshold
     df["盤中警示"] = [a[0] for a in alerts]
     df["即時判斷"] = [a[1] for a in alerts]
 
+    label_map = {
+        "強勢進攻": "🟢 強勢進攻",
+        "觀察偏強": "🟡 觀察偏強",
+        "中性": "🔵 中性",
+        "AI高分轉弱": "🟠 AI高分轉弱",
+        "不要追高": "🔴 不要追高",
+        "高風險上漲": "🔴 高風險上漲",
+        "盤中轉弱": "🟠 盤中轉弱",
+    }
+    df["盤中標籤"] = df["盤中警示"].map(label_map).fillna("🔵 中性")
+
     priority = {
         "強勢進攻": 1,
         "觀察偏強": 2,
@@ -275,8 +286,8 @@ def compute_live_strength(df: pd.DataFrame, attack_threshold=65, watch_threshold
 
 # ---------- UI ----------
 
-st.title("⚡ 盤中即時看盤 v2.4.4")
-st.caption("這是前台即時刷新頁：讀取盤後 AI 排名，再即時抓候選股盤中報價。v2.4.4 新增盤中警示條件。")
+st.title("⚡ 盤中即時看盤 v2.4.5")
+st.caption("前台即時刷新頁：盤後 AI 排名 + 盤中報價 + 警示標籤 + 今日優先盯盤。")
 
 with st.sidebar:
     st.header("即時設定")
@@ -352,11 +363,40 @@ c12.metric("資料模式", "前台即時")
 
 st.divider()
 
+# Priority watchlist: strong/watch names with acceptable risk and reasonable AI score.
+watch_df = live_df[
+    (
+        live_df["盤中警示"].isin(["強勢進攻", "觀察偏強"])
+        & (live_df["風險分"] < 40)
+        & (live_df["AI總分"] >= 45)
+        & (live_df["盤中漲跌幅"] > 0)
+    )
+].copy()
+watch_df = watch_df.sort_values(["警示排序", "即時強度分"], ascending=[True, False])
+
+st.subheader("今日優先盯盤")
+st.caption("只列出：強勢進攻 / 觀察偏強，且風險分不高、AI 分數不太低、盤中漲幅為正。")
+
+watch_cols = [
+    "代號", "名稱", "市場", "產業", "盤中標籤", "AI總分", "風險分", "即時強度分",
+    "盤中現價", "盤中漲跌幅", "盤中成交量", "報價時間", "即時判斷"
+]
+watch_cols = [c for c in watch_cols if c in watch_df.columns]
+
+if watch_df.empty:
+    st.info("目前沒有符合『優先盯盤』條件的股票。先觀察，不急著追。")
+else:
+    st.dataframe(
+        watch_df[watch_cols].head(top_n),
+        use_container_width=True,
+        hide_index=True,
+    )
+
 st.subheader("盤中警示清單")
-st.caption("優先看：強勢進攻、AI高分轉弱、不要追高。這是盤中輔助判斷，不等於下單建議。")
+st.caption("優先看：🟢 強勢進攻、🟡 觀察偏強、🟠 AI高分轉弱、🔴 不要追高 / 高風險。這是盤中輔助判斷，不等於下單建議。")
 
 show_cols = [
-    "代號", "名稱", "市場", "產業", "AI總分", "風險分", "即時強度分", "盤中警示",
+    "代號", "名稱", "市場", "產業", "盤中標籤", "AI總分", "風險分", "即時強度分",
     "盤中現價", "盤中漲跌幅", "盤中成交量", "報價時間", "即時判斷"
 ]
 show_cols = [c for c in show_cols if c in filtered.columns]
