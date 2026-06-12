@@ -1,5 +1,5 @@
 # pages/live_intraday.py
-# v2.15.3 Live Intraday Permanent Learning DB + Sync Timeout Batch Fix
+# v2.15.6 Live Intraday Permanent Learning DB + Learning Rate Display Fix
 # Purpose:
 # - Keep v2.4.x live AI candidate monitoring.
 # - Add a safer "market pool scan" mode: TWSE + TPEx turnover pool + live quotes.
@@ -3845,7 +3845,11 @@ def build_v215_stats(verified_df: pd.DataFrame) -> Dict[str, Any]:
         out["verified"] = int(valid.sum())
         if valid.any():
             out["avg_ret"] = round(float(ret[valid].mean()), 2)
-            win = res.str.contains("✅|🟢|🚀", regex=True, na=False) | (ret >= 1.0)
+            # v2.15.6: Google Sheet / journal labels are not always emoji-prefixed.
+            # Count practical successful outcomes by text label + return threshold, not only ✅ emoji.
+            success_label = res.str.contains("有效上漲|小幅有效|接近漲停|大漲|避開成功|成功|高信心", regex=True, na=False)
+            failure_label = res.str.contains("假突破|衝高回落|跌破停損|試單失敗|偏弱|失敗", regex=True, na=False)
+            win = success_label | ((ret >= 0.5) & (~failure_label))
             out["win_rate"] = round(float(win[valid].mean() * 100), 1)
         out["near_limit"] = int(res.str.contains("🚀|漲停|大漲", regex=True, na=False).sum())
         if "股票型態" in df.columns and valid.any():
@@ -3926,7 +3930,7 @@ def push_v215_to_google_sheet(verified_df: pd.DataFrame, webhook_url: str, max_r
             chunk_no = i // chunk_size + 1
             payload = {
                 "source": "TW_Stock_AI_Scanner",
-                "version": "v2.15.3",
+                "version": "v2.15.6",
                 "sent_at": now_taipei().strftime("%Y-%m-%d %H:%M:%S"),
                 "chunk_no": chunk_no,
                 "total_chunks": total_chunks,
@@ -4032,8 +4036,8 @@ def latest_v215_sync_status() -> Dict[str, Any]:
         return {"status": "讀取失敗", "time": "-", "rows": 0, "message": "同步紀錄讀取失敗"}
 
 
-st.title("🧬 盤中即時看盤 v2.15.3 真永久學習資料庫｜同步逾時批次修正版")
-st.caption("v2.15.3 修正：Google Sheet 同步改成小批次送出，避免 Apps Script / Google Sheet 因一次寫太多列而逾時；同步設定仍會保存。")
+st.title("🧬 盤中即時看盤 v2.15.6 真永久學習資料庫｜學習勝率修正版")
+st.caption("v2.15.6 修正：Google Sheet 同步維持批次寫入；學習勝率改用盤後驗證樣本，不再只看舊版本機 journal 的單一成功標籤。")
 
 refresh_default = _get_query_int("refresh", 30, 15, 120, 15)
 top_n_default = _get_query_int("top_n", 15, 5, 50, 5)
@@ -4270,8 +4274,8 @@ m8.metric("學習紀錄 / 驗證", f"{int(v213_summary.get("total", 0))} / {int(
 
 st.divider()
 
-st.subheader("🧬 v2.15.3 真永久學習資料庫 + 盤後驗證器｜同步逾時修正版")
-st.caption("目前會先把驗證後訊號寫到 data/v215_verified_signal_journal.csv；若設定 Google Sheet Webhook，可手動或自動同步到 Google Sheet。盤中是暫估，13:30 後會以最後抓到的報價做收盤近似驗證。")
+st.subheader("🧬 v2.15.6 真永久學習資料庫 + 盤後驗證器｜學習勝率修正版")
+st.caption("目前會先把驗證後訊號寫到 data/v215_verified_signal_journal.csv；若設定 Google Sheet Webhook，可手動或自動同步到 Google Sheet。v2.15.6 起，學習勝率以盤後驗證結果為主，避免顯示 0% 的舊版誤導。")
 vm1, vm2, vm3, vm4 = st.columns(4)
 vm1.metric("驗證樣本", int(v215_stats.get("verified", 0)))
 vm2.metric("驗證勝率", f"{float(v215_stats.get('win_rate', 0)):.1f}%")
@@ -4315,15 +4319,23 @@ wm1, wm2, wm3, wm4 = st.columns(4)
 sample_size = int(v214_weight_profile.get("sample_size", 0))
 verified_n = int(v215_stats.get("verified", 0))
 learning_ready = "資料不足" if sample_size < 30 or verified_n < 30 else "可開始參考"
+# v2.15.6: show the real post-close/verified win rate once verification samples are mature.
+# The old v2.14 success_rate can stay 0 when local runtime fields are not populated, which misleads the user.
+verified_win_rate = float(v215_stats.get('win_rate', 0) or 0)
+local_win_rate = float(v214_weight_profile.get('success_rate', 0) or 0)
+learning_win_rate_display = verified_win_rate if verified_n >= 30 else local_win_rate
 wm1.metric("學習樣本", f"{sample_size} / 30")
 wm2.metric("驗證樣本", f"{verified_n} / 30")
-wm3.metric("學習勝率", f"{float(v214_weight_profile.get('success_rate', 0)):.1f}%")
+wm3.metric("學習勝率", f"{learning_win_rate_display:.1f}%")
 wm4.metric("學習成熟度", learning_ready)
 wm5, wm6 = st.columns(2)
 wm5.metric("左側/資金權重", f"{float(v214_weight_profile.get('left_weight', 1)):.2f} / {float(v214_weight_profile.get('money_weight', 1)):.2f}")
 wm6.metric("前兆/風險權重", f"{float(v214_weight_profile.get('limit_weight', 1)):.2f} / {float(v214_weight_profile.get('risk_penalty', 1)):.2f}")
 st.caption(_safe_text(v214_weight_profile.get("confidence"), "") + "｜" + _safe_text(v214_weight_profile.get("note"), ""))
-st.warning("學習勝率不是每輪即時變動的『學習率』；要等盤後驗證樣本累積後才有意義。最高只會顯示 🟢 高信心小量，仍必須照防守停損執行。")
+if verified_n >= 30:
+    st.info("v2.15.6：學習勝率已改用盤後驗證樣本計算；有效上漲、小幅有效、接近漲停/大漲都會被納入，不再只看舊版 ✅ 標籤。")
+else:
+    st.warning("學習勝率不是每輪即時變動的『學習率』；要等盤後驗證樣本累積後才有意義。最高只會顯示 🟢 高信心小量，仍必須照防守停損執行。")
 
 # 1) Primary current decision table.
 st.subheader("🧭 v2.14 交易員目前決策")
