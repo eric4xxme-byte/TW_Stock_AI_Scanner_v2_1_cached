@@ -1,6 +1,6 @@
 # pages/live_intraday.py
-# v2.4.6 Live Intraday Page with Entry Timing Engine
-# Add this file under: pages/live_intraday.py
+# v2.4.8 Live Intraday Page with Entry Timing Engine
+# Fix: manual watch stocks are always shown in a dedicated section.
 
 from __future__ import annotations
 
@@ -458,16 +458,22 @@ def add_entry_timing(df: pd.DataFrame, chase_pct=7.0) -> pd.DataFrame:
 # ---------- Persistent settings and manual watchlist ----------
 
 LOCAL_STOCK_INFO = {
-    "3441": ("聯一光", "光電業"),
-    "2330": ("台積電", "半導體業"),
-    "2313": ("華通", "電子工業"),
-    "2382": ("廣達", "電子工業"),
-    "2327": ("國巨*", "電子工業"),
-    "2884": ("玉山金", "金融保險"),
-    "2892": ("第一金", "金融保險"),
-    "2379": ("瑞昱", "半導體業"),
-    "4938": ("和碩", "電子工業"),
-    "2881": ("富邦金", "金融保險"),
+    # code: (name, industry, market)
+    "3441": ("聯一光", "光電業", "上市"),
+    "2330": ("台積電", "半導體業", "上市"),
+    "2313": ("華通", "電子工業", "上市"),
+    "2382": ("廣達", "電子工業", "上市"),
+    "2327": ("國巨*", "電子工業", "上市"),
+    "2884": ("玉山金", "金融保險", "上市"),
+    "2892": ("第一金", "金融保險", "上市"),
+    "2379": ("瑞昱", "半導體業", "上市"),
+    "4938": ("和碩", "電子工業", "上市"),
+    "2881": ("富邦金", "金融保險", "上市"),
+    "8021": ("尖點", "電子工業", "上市"),
+    "3042": ("晶技", "電子工業", "上市"),
+    "2383": ("台光電", "電子工業", "上市"),
+    "2344": ("華邦電", "半導體業", "上市"),
+    "6173": ("信昌電", "電子零組件業", "上櫃"),
 }
 
 
@@ -559,12 +565,17 @@ def append_manual_codes(df: pd.DataFrame, codes: List[str], manual_ai_score: int
             df.loc[df["代號"].astype(str).str.zfill(4) == code, "手動加入"] = True
             continue
 
-        name, industry = LOCAL_STOCK_INFO.get(code, (code, "未知"))
+        info = LOCAL_STOCK_INFO.get(code, (code, "未知", "未知"))
+        if len(info) == 2:
+            name, industry = info
+            market = "未知"
+        else:
+            name, industry, market = info
         rows.append(
             {
                 "代號": code,
                 "名稱": name,
-                "市場": "未知",
+                "市場": market,
                 "產業": industry,
                 "AI總分": manual_ai_score,
                 "風險分": manual_risk_score,
@@ -581,8 +592,8 @@ def append_manual_codes(df: pd.DataFrame, codes: List[str], manual_ai_score: int
 
 # ---------- UI ----------
 
-st.title("⚡ 盤中即時看盤 v2.4.7")
-st.caption("前台即時刷新頁：盤後 AI 排名 + 盤中報價 + 警示標籤 + 今日優先盯盤 + 入場時機輔助判斷。")
+st.title("⚡ 盤中即時看盤 v2.4.8")
+st.caption("前台即時刷新頁：盤後 AI 排名 + 盤中報價 + 手動監控置頂 + 警示標籤 + 今日優先盯盤 + 入場時機輔助判斷。")
 
 # Defaults are read from URL query parameters.
 refresh_default = _get_query_int("refresh", 30, 15, 120, 15)
@@ -703,6 +714,26 @@ c13.metric("最後刷新", datetime.now().strftime("%H:%M:%S"))
 c14.metric("資料模式", "前台即時")
 
 st.divider()
+
+# Manual watchlist is always shown, regardless of AI / strength filters.
+manual_live_df = live_df[live_df.get("手動加入", False).astype(bool)].copy()
+if manual_codes:
+    st.subheader("手動監控股票即時狀態")
+    st.caption("這區會固定顯示你左側輸入的股票；即使它沒有進入今日 AI 30 檔、沒有達到優先盯盤條件，也會顯示。")
+    manual_cols = [
+        "代號", "名稱", "市場", "產業", "資料來源", "盤中標籤", "盤中入場判斷", "入場型態",
+        "觸發價", "停損參考", "壓力參考", "AI總分", "風險分", "即時強度分",
+        "盤中現價", "盤中漲跌幅", "盤中成交量", "報價時間", "即時判斷", "建議動作"
+    ]
+    manual_cols = [c for c in manual_cols if c in manual_live_df.columns]
+    if manual_live_df.empty:
+        st.warning("已收到手動監控代碼，但目前沒有產生資料。請確認代碼是否為 4 碼台股代號，或等待下一次刷新。")
+    else:
+        st.dataframe(manual_live_df[manual_cols], use_container_width=True, hide_index=True)
+        missing_quote_manual = manual_live_df[manual_live_df["盤中現價"].isna()]["代號"].astype(str).tolist() if "盤中現價" in manual_live_df.columns else []
+        if missing_quote_manual:
+            st.info("以下手動監控股暫時沒有盤中報價：" + "、".join(missing_quote_manual) + "。可能是非交易時間、報價端點暫時未回、或該股當下無成交。")
+    st.divider()
 
 # Priority watchlist: strong/watch names with acceptable risk and reasonable AI score.
 watch_df = live_df[
