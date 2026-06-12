@@ -1,0 +1,16 @@
+{
+  "updated_at": "2026-06-12T16:00:59.858612+08:00",
+  "status": "ok",
+  "pool_count": 180,
+  "quote_raw_count": 167,
+  "live_count": 166,
+  "journal_count": 166,
+  "sync": {
+    "ok": true,
+    "inserted": 15,
+    "updated": 105,
+    "skipped": 0,
+    "sent": 120,
+    "message": "1/6 ok; 2/6 ok; 3/6 ok; 4/6 ok; 5/6 ok; 6/6 ok"
+  }
+}
