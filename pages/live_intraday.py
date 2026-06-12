@@ -1,14 +1,20 @@
 # pages/live_intraday.py
-# v2.4.8 Live Intraday Page with Entry Timing Engine
-# Fix: manual watch stocks are always shown in a dedicated section.
+# v2.5 Live Intraday Market Pool Scanner
+# Purpose:
+# - Keep v2.4.x live AI candidate monitoring.
+# - Add a safer "market pool scan" mode: TWSE + TPEx turnover pool + live quotes.
+# - Persist sidebar settings through URL query params.
+# - Manual watch stocks always show in a dedicated section.
 
 from __future__ import annotations
 
+import json
 import math
+import re
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -23,6 +29,39 @@ RANK_PATH = DATA_DIR / "latest_rank.csv"
 META_PATH = DATA_DIR / "latest_meta.json"
 
 QUOTE_URL = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
+TWSE_STOCK_DAY_URLS = [
+    "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
+    "https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=open_data",
+    "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=open_data",
+]
+TPEX_QUOTES_URLS = [
+    "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes",
+]
+
+# A small local fallback map so manual watch stocks have reasonable names.
+LOCAL_STOCK_INFO = {
+    "2330": ("台積電", "半導體業", "上市"),
+    "2313": ("華通", "電子工業", "上市"),
+    "2327": ("國巨*", "電子工業", "上市"),
+    "2344": ("華邦電", "半導體業", "上市"),
+    "2382": ("廣達", "電子工業", "上市"),
+    "2383": ("台光電", "電子工業", "上市"),
+    "2409": ("友達", "光電業", "上市"),
+    "2379": ("瑞昱", "半導體業", "上市"),
+    "2881": ("富邦金", "金融保險", "上市"),
+    "2884": ("玉山金", "金融保險", "上市"),
+    "2892": ("第一金", "金融保險", "上市"),
+    "3042": ("晶技", "電子工業", "上市"),
+    "3441": ("聯一光", "光電業", "上市"),
+    "4938": ("和碩", "電子工業", "上市"),
+    "8021": ("尖點", "電子工業", "上市"),
+    "3105": ("穩懋", "半導體業", "上櫃"),
+    "3362": ("先進光", "光電業", "上櫃"),
+    "5274": ("信驊", "半導體業", "上櫃"),
+    "6173": ("信昌電", "電子零組件業", "上櫃"),
+    "6223": ("旺矽", "半導體業", "上櫃"),
+    "8042": ("金山電", "電子零組件業", "上櫃"),
+}
 
 
 def _to_float(value, default=np.nan):
@@ -30,11 +69,33 @@ def _to_float(value, default=np.nan):
         if value is None:
             return default
         text = str(value).replace(",", "").strip()
-        if text in {"", "-", "--", "nan", "None"}:
+        if text in {"", "-", "--", "nan", "None", "除權息"}:
             return default
         return float(text)
     except Exception:
         return default
+
+
+def _clean_number(value: Any) -> float:
+    v = _to_float(value, default=0.0)
+    if isinstance(v, float) and math.isnan(v):
+        return 0.0
+    return float(v)
+
+
+def _normalize_code(value: Any) -> str:
+    return "".join(ch for ch in str(value).strip() if ch.isdigit()).zfill(4)
+
+
+def _unique_keep_order(items: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for item in items:
+        code = _normalize_code(item)
+        if re.match(r"^\d{4}$", code) and code not in seen:
+            seen.add(code)
+            out.append(code)
+    return out
 
 
 def _first_number_from_price_list(value):
@@ -51,6 +112,86 @@ def _first_number_from_price_list(value):
     return np.nan
 
 
+def _pick_value(row: Dict[str, Any], keywords: List[str]) -> Any:
+    lower_items = [(str(k), str(k).lower(), v) for k, v in row.items()]
+    for key, key_lower, value in lower_items:
+        for kw in keywords:
+            kw_lower = kw.lower()
+            if kw in key or kw_lower in key_lower:
+                return value
+    return None
+
+
+def _request_json(url: str, timeout: int = 12) -> Optional[Any]:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json,text/plain,*/*",
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=timeout)
+        if resp.status_code != 200:
+            return None
+        try:
+            return resp.json()
+        except Exception:
+            text = resp.text.strip().lstrip("\ufeff")
+            if not text:
+                return None
+            return json.loads(text)
+    except Exception:
+        return None
+
+
+def _parse_market_rows(data: Any, market: str) -> List[Dict[str, Any]]:
+    if not isinstance(data, list) or not data:
+        return []
+
+    rows: List[Dict[str, Any]] = []
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+
+        code = (
+            _pick_value(row, ["證券代號", "代號", "SecuritiesCompanyCode", "Code", "code", "stock_id"])
+            or row.get("證券代號")
+        )
+        name = (
+            _pick_value(row, ["證券名稱", "名稱", "CompanyName", "Name", "name", "stock_name"])
+            or code
+        )
+        money = _pick_value(row, ["成交金額", "TradeValue", "trade_value", "Trading_money", "Amount"])
+        volume = _pick_value(row, ["成交股數", "成交股", "TradeVolume", "trade_volume", "Trading_Volume", "Volume"])
+        close = _pick_value(row, ["收盤價", "收盤", "Close", "ClosingPrice", "close"])
+
+        if code is None:
+            continue
+        code = _normalize_code(code)
+        if not re.match(r"^\d{4}$", code):
+            continue
+
+        money_num = _clean_number(money)
+        close_num = _clean_number(close)
+        volume_num = _clean_number(volume)
+        if money_num <= 0 and close_num > 0 and volume_num > 0:
+            money_num = close_num * volume_num
+
+        rows.append(
+            {
+                "代號": code,
+                "名稱": str(name).strip() if name else code,
+                "產業": "未知",
+                "市場": market,
+                "成交金額": money_num,
+                "盤後收盤參考": close_num,
+            }
+        )
+
+    rows = sorted(rows, key=lambda x: x.get("成交金額", 0), reverse=True)
+    return rows
+
+
+# ---------- Load daily AI rank ----------
+
 def load_rank() -> pd.DataFrame:
     if not RANK_PATH.exists():
         st.error("找不到 data/latest_rank.csv。請先讓 Daily Taiwan Stock AI Scan 成功跑完。")
@@ -58,7 +199,6 @@ def load_rank() -> pd.DataFrame:
 
     df = pd.read_csv(RANK_PATH)
 
-    # Normalize columns from older / newer scanner versions.
     rename_map = {}
     for c in df.columns:
         if c.lower() in {"stock_id", "code"}:
@@ -89,48 +229,140 @@ def load_rank() -> pd.DataFrame:
         df["資料來源"] = "盤後AI候選"
     if "手動加入" not in df.columns:
         df["手動加入"] = False
+    df["AI來源"] = "盤後AI"
     return df
 
 
-def build_symbols(df: pd.DataFrame) -> Tuple[List[str], Dict[str, str]]:
-    symbols: List[str] = []
-    symbol_to_code: Dict[str, str] = {}
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_market_pool(pool_size: int) -> Tuple[pd.DataFrame, str]:
+    """Build a broader intraday universe from TWSE + TPEx turnover lists.
 
+    This is not a full 1800-stock real-time scan. It is a practical market pool built from
+    top turnover names, then the page fetches live quotes for that pool.
+    """
+    per_market_limit = max(100, min(500, pool_size * 2))
+    all_rows: List[Dict[str, Any]] = []
+    sources: List[str] = []
+
+    twse_rows: List[Dict[str, Any]] = []
+    for url in TWSE_STOCK_DAY_URLS:
+        data = _request_json(url, timeout=12)
+        twse_rows = _parse_market_rows(data, market="上市")
+        if twse_rows:
+            sources.append("證交所上市成交金額排行")
+            break
+    if not twse_rows:
+        sources.append("證交所上市來源失敗")
+
+    tpex_rows: List[Dict[str, Any]] = []
+    for url in TPEX_QUOTES_URLS:
+        data = _request_json(url, timeout=12)
+        tpex_rows = _parse_market_rows(data, market="上櫃")
+        if tpex_rows:
+            sources.append("櫃買中心上櫃成交金額排行")
+            break
+    if not tpex_rows:
+        sources.append("櫃買中心上櫃來源失敗")
+
+    all_rows.extend(twse_rows[:per_market_limit])
+    all_rows.extend(tpex_rows[:per_market_limit])
+
+    if not all_rows:
+        return pd.DataFrame(), "；".join(sources) if sources else "市場池來源抓取失敗"
+
+    by_code: Dict[str, Dict[str, Any]] = {}
+    for row in all_rows:
+        code = _normalize_code(row.get("代號"))
+        if not re.match(r"^\d{4}$", code):
+            continue
+        row = dict(row)
+        row["代號"] = code
+        if code not in by_code or _clean_number(row.get("成交金額")) > _clean_number(by_code[code].get("成交金額")):
+            by_code[code] = row
+
+    pool = pd.DataFrame(sorted(by_code.values(), key=lambda x: _clean_number(x.get("成交金額")), reverse=True))
+    pool = pool.head(pool_size).reset_index(drop=True)
+    pool["市場池排名"] = np.arange(1, len(pool) + 1)
+    pool["資料來源"] = "盤中市場池"
+
+    # Turnover-base score for names that are not in daily AI candidates.
+    # Top turnover names get a modest base score but not a full AI score.
+    if len(pool) > 1:
+        pool["市場池基礎分"] = (55 - (pool["市場池排名"] - 1) / max(len(pool) - 1, 1) * 10).round(1)
+    else:
+        pool["市場池基礎分"] = 50.0
+
+    return pool, "；".join(sources)
+
+
+def build_live_universe(rank_df: pd.DataFrame, mode: str, pool_size: int, manual_codes: List[str], manual_ai_score: int = 50, manual_risk_score: int = 20) -> Tuple[pd.DataFrame, str]:
+    rank_df = rank_df.copy()
+    rank_df["代號"] = rank_df["代號"].astype(str).str.zfill(4)
+
+    if mode == "盤中市場池掃描":
+        pool_df, source = fetch_market_pool(pool_size)
+        if pool_df.empty:
+            universe = rank_df.copy()
+            universe["資料來源"] = universe.get("資料來源", "盤後AI候選")
+            return append_manual_codes(universe, manual_codes, manual_ai_score, manual_risk_score), f"市場池抓取失敗，改用盤後AI候選｜{source}"
+
+        ai_cols = ["代號", "AI總分", "風險分", "產業", "市場", "名稱"]
+        ai_map = rank_df[[c for c in ai_cols if c in rank_df.columns]].drop_duplicates("代號")
+        universe = pool_df.merge(ai_map, on="代號", how="left", suffixes=("_pool", "_ai"))
+
+        # Prefer daily AI name/industry when available, otherwise market pool name.
+        universe["名稱"] = universe.get("名稱_ai").fillna(universe.get("名稱_pool")).fillna(universe["代號"])
+        universe["產業"] = universe.get("產業_ai").fillna(universe.get("產業_pool")).fillna("未知")
+        universe["市場"] = universe.get("市場_ai").fillna(universe.get("市場_pool")).fillna("未知")
+        universe["風險分"] = pd.to_numeric(universe.get("風險分"), errors="coerce").fillna(20)
+        universe["AI總分"] = pd.to_numeric(universe.get("AI總分"), errors="coerce")
+        universe["AI來源"] = np.where(universe["AI總分"].notna(), "盤後AI", "市場池估分")
+        universe["AI總分"] = universe["AI總分"].fillna(universe["市場池基礎分"]).round(1)
+        universe["資料來源"] = np.where(universe["AI來源"].eq("盤後AI"), "市場池+盤後AI", "盤中市場池")
+        universe["手動加入"] = False
+
+        keep = [
+            "代號", "名稱", "市場", "產業", "資料來源", "AI來源", "市場池排名", "成交金額", "市場池基礎分",
+            "AI總分", "風險分", "手動加入"
+        ]
+        universe = universe[[c for c in keep if c in universe.columns]].copy()
+        universe = append_manual_codes(universe, manual_codes, manual_ai_score, manual_risk_score)
+        return universe, f"盤中市場池掃描｜{source}"
+
+    universe = rank_df.copy()
+    universe["資料來源"] = universe.get("資料來源", "盤後AI候選")
+    universe["AI來源"] = "盤後AI"
+    universe = append_manual_codes(universe, manual_codes, manual_ai_score, manual_risk_score)
+    return universe, "盤後AI候選 + 手動監控"
+
+
+# ---------- Live quote ----------
+
+def build_symbols(df: pd.DataFrame) -> List[str]:
+    symbols: List[str] = []
     for _, row in df.iterrows():
         code = str(row["代號"]).zfill(4)
         market = str(row.get("市場", "未知"))
-
-        # Prefer known market, but for unknown try both because many scanners mix listed and OTC.
-        candidates = []
         if "上櫃" in market or "OTC" in market.upper():
             candidates = [f"otc_{code}.tw", f"tse_{code}.tw"]
         elif "上市" in market or "TWSE" in market.upper():
             candidates = [f"tse_{code}.tw", f"otc_{code}.tw"]
         else:
             candidates = [f"tse_{code}.tw", f"otc_{code}.tw"]
-
-        for sym in candidates:
-            symbols.append(sym)
-            symbol_to_code[sym] = code
-
-    return symbols, symbol_to_code
+        symbols.extend(candidates)
+    return symbols
 
 
-@st.cache_data(ttl=15, show_spinner=False)
+@st.cache_data(ttl=10, show_spinner=False)
 def fetch_twse_mis_quotes(symbols: List[str]) -> pd.DataFrame:
-    """Fetch quotes from TWSE MIS in small batches.
-
-    Cached only 15 seconds to allow near-real-time refresh while avoiding excessive requests.
-    """
     rows = []
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Referer": "https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw",
     }
 
-    # De-duplicate while preserving order.
     dedup_symbols = list(dict.fromkeys(symbols))
-    batch_size = 18
+    batch_size = 24
 
     for i in range(0, len(dedup_symbols), batch_size):
         batch = dedup_symbols[i : i + batch_size]
@@ -147,9 +379,8 @@ def fetch_twse_mis_quotes(symbols: List[str]) -> pd.DataFrame:
             msg_array = payload.get("msgArray", []) or []
             rows.extend(msg_array)
         except Exception:
-            # Continue with other batches instead of failing whole page.
             continue
-        time.sleep(0.15)
+        time.sleep(0.08)
 
     if not rows:
         return pd.DataFrame()
@@ -163,7 +394,6 @@ def fetch_twse_mis_quotes(symbols: List[str]) -> pd.DataFrame:
 
         last = _to_float(q.get("z"))
         if math.isnan(last):
-            # When no transaction yet, estimate with first bid/ask if available.
             ask = _first_number_from_price_list(q.get("a"))
             bid = _first_number_from_price_list(q.get("b"))
             if not math.isnan(ask) and not math.isnan(bid):
@@ -209,12 +439,13 @@ def fetch_twse_mis_quotes(symbols: List[str]) -> pd.DataFrame:
     if quotes.empty:
         return quotes
 
-    # If trying tse and otc both returns duplicate code, keep the row with valid last price first.
     quotes["has_price"] = quotes["盤中現價"].notna().astype(int)
     quotes = quotes.sort_values(["代號", "has_price"], ascending=[True, False])
     quotes = quotes.drop_duplicates("代號", keep="first").drop(columns=["has_price"])
     return quotes
 
+
+# ---------- Scoring / alerts / entry engine ----------
 
 def compute_live_strength(df: pd.DataFrame, attack_threshold=65, watch_threshold=55, weak_drop=-1.0, chase_pct=7.0) -> pd.DataFrame:
     df = df.copy()
@@ -223,18 +454,17 @@ def compute_live_strength(df: pd.DataFrame, attack_threshold=65, watch_threshold
     df["盤中漲跌幅"] = pd.to_numeric(df["盤中漲跌幅"], errors="coerce").fillna(0)
     df["盤中成交量"] = pd.to_numeric(df["盤中成交量"], errors="coerce").fillna(0)
 
-    # Volume percentile within current candidate list. Avoid over-trusting absolute MIS volume units.
     if df["盤中成交量"].max() > 0:
         df["盤中量能分"] = df["盤中成交量"].rank(pct=True) * 100
     else:
         df["盤中量能分"] = 0
 
-    # Convert intraday return into 0~100 momentum score. -3% => 20, 0%=>50, +5%=>100, clipped.
     df["盤中漲幅分"] = ((df["盤中漲跌幅"] + 3) / 8 * 100).clip(0, 100)
 
+    # In market-pool mode, AI來源 may be 市場池估分, so this is a hybrid strength score.
     df["即時強度分"] = (
-        df["AI總分"] * 0.50
-        + df["盤中漲幅分"] * 0.25
+        df["AI總分"] * 0.45
+        + df["盤中漲幅分"] * 0.30
         + df["盤中量能分"] * 0.15
         - df["風險分"] * 0.10
     ).round(1)
@@ -253,12 +483,12 @@ def compute_live_strength(df: pd.DataFrame, attack_threshold=65, watch_threshold
         if ai >= 60 and pct <= weak_drop:
             return "AI高分轉弱", "盤後AI分數高，但盤中轉弱，先等止跌。"
         if strength >= attack_threshold and pct > 1.5 and vol_score >= 60 and risk < 40:
-            return "強勢進攻", "AI分數、盤中漲幅、量能同步偏強，可列入重點觀察。"
+            return "強勢進攻", "AI/市場池基礎、盤中漲幅、量能同步偏強，可列入重點觀察。"
         if strength >= watch_threshold and pct > 0 and risk < 40:
             return "觀察偏強", "盤中偏強，可觀察量能是否延續。"
         if pct <= -3:
             return "盤中轉弱", "跌幅擴大，避免急著承接。"
-        return "中性", "以盤後AI分數與風控為主。"
+        return "中性", "以盤後AI分數、盤中動能與風控為主。"
 
     alerts = df.apply(alert, axis=1)
     df["盤中警示"] = [a[0] for a in alerts]
@@ -288,8 +518,6 @@ def compute_live_strength(df: pd.DataFrame, attack_threshold=65, watch_threshold
     return df.sort_values(["警示排序", "即時強度分"], ascending=[True, False]).reset_index(drop=True)
 
 
-
-
 def _fmt_price(value):
     try:
         if value is None:
@@ -307,13 +535,10 @@ def _fmt_price(value):
 
 
 def _round_tick(value):
-    """Simple display rounding for TW stocks. This is for reference only, not an exchange tick validator."""
     try:
         v = float(value)
         if math.isnan(v) or v <= 0:
             return np.nan
-        if v < 10:
-            return round(v, 2)
         if v < 50:
             return round(v, 2)
         if v < 100:
@@ -328,10 +553,6 @@ def _round_tick(value):
 
 
 def add_entry_timing(df: pd.DataFrame, chase_pct=7.0) -> pd.DataFrame:
-    """Add intraday entry timing reference columns.
-
-    These are rule-based reference notes for watching the setup. They are not buy/sell instructions.
-    """
     df = df.copy()
 
     def plan(row):
@@ -341,6 +562,7 @@ def add_entry_timing(df: pd.DataFrame, chase_pct=7.0) -> pd.DataFrame:
         pct = float(row.get("盤中漲跌幅", 0) or 0)
         vol_score = float(row.get("盤中量能分", 0) or 0)
         alert = str(row.get("盤中警示", "中性"))
+        ai_source = str(row.get("AI來源", ""))
 
         px = _to_float(row.get("盤中現價"))
         high = _to_float(row.get("最高"))
@@ -370,7 +592,6 @@ def add_entry_timing(df: pd.DataFrame, chase_pct=7.0) -> pd.DataFrame:
         stop_loose = _round_tick(min(ref_low, ref_prev, px * 0.97))
         pressure = _round_tick(max(ref_high, px * 1.025))
 
-        # 1) Clear avoid states first.
         if pct >= chase_pct and (risk >= 25 or ai < 65):
             return pd.Series({
                 "盤中入場判斷": "漲幅偏高，不追",
@@ -415,26 +636,27 @@ def add_entry_timing(df: pd.DataFrame, chase_pct=7.0) -> pd.DataFrame:
                 "建議動作": "不急著接，等下一輪重新轉強",
             })
 
-        # 2) Constructive states.
         if alert == "強勢進攻" or (ai >= 60 and strength >= 65 and 1.0 <= pct <= chase_pct and vol_score >= 60):
+            suffix = "；市場池估分股需額外確認基本面與題材" if ai_source == "市場池估分" else ""
             return pd.Series({
                 "盤中入場判斷": "強勢進攻，可盯突破",
                 "入場型態": "突破確認型",
                 "觸發價": _fmt_price(trigger_break),
                 "停損參考": _fmt_price(stop_short),
                 "壓力參考": _fmt_price(pressure),
-                "不追原因": "若瞬間急拉超過觸發價太多，不用追",
+                "不追原因": "若瞬間急拉超過觸發價太多，不用追" + suffix,
                 "建議動作": "盯是否帶量突破；突破後未站穩就放棄",
             })
 
         if alert == "觀察偏強" or (strength >= 55 and pct > 0 and ai >= 45 and risk < 40):
+            suffix = "；市場池股僅代表盤中動能，不等於完整盤後AI通過" if ai_source == "市場池估分" else ""
             return pd.Series({
                 "盤中入場判斷": "觀察偏強，等回測確認",
                 "入場型態": "回測確認型",
                 "觸發價": _fmt_price(trigger_reclaim),
                 "停損參考": _fmt_price(stop_short),
                 "壓力參考": _fmt_price(pressure),
-                "不追原因": "尚未達強攻條件，追價勝率不夠好",
+                "不追原因": "尚未達強攻條件，追價勝率不夠好" + suffix,
                 "建議動作": "等回測不破或重新放量，再列入優先盯盤",
             })
 
@@ -444,7 +666,7 @@ def add_entry_timing(df: pd.DataFrame, chase_pct=7.0) -> pd.DataFrame:
             "觸發價": _fmt_price(trigger_reclaim),
             "停損參考": _fmt_price(stop_loose),
             "壓力參考": _fmt_price(pressure),
-            "不追原因": "AI、盤中強度或量能尚未同步",
+            "不追原因": "AI/市場池分、盤中強度或量能尚未同步",
             "建議動作": "等待下一次刷新或更明確突破/回測訊號",
         })
 
@@ -454,31 +676,9 @@ def add_entry_timing(df: pd.DataFrame, chase_pct=7.0) -> pd.DataFrame:
     return df
 
 
-
-# ---------- Persistent settings and manual watchlist ----------
-
-LOCAL_STOCK_INFO = {
-    # code: (name, industry, market)
-    "3441": ("聯一光", "光電業", "上市"),
-    "2330": ("台積電", "半導體業", "上市"),
-    "2313": ("華通", "電子工業", "上市"),
-    "2382": ("廣達", "電子工業", "上市"),
-    "2327": ("國巨*", "電子工業", "上市"),
-    "2884": ("玉山金", "金融保險", "上市"),
-    "2892": ("第一金", "金融保險", "上市"),
-    "2379": ("瑞昱", "半導體業", "上市"),
-    "4938": ("和碩", "電子工業", "上市"),
-    "2881": ("富邦金", "金融保險", "上市"),
-    "8021": ("尖點", "電子工業", "上市"),
-    "3042": ("晶技", "電子工業", "上市"),
-    "2383": ("台光電", "電子工業", "上市"),
-    "2344": ("華邦電", "半導體業", "上市"),
-    "6173": ("信昌電", "電子零組件業", "上櫃"),
-}
-
+# ---------- Sidebar persistence and manual watch ----------
 
 def _get_query_value(name: str, default: str = "") -> str:
-    """Read a single value from st.query_params safely."""
     try:
         value = st.query_params.get(name, default)
         if isinstance(value, list):
@@ -513,24 +713,16 @@ def _get_query_float(name: str, default: float, min_value: float, max_value: flo
 
 
 def _set_query_if_changed(values: Dict[str, str]) -> None:
-    """Persist sidebar settings into the URL so browser auto-refresh keeps them."""
     try:
-        changed = False
-        for key, value in values.items():
-            old = _get_query_value(key, "")
-            if old != str(value):
-                changed = True
-                break
+        changed = any(_get_query_value(k, "") != str(v) for k, v in values.items())
         if changed:
             for key, value in values.items():
                 st.query_params[key] = str(value)
     except Exception:
-        # App should continue even if query params are unavailable on an older Streamlit version.
         pass
 
 
 def parse_extra_codes(text: str) -> List[str]:
-    """Parse comma / space / newline separated Taiwan stock codes."""
     if not text:
         return []
     cleaned = (
@@ -550,27 +742,17 @@ def parse_extra_codes(text: str) -> List[str]:
 
 
 def append_manual_codes(df: pd.DataFrame, codes: List[str], manual_ai_score: int = 50, manual_risk_score: int = 20) -> pd.DataFrame:
-    """Append stocks that are not in the daily AI candidate list.
-
-    Manual additions use a neutral AI score for sorting, because they do not have a full daily AI analysis.
-    Intraday quote fields are still fetched live.
-    """
     df = df.copy()
-    existing = set(df["代號"].astype(str).str.zfill(4))
+    existing = set(df["代號"].astype(str).str.zfill(4)) if "代號" in df.columns else set()
     rows = []
 
     for code in codes:
         if code in existing:
-            # Mark existing candidate as manually watched too, but keep its original AI score.
             df.loc[df["代號"].astype(str).str.zfill(4) == code, "手動加入"] = True
             continue
 
         info = LOCAL_STOCK_INFO.get(code, (code, "未知", "未知"))
-        if len(info) == 2:
-            name, industry = info
-            market = "未知"
-        else:
-            name, industry, market = info
+        name, industry, market = info if len(info) == 3 else (info[0], info[1], "未知")
         rows.append(
             {
                 "代號": code,
@@ -580,6 +762,7 @@ def append_manual_codes(df: pd.DataFrame, codes: List[str], manual_ai_score: int
                 "AI總分": manual_ai_score,
                 "風險分": manual_risk_score,
                 "資料來源": "手動監控",
+                "AI來源": "手動中性分",
                 "手動加入": True,
             }
         )
@@ -590,14 +773,14 @@ def append_manual_codes(df: pd.DataFrame, codes: List[str], manual_ai_score: int
     df["代號"] = df["代號"].astype(str).str.zfill(4)
     return df
 
+
 # ---------- UI ----------
 
-st.title("⚡ 盤中即時看盤 v2.4.8")
-st.caption("前台即時刷新頁：盤後 AI 排名 + 盤中報價 + 手動監控置頂 + 警示標籤 + 今日優先盯盤 + 入場時機輔助判斷。")
+st.title("⚡ 盤中即時看盤 v2.5 市場池掃描")
+st.caption("盤後 AI 候選 + 盤中市場池掃描 + 前台即時報價 + 入場時機輔助判斷。市場池不是完整盤後AI，只是盤中動能擴大掃描。")
 
-# Defaults are read from URL query parameters.
 refresh_default = _get_query_int("refresh", 30, 15, 120, 15)
-top_n_default = _get_query_int("top_n", 15, 5, 30, 5)
+top_n_default = _get_query_int("top_n", 15, 5, 50, 5)
 min_ai_default = _get_query_int("min_ai", 0, 0, 100, 5)
 min_strength_default = _get_query_int("min_strength", 0, 0, 100, 5)
 attack_default = _get_query_int("attack", 65, 50, 85, 5)
@@ -605,13 +788,22 @@ watch_default = _get_query_int("watch", 55, 40, 75, 5)
 weak_default = _get_query_float("weak", -1.0, -5.0, 0.0, 0.5)
 chase_default = _get_query_float("chase", 7.0, 3.0, 10.0, 0.5)
 extra_codes_default = _get_query_value("extra_codes", "")
+mode_default = _get_query_value("mode", "盤中市場池掃描")
+pool_default = _get_query_int("pool_size", 150, 30, 300, 10)
 
 with st.sidebar:
     st.header("即時設定")
-    refresh_seconds = st.slider("自動刷新秒數", min_value=15, max_value=120, value=refresh_default, step=15, key="refresh_seconds")
-    top_n = st.slider("顯示前 N 檔", min_value=5, max_value=30, value=top_n_default, step=5, key="top_n")
-    min_ai = st.slider("最低 AI 總分", 0, 100, min_ai_default, 5, key="min_ai")
-    min_strength = st.slider("最低即時強度分", 0, 100, min_strength_default, 5, key="min_strength")
+    scan_mode = st.radio(
+        "即時掃描範圍",
+        ["盤後AI候選", "盤中市場池掃描"],
+        index=1 if mode_default == "盤中市場池掃描" else 0,
+        help="盤後AI候選：只看每日AI 30檔。盤中市場池掃描：用上市+上櫃成交金額池擴大即時掃描，再依即時強度排序。",
+    )
+    pool_size = st.slider("市場池檔數", min_value=30, max_value=300, value=pool_default, step=10, disabled=(scan_mode != "盤中市場池掃描"))
+    refresh_seconds = st.slider("自動刷新秒數", min_value=15, max_value=120, value=refresh_default, step=15)
+    top_n = st.slider("顯示前 N 檔", min_value=5, max_value=50, value=top_n_default, step=5)
+    min_ai = st.slider("最低 AI / 市場池分", 0, 100, min_ai_default, 5)
+    min_strength = st.slider("最低即時強度分", 0, 100, min_strength_default, 5)
 
     st.markdown("---")
     st.subheader("手動監控股票")
@@ -619,8 +811,7 @@ with st.sidebar:
         "額外監控代碼",
         value=extra_codes_default,
         placeholder="例如：3441, 6285, 2313",
-        help="輸入不在今日 AI 候選清單內的股票，也會一起抓盤中報價。手動加入股採中性 AI 分數，主要看盤中動能。",
-        key="extra_codes_text",
+        help="手動加入股一定會固定顯示。若它不在今日AI候選/市場池內，也會抓盤中報價。",
     )
     manual_codes = parse_extra_codes(extra_codes_text)
     if manual_codes:
@@ -628,15 +819,17 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("警示條件")
-    attack_threshold = st.slider("強勢進攻門檻", 50, 85, attack_default, 5, key="attack_threshold")
-    watch_threshold = st.slider("觀察偏強門檻", 40, 75, watch_default, 5, key="watch_threshold")
-    weak_drop = st.slider("AI高分轉弱跌幅", -5.0, 0.0, weak_default, 0.5, key="weak_drop")
-    chase_pct = st.slider("不要追高漲幅", 3.0, 10.0, chase_default, 0.5, key="chase_pct")
+    attack_threshold = st.slider("強勢進攻門檻", 50, 85, attack_default, 5)
+    watch_threshold = st.slider("觀察偏強門檻", 40, 75, watch_default, 5)
+    weak_drop = st.slider("AI高分轉弱跌幅", -5.0, 0.0, weak_default, 0.5)
+    chase_pct = st.slider("不要追高漲幅", 3.0, 10.0, chase_default, 0.5)
 
-    st.info("設定會寫進網址參數，所以自動刷新後不會跳回預設值。手動加入股票也會保留。")
+    st.info("設定會寫進網址參數，所以自動刷新後不會跳回預設值。市場池越大，刷新越慢、也越容易被報價來源限制。")
 
 _set_query_if_changed(
     {
+        "mode": scan_mode,
+        "pool_size": pool_size,
         "refresh": refresh_seconds,
         "top_n": top_n,
         "min_ai": min_ai,
@@ -649,7 +842,6 @@ _set_query_if_changed(
     }
 )
 
-# Browser auto reload. This refreshes this page, not the whole GitHub Action data.
 components.html(
     f"""
     <script>
@@ -662,19 +854,22 @@ components.html(
 )
 
 rank_df = load_rank()
-rank_df = append_manual_codes(rank_df, manual_codes)
-symbols, _ = build_symbols(rank_df)
-quotes_df = fetch_twse_mis_quotes(symbols)
+with st.spinner("建立盤中掃描清單並抓取即時報價..."):
+    universe_df, universe_source = build_live_universe(rank_df, scan_mode, pool_size, manual_codes)
+    symbols = build_symbols(universe_df)
+    quotes_df = fetch_twse_mis_quotes(symbols)
 
-merged = rank_df.copy()
+merged = universe_df.copy()
 if quotes_df.empty:
     st.warning("目前沒有抓到盤中報價。可能是非交易時間、TWSE MIS 暫時無回應，或網路限制。")
     for col in ["盤中現價", "盤中漲跌幅", "盤中成交量", "報價時間", "報價市場"]:
         merged[col] = np.nan
 else:
     merged = merged.merge(quotes_df, on="代號", how="left")
-    merged["名稱"] = merged.get("即時名稱", pd.Series(index=merged.index)).fillna(merged["名稱"])
-    merged["市場"] = merged.get("報價市場", pd.Series(index=merged.index)).fillna(merged["市場"])
+    if "即時名稱" in merged.columns:
+        merged["名稱"] = merged["即時名稱"].fillna(merged["名稱"])
+    if "報價市場" in merged.columns:
+        merged["市場"] = merged["報價市場"].fillna(merged["市場"])
 
 live_df = compute_live_strength(merged, attack_threshold, watch_threshold, weak_drop, chase_pct)
 live_df = add_entry_timing(live_df, chase_pct=chase_pct)
@@ -684,15 +879,17 @@ quote_ok = int(live_df["盤中現價"].notna().sum())
 up_count = int((live_df["盤中漲跌幅"] > 0).sum())
 best_pct = float(live_df["盤中漲跌幅"].max()) if len(live_df) else 0
 best_strength = float(live_df["即時強度分"].max()) if len(live_df) else 0
-attack_count = int((live_df["盤中警示"] == "強勢進攻").sum()) if "盤中警示" in live_df.columns else 0
-watch_count = int((live_df["盤中警示"] == "觀察偏強").sum()) if "盤中警示" in live_df.columns else 0
-weak_count = int((live_df["盤中警示"] == "AI高分轉弱").sum()) if "盤中警示" in live_df.columns else 0
-no_chase_count = int((live_df["盤中警示"].isin(["不要追高", "高風險上漲"])).sum()) if "盤中警示" in live_df.columns else 0
-entry_break_count = int((live_df["盤中入場判斷"] == "強勢進攻，可盯突破").sum()) if "盤中入場判斷" in live_df.columns else 0
-entry_pullback_count = int((live_df["盤中入場判斷"] == "觀察偏強，等回測確認").sum()) if "盤中入場判斷" in live_df.columns else 0
+attack_count = int((live_df["盤中警示"] == "強勢進攻").sum())
+watch_count = int((live_df["盤中警示"] == "觀察偏強").sum())
+weak_count = int((live_df["盤中警示"] == "AI高分轉弱").sum())
+no_chase_count = int((live_df["盤中警示"].isin(["不要追高", "高風險上漲"])).sum())
+entry_break_count = int((live_df["盤中入場判斷"] == "強勢進攻，可盯突破").sum())
+entry_pullback_count = int((live_df["盤中入場判斷"] == "觀察偏強，等回測確認").sum())
+market_pool_count = int((live_df.get("資料來源", pd.Series(dtype=str)).astype(str).str.contains("市場池")).sum())
+daily_ai_count = int((live_df.get("AI來源", pd.Series(dtype=str)).astype(str).eq("盤後AI")).sum())
 
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("候選股票數", len(rank_df))
+c1.metric("掃描股票數", len(universe_df))
 c2.metric("報價成功檔數", quote_ok)
 c3.metric("盤中上漲檔數", up_count)
 c4.metric("最高即時強度分", f"{best_strength:.1f}")
@@ -709,19 +906,25 @@ c10.metric("可盯突破", entry_break_count)
 c11.metric("等回測確認", entry_pullback_count)
 c12.metric("自動刷新", f"{refresh_seconds} 秒")
 
-c13, c14 = st.columns(2)
+c13, c14, c15, c16 = st.columns(4)
 c13.metric("最後刷新", datetime.now().strftime("%H:%M:%S"))
-c14.metric("資料模式", "前台即時")
+c14.metric("資料模式", scan_mode)
+c15.metric("市場池股數", market_pool_count)
+c16.metric("含盤後AI分數", daily_ai_count)
+
+st.caption(f"掃描來源：{universe_source}")
+if scan_mode == "盤中市場池掃描":
+    st.warning("市場池掃描股若顯示『市場池估分』，代表它只有盤中動能與成交金額排序，沒有完整盤後AI/籌碼驗證。入場判斷要更保守。")
 
 st.divider()
 
-# Manual watchlist is always shown, regardless of AI / strength filters.
+# Manual watchlist always visible.
 manual_live_df = live_df[live_df.get("手動加入", False).astype(bool)].copy()
 if manual_codes:
     st.subheader("手動監控股票即時狀態")
-    st.caption("這區會固定顯示你左側輸入的股票；即使它沒有進入今日 AI 30 檔、沒有達到優先盯盤條件，也會顯示。")
+    st.caption("這區固定顯示你左側輸入的股票；即使它沒有進入今日AI候選或市場池前段，也會顯示。")
     manual_cols = [
-        "代號", "名稱", "市場", "產業", "資料來源", "盤中標籤", "盤中入場判斷", "入場型態",
+        "代號", "名稱", "市場", "產業", "資料來源", "AI來源", "市場池排名", "盤中標籤", "盤中入場判斷", "入場型態",
         "觸發價", "停損參考", "壓力參考", "AI總分", "風險分", "即時強度分",
         "盤中現價", "盤中漲跌幅", "盤中成交量", "報價時間", "即時判斷", "建議動作"
     ]
@@ -730,12 +933,9 @@ if manual_codes:
         st.warning("已收到手動監控代碼，但目前沒有產生資料。請確認代碼是否為 4 碼台股代號，或等待下一次刷新。")
     else:
         st.dataframe(manual_live_df[manual_cols], use_container_width=True, hide_index=True)
-        missing_quote_manual = manual_live_df[manual_live_df["盤中現價"].isna()]["代號"].astype(str).tolist() if "盤中現價" in manual_live_df.columns else []
-        if missing_quote_manual:
-            st.info("以下手動監控股暫時沒有盤中報價：" + "、".join(missing_quote_manual) + "。可能是非交易時間、報價端點暫時未回、或該股當下無成交。")
     st.divider()
 
-# Priority watchlist: strong/watch names with acceptable risk and reasonable AI score.
+# Priority watchlist.
 watch_df = live_df[
     (
         live_df["盤中警示"].isin(["強勢進攻", "觀察偏強"])
@@ -761,60 +961,32 @@ entry_priority = {
 entry_df["入場排序"] = entry_df["盤中入場判斷"].map(entry_priority).fillna(9)
 entry_df = entry_df.sort_values(["入場排序", "即時強度分"], ascending=[True, False])
 
-entry_cols = [
-    "代號", "名稱", "市場", "產業", "資料來源", "手動加入", "盤中標籤", "盤中入場判斷", "入場型態",
+common_cols = [
+    "代號", "名稱", "市場", "產業", "資料來源", "AI來源", "市場池排名", "手動加入", "盤中標籤", "盤中入場判斷", "入場型態",
     "觸發價", "停損參考", "壓力參考", "AI總分", "風險分", "即時強度分",
-    "盤中現價", "盤中漲跌幅", "盤中成交量", "不追原因", "建議動作"
+    "盤中現價", "盤中漲跌幅", "盤中成交量", "報價時間", "即時判斷", "不追原因", "建議動作"
 ]
-entry_cols = [c for c in entry_cols if c in entry_df.columns]
 
+entry_cols = [c for c in common_cols if c in entry_df.columns]
 if entry_df.empty:
     st.info("目前沒有明確入場時機訊號。先觀察，不急著追。")
 else:
-    st.dataframe(
-        entry_df[entry_cols].head(top_n),
-        use_container_width=True,
-        hide_index=True,
-    )
+    st.dataframe(entry_df[entry_cols].head(top_n), use_container_width=True, hide_index=True)
 
 st.subheader("今日優先盯盤")
-st.caption("只列出：強勢進攻 / 觀察偏強，且風險分不高、AI 分數不太低、盤中漲幅為正。")
-
-watch_cols = [
-    "代號", "名稱", "市場", "產業", "資料來源", "手動加入", "盤中標籤", "盤中入場判斷", "入場型態", "觸發價", "停損參考", "壓力參考",
-    "AI總分", "風險分", "即時強度分", "盤中現價", "盤中漲跌幅", "盤中成交量", "報價時間", "即時判斷"
-]
-watch_cols = [c for c in watch_cols if c in watch_df.columns]
-
+st.caption("只列出：強勢進攻 / 觀察偏強，且風險分不高、AI/市場池分不太低、盤中漲幅為正。")
+watch_cols = [c for c in common_cols if c in watch_df.columns]
 if watch_df.empty:
     st.info("目前沒有符合『優先盯盤』條件的股票。先觀察，不急著追。")
 else:
-    st.dataframe(
-        watch_df[watch_cols].head(top_n),
-        use_container_width=True,
-        hide_index=True,
-    )
+    st.dataframe(watch_df[watch_cols].head(top_n), use_container_width=True, hide_index=True)
 
-st.subheader("盤中警示清單")
-st.caption("優先看：🟢 強勢進攻、🟡 觀察偏強、🟠 AI高分轉弱、🔴 不要追高 / 高風險。這是盤中輔助判斷，不等於下單建議。")
+st.subheader("盤中市場池即時前段")
+st.caption("這區是 v2.5 重點：從市場池中依即時強度排序，不只限於盤後 AI 30 檔。")
+market_cols = [c for c in common_cols if c in filtered.columns]
+st.dataframe(filtered.sort_values(["警示排序", "即時強度分"], ascending=[True, False])[market_cols].head(top_n), use_container_width=True, hide_index=True)
 
-show_cols = [
-    "代號", "名稱", "市場", "產業", "資料來源", "手動加入", "盤中標籤", "盤中入場判斷", "入場型態", "觸發價", "停損參考", "壓力參考",
-    "AI總分", "風險分", "即時強度分", "盤中現價", "盤中漲跌幅", "盤中成交量", "報價時間", "即時判斷"
-]
-show_cols = [c for c in show_cols if c in filtered.columns]
+st.subheader("全部掃描池即時快照")
+st.dataframe(live_df[market_cols], use_container_width=True, hide_index=True)
 
-st.dataframe(
-    filtered[show_cols].head(top_n),
-    use_container_width=True,
-    hide_index=True,
-)
-
-st.subheader("全部候選股即時快照")
-st.dataframe(
-    live_df[show_cols],
-    use_container_width=True,
-    hide_index=True,
-)
-
-st.caption("提醒：這是網頁快照更新，不是券商逐筆成交資料。觸發價、停損與壓力是規則化參考，不等於下單建議；法人、融資融券仍以盤後資料為準。")
+st.caption("提醒：這是網頁快照更新，不是券商逐筆成交資料。市場池估分股沒有完整盤後籌碼驗證；觸發價、停損與壓力是規則化參考，不等於下單建議。")
