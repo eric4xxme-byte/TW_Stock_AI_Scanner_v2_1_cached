@@ -1,5 +1,5 @@
 # pages/live_intraday.py
-# v2.7 Live Intraday Decision Dashboard + Limit-Up Surge Radar
+# v2.7.1 Live Intraday Entry Signal Dashboard + Limit-Up Surge Radar
 # Purpose:
 # - Keep v2.4.x live AI candidate monitoring.
 # - Add a safer "market pool scan" mode: TWSE + TPEx turnover pool + live quotes.
@@ -820,6 +820,160 @@ def add_decision_dashboard(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _parse_price_text(value) -> float:
+    """Parse display price text such as '72.5' or '-' into float."""
+    try:
+        if value is None:
+            return np.nan
+        text = str(value).replace(",", "").strip()
+        if text in {"", "-", "--", "nan", "None"}:
+            return np.nan
+        return float(text)
+    except Exception:
+        return np.nan
+
+
+def add_entry_signal_layer(df: pd.DataFrame, chase_pct: float = 7.0) -> pd.DataFrame:
+    """v2.7.1: turn watch/decision fields into a clear entry signal.
+
+    This layer is intentionally stricter than the decision dashboard.
+    A/B are watch states; only ✅ means the setup has triggered and survived at least one refresh.
+    """
+    df = df.copy()
+
+    def signal(row):
+        px = _to_float(row.get("盤中現價"))
+        prev_px = _to_float(row.get("上一輪價格"))
+        trigger = _parse_price_text(row.get("觸發價"))
+        pct = float(row.get("盤中漲跌幅", 0) or 0)
+        speed = float(row.get("刷新漲速%", 0) or 0)
+        ai = float(row.get("AI總分", 0) or 0)
+        risk = float(row.get("風險分", 0) or 0)
+        strength = float(row.get("即時強度分", 0) or 0)
+        vol_score = float(row.get("盤中量能分", 0) or 0)
+        vol_jump = float(row.get("量能跳升分", 0) or 0)
+        decision = str(row.get("決策等級", ""))
+        entry = str(row.get("盤中入場判斷", ""))
+        surge = str(row.get("爆衝警示", ""))
+        ai_source = str(row.get("AI來源", ""))
+        limit_dist = _to_float(row.get("漲停距離%"))
+
+        if math.isnan(px) or px <= 0:
+            return pd.Series({
+                "入場訊號": "⚪ 無報價",
+                "可否入場": "不可判斷",
+                "入場確認": "無即時報價",
+                "入場優先級": 9,
+                "入場訊號分": 0.0,
+                "入場條件檢查": "等下一次報價刷新",
+                "建議下單方式": "不動作",
+            })
+
+        has_trigger = not math.isnan(trigger) and trigger > 0
+        above_trigger = bool(has_trigger and px >= trigger)
+        prev_above_trigger = bool(has_trigger and (not math.isnan(prev_px)) and prev_px >= trigger * 0.998)
+        stood_one_round = bool(above_trigger and prev_above_trigger)
+        not_extended = bool(pct < min(chase_pct, 7.5) and (math.isnan(limit_dist) or limit_dist > 1.2))
+        enough_volume = bool(vol_score >= 55 or vol_jump >= 55 or surge in {"🟢 瞬間爆衝", "🟢 剛起漲", "🟡 爆量轉強"})
+        safe_risk = bool(risk < 35)
+        not_falling_now = bool(speed >= -0.15)
+        market_pool_note = "市場池估分股，只能小量觀察，不能重押。" if ai_source == "市場池估分" else ""
+
+        score = 0.0
+        score += min(25.0, max(0.0, strength * 0.25))
+        score += min(20.0, max(0.0, ai * 0.20))
+        score += min(20.0, max(0.0, vol_score * 0.20))
+        score += min(15.0, max(0.0, vol_jump * 0.15))
+        score += 10.0 if above_trigger else 0.0
+        score += 10.0 if stood_one_round else 0.0
+        score -= min(25.0, max(0.0, risk * 0.35))
+        score -= 18.0 if pct >= chase_pct else 0.0
+        score = round(max(0.0, min(100.0, score)), 1)
+
+        if decision in {"🔴 D 不追高", "🔴 D 高風險"} or pct >= chase_pct or (not math.isnan(limit_dist) and limit_dist <= 1.0):
+            why = "已漲太高 / 太接近漲停 / 風險偏高"
+            return pd.Series({
+                "入場訊號": "🔴 不可追",
+                "可否入場": "不建議入場",
+                "入場確認": why,
+                "入場優先級": 5,
+                "入場訊號分": score,
+                "入場條件檢查": f"{why}；等拉回或尾盤確認",
+                "建議下單方式": "不追價",
+            })
+
+        if decision in {"⚫ E 轉弱避開", "🟠 C 高分轉弱"} or entry in {"盤中轉弱，避開", "AI高分但盤中轉弱"}:
+            return pd.Series({
+                "入場訊號": "⚫ 避開",
+                "可否入場": "不可入場",
+                "入場確認": "盤中轉弱或尚未重新站回",
+                "入場優先級": 6,
+                "入場訊號分": score,
+                "入場條件檢查": "等重新站回觸發價/開盤價且量能回來",
+                "建議下單方式": "不動作",
+            })
+
+        # The only explicit "can enter" signal.
+        if decision == "🟢 A 可盯突破" and stood_one_round and enough_volume and safe_risk and not_extended and not_falling_now and strength >= 62:
+            return pd.Series({
+                "入場訊號": "✅ 可小量試單",
+                "可否入場": "可以小量觀察進場",
+                "入場確認": "已觸發並站穩一輪",
+                "入場優先級": 1,
+                "入場訊號分": score,
+                "入場條件檢查": f"現價≥觸發價、上一輪也站上、量能有跟、風險可控。{market_pool_note}",
+                "建議下單方式": "只小量試單；跌破停損參考就退出",
+            })
+
+        if decision == "🟢 A 可盯突破" and above_trigger and enough_volume and safe_risk and not_extended:
+            return pd.Series({
+                "入場訊號": "🟢 觸發中，等站穩",
+                "可否入場": "尚未確認",
+                "入場確認": "剛碰觸觸發價，需再站穩一輪",
+                "入場優先級": 2,
+                "入場訊號分": score,
+                "入場條件檢查": f"已到觸發價，但還需要下一輪刷新確認沒有跌回。{market_pool_note}",
+                "建議下單方式": "不要市價追；等下一輪仍站上再看",
+            })
+
+        if decision == "🟢 A 可盯突破":
+            return pd.Series({
+                "入場訊號": "🟢 等突破觸發",
+                "可否入場": "先不進",
+                "入場確認": "條件偏強，但尚未突破觸發價",
+                "入場優先級": 3,
+                "入場訊號分": score,
+                "入場條件檢查": "等現價突破觸發價，且量能放大、下一輪不跌回",
+                "建議下單方式": "掛提醒，不提前追",
+            })
+
+        if decision == "🟡 B 等回測":
+            return pd.Series({
+                "入場訊號": "🟡 等回測確認",
+                "可否入場": "先不進",
+                "入場確認": "偏強但未達突破進場條件",
+                "入場優先級": 4,
+                "入場訊號分": score,
+                "入場條件檢查": "等拉回不破支撐，或重新放量站回觸發價",
+                "建議下單方式": "等回測，不追高",
+            })
+
+        return pd.Series({
+            "入場訊號": "⚪ 觀察",
+            "可否入場": "先不進",
+            "入場確認": "沒有明確入場觸發",
+            "入場優先級": 7,
+            "入場訊號分": score,
+            "入場條件檢查": "AI、盤中強度、量能、觸發價尚未同步",
+            "建議下單方式": "不動作",
+        })
+
+    signals = df.apply(signal, axis=1)
+    for col in signals.columns:
+        df[col] = signals[col]
+    return df
+
+
 # ---------- Sidebar persistence and manual watch ----------
 
 def _get_query_value(name: str, default: str = "") -> str:
@@ -1279,8 +1433,8 @@ def update_surge_radar(live_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFram
 
 # ---------- UI ----------
 
-st.title("⚡ 盤中即時看盤 v2.7 決策中控台 + 漲停爆衝雷達")
-st.caption("把盤中訊號整理成：可盯突破、等回測、不可追、轉弱避開。先看決策中控台，再看詳細表格。")
+st.title("⚡ 盤中即時看盤 v2.7.1 入場訊號中控台 + 漲停爆衝雷達")
+st.caption("先給明確入場訊號：✅可小量試單、🟢觸發中、🟡等確認、🔴不追、⚫避開。不要只看可盯突破。")
 
 refresh_default = _get_query_int("refresh", 30, 15, 120, 15)
 top_n_default = _get_query_int("top_n", 15, 5, 50, 5)
@@ -1378,6 +1532,7 @@ live_df = compute_live_strength(merged, attack_threshold, watch_threshold, weak_
 live_df = add_entry_timing(live_df, chase_pct=chase_pct)
 live_df, surge_df, surge_has_prev = update_surge_radar(live_df)
 live_df = add_decision_dashboard(live_df)
+live_df = add_entry_signal_layer(live_df, chase_pct=chase_pct)
 # v2.5.1: Keep the internal boolean, but show a readable text column instead of a non-clickable checkbox.
 if "手動加入" in live_df.columns:
     live_df["加入來源"] = np.where(live_df["手動加入"].astype(bool), "手動監控", "自動掃描")
@@ -1439,6 +1594,13 @@ d2.metric("B 等回測", int(decision_counts.get("🟡 B 等回測", 0)))
 d3.metric("不追/高風險", int(decision_counts.get("🔴 D 不追高", 0) + decision_counts.get("🔴 D 高風險", 0)))
 d4.metric("轉弱避開", int(decision_counts.get("⚫ E 轉弱避開", 0) + decision_counts.get("🟠 C 高分轉弱", 0)))
 
+entry_counts = live_df.get("入場訊號", pd.Series(dtype=str)).astype(str).value_counts()
+e1, e2, e3, e4 = st.columns(4)
+e1.metric("✅ 可小量試單", int(entry_counts.get("✅ 可小量試單", 0)))
+e2.metric("🟢 觸發中/等突破", int(entry_counts.get("🟢 觸發中，等站穩", 0) + entry_counts.get("🟢 等突破觸發", 0)))
+e3.metric("🟡 等回測確認", int(entry_counts.get("🟡 等回測確認", 0)))
+e4.metric("🔴 不可追/避開", int(entry_counts.get("🔴 不可追", 0) + entry_counts.get("⚫ 避開", 0)))
+
 st.caption(f"掃描來源：{universe_source}")
 if scan_mode == "盤中市場池掃描":
     st.warning("市場池掃描股若顯示『市場池估分』，代表它只有盤中動能與成交金額排序，沒有完整盤後AI/籌碼驗證。入場判斷要更保守。")
@@ -1446,13 +1608,39 @@ if scan_mode == "盤中市場池掃描":
 
 st.divider()
 
+st.subheader("🚦 即時入場訊號中控台")
+st.caption("先看這區：只有 ✅ 可小量試單 才代表系統認為已觸發入場條件；🟢 只是等待突破或等待站穩，🟡 是等回測，🔴/⚫ 不碰。")
+
+entry_signal_cols = [
+    "代號", "名稱", "市場", "產業", "入場訊號", "可否入場", "入場訊號分", "入場確認",
+    "盤中現價", "觸發價", "停損參考", "壓力參考", "盤中漲跌幅", "刷新漲速%", "盤中成交量",
+    "AI總分", "風險分", "即時強度分", "爆衝分", "漲停雷達", "漲停距離%",
+    "入場條件檢查", "建議下單方式", "資料來源", "AI來源", "報價時間"
+]
+entry_signal_cols = [c for c in entry_signal_cols if c in live_df.columns]
+entry_signal_df = live_df[live_df["入場訊號"].isin(["✅ 可小量試單", "🟢 觸發中，等站穩", "🟢 等突破觸發", "🟡 等回測確認"])].copy()
+entry_signal_df = entry_signal_df.sort_values(["入場優先級", "入場訊號分", "決策分"], ascending=[True, False, False])
+
+if entry_signal_df.empty:
+    st.info("目前沒有明確入場訊號。先不要硬追，等下一次刷新、突破觸發價或回測確認。")
+else:
+    st.dataframe(entry_signal_df[entry_signal_cols].head(top_n), use_container_width=True, hide_index=True)
+
+with st.expander("🔴 目前不可入場 / 不可追 / 避開", expanded=False):
+    blocked_df = live_df[live_df["入場訊號"].isin(["🔴 不可追", "⚫ 避開"])].copy()
+    blocked_df = blocked_df.sort_values(["入場優先級", "盤中漲跌幅"], ascending=[True, False])
+    if blocked_df.empty:
+        st.caption("目前沒有明確不可追或轉弱避開名單。")
+    else:
+        st.dataframe(blocked_df[entry_signal_cols].head(top_n), use_container_width=True, hide_index=True)
+
 st.subheader("🎯 今日入場決策中控台")
-st.caption("先看這區：A 是可盯突破、B 是等回測；D/E 不追。這是盤中輔助判斷，不是自動下單指令。")
+st.caption("這區保留 A/B/C/D/E 決策分層；真正要不要進，以上方『即時入場訊號』為準。")
 
 decision_cols = [
-    "代號", "名稱", "市場", "產業", "決策等級", "是否可入場", "決策分", "爆衝分", "漲停雷達", "漲停距離%",
+    "代號", "名稱", "市場", "產業", "入場訊號", "可否入場", "決策等級", "決策分", "入場訊號分", "爆衝分", "漲停雷達", "漲停距離%",
     "盤中現價", "盤中漲跌幅", "刷新漲速%", "盤中成交量", "AI總分", "風險分", "即時強度分",
-    "觸發價", "停損參考", "壓力參考", "第一優先原因", "入場建議", "資料來源", "AI來源", "報價時間"
+    "觸發價", "停損參考", "壓力參考", "第一優先原因", "入場建議", "入場條件檢查", "資料來源", "AI來源", "報價時間"
 ]
 decision_cols = [c for c in decision_cols if c in live_df.columns]
 
