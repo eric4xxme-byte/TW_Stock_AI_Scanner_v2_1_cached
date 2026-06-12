@@ -1,5 +1,5 @@
 # pages/live_intraday.py
-# v2.15.2 Live Intraday Permanent Learning DB + Sync Persistence Status
+# v2.15.3 Live Intraday Permanent Learning DB + Sync Timeout Batch Fix
 # Purpose:
 # - Keep v2.4.x live AI candidate monitoring.
 # - Add a safer "market pool scan" mode: TWSE + TPEx turnover pool + live quotes.
@@ -3878,45 +3878,95 @@ def _v215_sync_log(status: str, rows: int, message: str) -> None:
         pass
 
 
-def push_v215_to_google_sheet(verified_df: pd.DataFrame, webhook_url: str, max_rows: int = 500) -> Tuple[bool, str]:
-    """Push verified journal to a Google Apps Script webhook using only stdlib.
+def push_v215_to_google_sheet(verified_df: pd.DataFrame, webhook_url: str, max_rows: int = 500, chunk_size: int = 25) -> Tuple[bool, str]:
+    """Push verified journal to Google Sheet in small chunks.
 
-    The Apps Script should upsert by 驗證Key. If no webhook is configured, this
-    function is not called.
+    v2.15.3 fix:
+    - Google Apps Script / Google Sheet can timeout when one POST contains 100+ rows.
+    - Split records into smaller chunks.
+    - Log actual attempted row count, not 0, when timeout happens.
+    - Keep the app alive even when one chunk fails.
     """
     if verified_df is None or verified_df.empty:
+        _v215_sync_log("略過", 0, "沒有可同步的紀錄")
         return False, "沒有可同步的紀錄"
-    if not webhook_url or not str(webhook_url).startswith("http"):
+    webhook_url = str(webhook_url or "").strip()
+    if not webhook_url.startswith("http"):
+        _v215_sync_log("失敗", 0, "尚未設定 Google Sheet Webhook URL")
         return False, "尚未設定 Google Sheet Webhook URL"
+
+    try:
+        chunk_size = max(5, min(int(chunk_size or 25), 50))
+    except Exception:
+        chunk_size = 25
+
     try:
         df = verified_df.tail(max_rows).copy()
-        rows = []
+        # Make all columns safe before JSON serialization.
+        for c in df.columns:
+            try:
+                df[c] = df[c].map(_v215_json_safe)
+            except Exception:
+                df[c] = df[c].astype(str)
+
+        all_rows = []
         for rec in df.to_dict(orient="records"):
-            rows.append({str(k): _v215_json_safe(v) for k, v in rec.items()})
-        payload = {
-            "source": "TW_Stock_AI_Scanner",
-            "version": "v2.15",
-            "sent_at": now_taipei().strftime("%Y-%m-%d %H:%M:%S"),
-            "rows": rows,
-        }
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(
-            webhook_url,
-            data=data,
-            headers={"Content-Type": "application/json; charset=utf-8"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=12) as resp:
-            body = resp.read().decode("utf-8", errors="ignore")
-            ok = 200 <= int(resp.status) < 300
-        msg = f"HTTP {getattr(resp, 'status', '')}｜{body[:300]}"
-        _v215_sync_log("成功" if ok else "失敗", len(rows), msg)
-        return ok, msg
+            all_rows.append({str(k): _v215_json_safe(v) for k, v in rec.items()})
+
+        if not all_rows:
+            _v215_sync_log("略過", 0, "沒有可同步的有效紀錄")
+            return False, "沒有可同步的有效紀錄"
+
+        total_ok_rows = 0
+        messages = []
+        total_chunks = (len(all_rows) + chunk_size - 1) // chunk_size
+
+        for i in range(0, len(all_rows), chunk_size):
+            chunk = all_rows[i:i + chunk_size]
+            chunk_no = i // chunk_size + 1
+            payload = {
+                "source": "TW_Stock_AI_Scanner",
+                "version": "v2.15.3",
+                "sent_at": now_taipei().strftime("%Y-%m-%d %H:%M:%S"),
+                "chunk_no": chunk_no,
+                "total_chunks": total_chunks,
+                "rows": chunk,
+            }
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            req = urllib.request.Request(
+                webhook_url,
+                data=data,
+                headers={"Content-Type": "application/json; charset=utf-8"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=35) as resp:
+                    body = resp.read().decode("utf-8", errors="ignore")
+                    status_code = int(getattr(resp, "status", 0) or 0)
+                    ok = 200 <= status_code < 300
+                if ok:
+                    total_ok_rows += len(chunk)
+                messages.append(f"第{chunk_no}/{total_chunks}批 HTTP {status_code}｜{body[:160]}")
+            except Exception as e:
+                # Stop on timeout/failure to avoid repeated hammering, but keep detailed log.
+                err_msg = f"第{chunk_no}/{total_chunks}批失敗｜{type(e).__name__}: {e}"
+                messages.append(err_msg)
+                final_msg = "；".join(messages)[-900:]
+                _v215_sync_log("部分成功" if total_ok_rows else "失敗", total_ok_rows, final_msg)
+                return False, final_msg
+
+        final_msg = "；".join(messages)[-900:]
+        _v215_sync_log("成功", total_ok_rows, final_msg)
+        return True, final_msg
     except Exception as e:
         msg = f"{type(e).__name__}: {e}"
-        _v215_sync_log("失敗", 0, msg)
+        # Try to log the intended size when possible.
+        try:
+            intended = min(len(verified_df), max_rows)
+        except Exception:
+            intended = 0
+        _v215_sync_log("失敗", intended, msg)
         return False, msg
-
 
 def load_v215_sync_log() -> pd.DataFrame:
     try:
@@ -3982,8 +4032,8 @@ def latest_v215_sync_status() -> Dict[str, Any]:
         return {"status": "讀取失敗", "time": "-", "rows": 0, "message": "同步紀錄讀取失敗"}
 
 
-st.title("🧬 盤中即時看盤 v2.15.2 真永久學習資料庫｜同步狀態固定版")
-st.caption("v2.15.2 修正：Google Sheet URL / 自動同步開關會保存，不會刷新就消失；同步狀態、最後同步時間、同步筆數固定顯示。最高信號仍是小量試單，不是無腦重倉。")
+st.title("🧬 盤中即時看盤 v2.15.3 真永久學習資料庫｜同步逾時批次修正版")
+st.caption("v2.15.3 修正：Google Sheet 同步改成小批次送出，避免 Apps Script / Google Sheet 因一次寫太多列而逾時；同步設定仍會保存。")
 
 refresh_default = _get_query_int("refresh", 30, 15, 120, 15)
 top_n_default = _get_query_int("top_n", 15, 5, 50, 5)
@@ -4185,7 +4235,7 @@ if "v215_enable_gsheet" in globals() and v215_enable_gsheet and v215_auto_sync:
     # Auto-sync only the latest rows to reduce repeated traffic. The webhook should upsert by 驗證Key.
     try:
         if str(v215_webhook_url or "").strip():
-            push_v215_to_google_sheet(v215_verified_journal_df.tail(120), v215_webhook_url)
+            push_v215_to_google_sheet(v215_verified_journal_df.tail(60), v215_webhook_url, max_rows=60, chunk_size=20)
     except Exception:
         pass
 
@@ -4220,7 +4270,7 @@ m8.metric("學習紀錄 / 驗證", f"{int(v213_summary.get("total", 0))} / {int(
 
 st.divider()
 
-st.subheader("🧬 v2.15.1 真永久學習資料庫 + 盤後驗證器｜穩定紀錄修正版")
+st.subheader("🧬 v2.15.3 真永久學習資料庫 + 盤後驗證器｜同步逾時修正版")
 st.caption("目前會先把驗證後訊號寫到 data/v215_verified_signal_journal.csv；若設定 Google Sheet Webhook，可手動或自動同步到 Google Sheet。盤中是暫估，13:30 後會以最後抓到的報價做收盤近似驗證。")
 vm1, vm2, vm3, vm4 = st.columns(4)
 vm1.metric("驗證樣本", int(v215_stats.get("verified", 0)))
@@ -4244,7 +4294,7 @@ if 'v215_enable_gsheet' in globals() and v215_enable_gsheet:
     c_sync, c_log = st.columns([1, 2])
     with c_sync:
         if st.button("立即同步到 Google Sheet", type="primary"):
-            ok, msg = push_v215_to_google_sheet(v215_verified_journal_df, v215_webhook_url)
+            ok, msg = push_v215_to_google_sheet(v215_verified_journal_df, v215_webhook_url, max_rows=200, chunk_size=20)
             if ok:
                 st.success("已送出 Google Sheet 同步。")
             else:
