@@ -1710,6 +1710,343 @@ def clear_runtime_signal_log() -> None:
 
 
 
+# ---------- v2.11 AI signal learning engine ----------
+
+V211_SIGNAL_LOG_PATH = DATA_DIR / "v211_ai_signal_learning_runtime.csv"
+V211_TRACK_SIGNALS = {
+    "✅ 左側可小量試單",
+    "👀 前兆出現，等低吸",
+    "🟡 等左側回測",
+    "🟢 右側確認，只能加碼",
+    "🔴 已錯過，不追",
+    "⚫ 不買，結構不穩",
+}
+V211_ACTIONABLE_SIGNALS = {"✅ 左側可小量試單"}
+V211_EARLY_SIGNALS = {"👀 前兆出現，等低吸", "🟡 等左側回測"}
+V211_RIGHT_SIDE_SIGNALS = {"🟢 右側確認，只能加碼"}
+V211_NO_BUY_SIGNALS = {"🔴 已錯過，不追", "⚫ 不買，結構不穩"}
+
+
+def _load_v211_learning_log() -> pd.DataFrame:
+    if V211_SIGNAL_LOG_PATH.exists():
+        try:
+            df = pd.read_csv(V211_SIGNAL_LOG_PATH, dtype={"代號": str})
+            if "代號" in df.columns:
+                df["代號"] = df["代號"].astype(str).str.zfill(4)
+            return df
+        except Exception:
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+
+def _save_v211_learning_log(df: pd.DataFrame) -> None:
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        df.to_csv(V211_SIGNAL_LOG_PATH, index=False, encoding="utf-8-sig")
+    except Exception:
+        pass
+
+
+def clear_v211_learning_log() -> None:
+    try:
+        if V211_SIGNAL_LOG_PATH.exists():
+            V211_SIGNAL_LOG_PATH.unlink()
+    except Exception:
+        pass
+
+
+def _v211_stock_type(row: pd.Series) -> str:
+    code = _normalize_code(row.get("代號"))
+    industry = _safe_text(row.get("產業"), "")
+    pct = _clean_number(row.get("盤中漲跌幅"))
+    precursor = _clean_number(row.get("v29漲停前兆分") or row.get("漲停前兆分"))
+    source = _safe_text(row.get("AI來源"), "")
+    if code == "3441" or precursor >= 65 or pct >= 6.0:
+        return "小型強攻 / 漲停前兆股"
+    if code in {"2382", "2313"}:
+        return "中大型資金延續股"
+    if "金融" in industry:
+        return "金融穩推股"
+    if source == "市場池估分":
+        return "市場池動能股"
+    if pct >= 3.0:
+        return "題材急拉股"
+    return "一般觀察股"
+
+
+def _v211_signal_group(signal: str) -> str:
+    if signal in V211_ACTIONABLE_SIGNALS:
+        return "左側試單"
+    if signal in V211_EARLY_SIGNALS:
+        return "早期 / 等低吸"
+    if signal in V211_RIGHT_SIDE_SIGNALS:
+        return "右側確認"
+    if signal in V211_NO_BUY_SIGNALS:
+        return "不買 / 風險"
+    return "其他"
+
+
+def _v211_missing_confirmation(row: pd.Series) -> str:
+    checks = []
+    if _clean_number(row.get("盤中資金分")) < 55:
+        checks.append("資金分不足")
+    if _clean_number(row.get("左側低吸分")) < 55:
+        checks.append("左側低吸分不足")
+    if _clean_number(row.get("左側距停損%")) > 2.2:
+        checks.append("停損距離偏遠")
+    if _clean_number(row.get("盤中漲跌幅")) >= 7.5:
+        checks.append("漲幅偏高")
+    if _clean_number(row.get("風險分")) >= 40:
+        checks.append("風險分偏高")
+    if not checks:
+        checks.append("等待下一輪價格/量能確認")
+    return "、".join(checks)
+
+
+def _v211_signal_key(today: str, code: str, signal: str) -> str:
+    return f"{today}|{code}|{signal}"
+
+
+def update_v211_signal_learning(live_df: pd.DataFrame) -> pd.DataFrame:
+    """Record v2.10 trader decisions and learn if each signal worked."""
+    now = now_taipei()
+    today = now.strftime("%Y-%m-%d")
+    now_time = now.strftime("%H:%M:%S")
+
+    log_df = _load_v211_learning_log()
+    if not log_df.empty and "日期" in log_df.columns:
+        log_df = log_df[log_df["日期"].astype(str) == today].copy()
+    if log_df.empty:
+        log_df = pd.DataFrame()
+
+    existing_keys = set(log_df["學習Key"].astype(str)) if "學習Key" in log_df.columns else set()
+    current_by_code: Dict[str, Dict[str, Any]] = {}
+    new_rows: List[Dict[str, Any]] = []
+
+    for _, row in live_df.iterrows():
+        code = _normalize_code(row.get("代號"))
+        px = _clean_number(row.get("盤中現價"))
+        if not re.match(r"^\d{4}$", code) or px <= 0:
+            continue
+        current_by_code[code] = row.to_dict() | {"_current_px": px}
+
+        signal = _safe_text(row.get("交易員訊號"), "")
+        decision_score = _clean_number(row.get("v210決策分"))
+        is_focus = code in FOCUS_CODES
+        is_hot = _clean_number(row.get("v29漲停前兆分") or row.get("漲停前兆分")) >= 60
+        if signal not in V211_TRACK_SIGNALS:
+            continue
+        if signal in V211_NO_BUY_SIGNALS and not (is_focus or is_hot or decision_score >= 55):
+            continue
+
+        key = _v211_signal_key(today, code, signal)
+        if key in existing_keys:
+            continue
+
+        limit_dist = _to_float(row.get("漲停距離%"), default=np.nan)
+        near_limit = _clean_number(row.get("盤中漲跌幅")) >= 9.0 or (not math.isnan(limit_dist) and 0 < limit_dist <= 1.0)
+        first_buy = _safe_text(row.get("第一買點") or row.get("左側試單價") or row.get("左側試單區"), "-")
+        stop_text = _safe_text(row.get("防守停損") or row.get("左側停損價") or row.get("停損參考"), "-")
+        right_add = _safe_text(row.get("右側加碼價") or row.get("右側確認價"), "-")
+        max_chase = _safe_text(row.get("追價上限") or row.get("AI追價上限"), "-")
+        group = _v211_signal_group(signal)
+
+        new_rows.append({
+            "學習Key": key,
+            "日期": today,
+            "首次時間": now_time,
+            "代號": code,
+            "名稱": _safe_text(row.get("名稱"), code),
+            "股票型態": _v211_stock_type(row),
+            "AI來源": _safe_text(row.get("AI來源"), ""),
+            "資料來源": _safe_text(row.get("資料來源"), ""),
+            "訊號分類": group,
+            "交易員訊號": signal,
+            "首次價格": round(px, 2),
+            "目前價格": round(px, 2),
+            "最高價格": round(px, 2),
+            "最低價格": round(px, 2),
+            "5分鐘後報酬%": np.nan,
+            "15分鐘後報酬%": np.nan,
+            "30分鐘後報酬%": np.nan,
+            "60分鐘後報酬%": np.nan,
+            "目前報酬%": 0.0,
+            "最高報酬%": 0.0,
+            "最大回撤%": 0.0,
+            "是否碰停損": "否",
+            "是否接近漲停": "是" if near_limit else "否",
+            "學習狀態": "⏳ 追蹤中",
+            "錯誤歸因": "",
+            "第一買點": first_buy,
+            "防守停損": stop_text,
+            "右側加碼價": right_add,
+            "追價上限": max_chase,
+            "v210決策分": round(decision_score, 1),
+            "即時入場分": round(_clean_number(row.get("即時入場分")), 1),
+            "左側低吸分": round(_clean_number(row.get("左側低吸分")), 1),
+            "盤中資金分": round(_clean_number(row.get("盤中資金分")), 1),
+            "漲停前兆分": round(_clean_number(row.get("v29漲停前兆分") or row.get("漲停前兆分")), 1),
+            "AI總分": round(_clean_number(row.get("AI總分")), 1),
+            "風險分": round(_clean_number(row.get("風險分")), 1),
+            "首次盤中漲跌幅": round(_clean_number(row.get("盤中漲跌幅")), 2),
+            "最新盤中漲跌幅": round(_clean_number(row.get("盤中漲跌幅")), 2),
+            "1分漲速%": round(_clean_number(row.get("1分漲速%")), 2),
+            "3分漲速%": round(_clean_number(row.get("3分漲速%")), 2),
+            "我會怎麼做": _safe_text(row.get("我會怎麼做"), ""),
+            "還缺什麼確認": _safe_text(row.get("還缺什麼確認"), _v211_missing_confirmation(row)),
+            "最新時間": now_time,
+        })
+        existing_keys.add(key)
+
+    if new_rows:
+        log_df = pd.concat([log_df, pd.DataFrame(new_rows)], ignore_index=True)
+
+    if not log_df.empty:
+        for idx, record in log_df.iterrows():
+            code = _normalize_code(record.get("代號"))
+            if code not in current_by_code:
+                continue
+            row = current_by_code[code]
+            px = _clean_number(row.get("_current_px"))
+            first_px = _clean_number(record.get("首次價格"))
+            if px <= 0 or first_px <= 0:
+                continue
+            prev_high = _clean_number(record.get("最高價格")) or first_px
+            prev_low = _clean_number(record.get("最低價格")) or first_px
+            high_px = max(prev_high, px)
+            low_px = min(prev_low, px)
+            current_ret = (px - first_px) / first_px * 100
+            high_ret = (high_px - first_px) / first_px * 100
+            low_ret = (low_px - first_px) / first_px * 100
+
+            log_df.loc[idx, "目前價格"] = round(px, 2)
+            log_df.loc[idx, "最高價格"] = round(high_px, 2)
+            log_df.loc[idx, "最低價格"] = round(low_px, 2)
+            log_df.loc[idx, "目前報酬%"] = round(current_ret, 2)
+            log_df.loc[idx, "最高報酬%"] = round(high_ret, 2)
+            log_df.loc[idx, "最大回撤%"] = round(low_ret, 2)
+            log_df.loc[idx, "最新盤中漲跌幅"] = round(_clean_number(row.get("盤中漲跌幅")), 2)
+            log_df.loc[idx, "最新時間"] = now_time
+
+            limit_dist_now = _to_float(row.get("漲停距離%"), default=np.nan)
+            if _clean_number(row.get("盤中漲跌幅")) >= 9.0 or (not math.isnan(limit_dist_now) and 0 < limit_dist_now <= 1.0):
+                log_df.loc[idx, "是否接近漲停"] = "是"
+            stop_num = _clean_number(record.get("防守停損"))
+            if stop_num > 0 and low_px <= stop_num:
+                log_df.loc[idx, "是否碰停損"] = "是"
+
+            try:
+                first_time = datetime.strptime(str(record.get("首次時間")), "%H:%M:%S").replace(year=now.year, month=now.month, day=now.day, tzinfo=TAIPEI_TZ)
+                elapsed_min = (now - first_time).total_seconds() / 60
+            except Exception:
+                elapsed_min = 0
+            for minutes, col in [(5, "5分鐘後報酬%"), (15, "15分鐘後報酬%"), (30, "30分鐘後報酬%"), (60, "60分鐘後報酬%")]:
+                existing = _to_float(record.get(col), default=np.nan)
+                if elapsed_min >= minutes and math.isnan(existing):
+                    log_df.loc[idx, col] = round(current_ret, 2)
+
+            signal = _safe_text(record.get("交易員訊號"), "")
+            hit_stop = _safe_text(log_df.loc[idx, "是否碰停損"], "否") == "是"
+            if signal in V211_ACTIONABLE_SIGNALS:
+                if hit_stop or current_ret <= -1.2:
+                    status, cause = "❌ 左側失敗", "碰停損或跌幅超過容忍"
+                elif high_ret >= 2.0 and current_ret < 0.5:
+                    status, cause = "⚠️ 衝高回落", "最高有利但未延續"
+                elif current_ret >= 1.0 or high_ret >= 1.8:
+                    status, cause = "✅ 左側有效", "訊號後有利延伸"
+                else:
+                    status, cause = "⏳ 追蹤中", "尚未分出勝負"
+            elif signal in V211_NO_BUY_SIGNALS:
+                if current_ret <= -1.0:
+                    status, cause = "🛡️ 避開成功", "不買後走弱"
+                elif high_ret >= 2.0:
+                    status, cause = "⚠️ 可能錯過", "不買後仍上攻"
+                else:
+                    status, cause = "⏳ 風險追蹤", "尚未分出勝負"
+            else:
+                if current_ret >= 1.2 or high_ret >= 2.0:
+                    status, cause = "✅ 觀察有效", "早期訊號後有上攻"
+                elif current_ret <= -1.2 or hit_stop:
+                    status, cause = "❌ 觀察失敗", "早期訊號後轉弱"
+                else:
+                    status, cause = "⏳ 追蹤中", "尚未分出勝負"
+            log_df.loc[idx, "學習狀態"] = status
+            log_df.loc[idx, "錯誤歸因"] = cause
+
+    _save_v211_learning_log(log_df)
+    return log_df
+
+
+def build_v211_missed_limit_report(live_df: pd.DataFrame, learn_log: pd.DataFrame) -> pd.DataFrame:
+    if live_df.empty:
+        return pd.DataFrame()
+    had_left = set()
+    if not learn_log.empty:
+        try:
+            left_df = learn_log[learn_log.get("交易員訊號", pd.Series(dtype=str)).astype(str).isin(V211_ACTIONABLE_SIGNALS | V211_EARLY_SIGNALS)]
+            had_left = set(left_df.get("代號", pd.Series(dtype=str)).astype(str).str.zfill(4))
+        except Exception:
+            had_left = set()
+    rows = []
+    for _, row in live_df.iterrows():
+        code = _normalize_code(row.get("代號"))
+        pct = _clean_number(row.get("盤中漲跌幅"))
+        limit_dist = _to_float(row.get("漲停距離%"), default=np.nan)
+        near_limit = pct >= 9.0 or (not math.isnan(limit_dist) and 0 < limit_dist <= 1.0)
+        if not near_limit:
+            continue
+        sig = _safe_text(row.get("交易員訊號"), "")
+        reasons = []
+        if _safe_text(row.get("AI來源"), "") == "市場池估分": reasons.append("只有市場池估分")
+        if _clean_number(row.get("左側低吸分")) < 55: reasons.append("左側低吸分不足")
+        if _clean_number(row.get("盤中資金分")) < 55: reasons.append("盤中資金分不足")
+        if _clean_number(row.get("風險分")) >= 40: reasons.append("風險分偏高")
+        if sig in V211_NO_BUY_SIGNALS: reasons.append("交易員層判定不買")
+        if not reasons: reasons.append("可能是漲速突然跳升，等待記憶層累積")
+        rows.append({
+            "代號": code,
+            "名稱": _safe_text(row.get("名稱"), code),
+            "目前價": _fmt_price(_clean_number(row.get("盤中現價"))),
+            "盤中漲跌幅": round(pct, 2),
+            "漲停距離%": np.nan if math.isnan(limit_dist) else round(limit_dist, 2),
+            "交易員訊號": sig,
+            "檢查結果": "已進過雷達" if code in had_left else "可能錯過",
+            "可能原因": "、".join(reasons),
+            "左側低吸分": round(_clean_number(row.get("左側低吸分")), 1),
+            "盤中資金分": round(_clean_number(row.get("盤中資金分")), 1),
+            "漲停前兆分": round(_clean_number(row.get("v29漲停前兆分") or row.get("漲停前兆分")), 1),
+            "AI來源": _safe_text(row.get("AI來源"), ""),
+        })
+    return pd.DataFrame(rows)
+
+
+def build_v211_learning_summary(log_df: pd.DataFrame) -> Dict[str, Any]:
+    if log_df.empty:
+        return {"total": 0, "actionable": 0, "effective": 0, "failed": 0, "false_break": 0, "left_success_rate": np.nan, "avg_high": 0.0, "avg_drawdown": 0.0, "best_type": "-", "worst_type": "-"}
+    states = log_df.get("學習狀態", pd.Series(dtype=str)).astype(str)
+    groups = log_df.get("訊號分類", pd.Series(dtype=str)).astype(str)
+    actionable_mask = groups.eq("左側試單")
+    effective_mask = states.str.contains("有效|避開成功", regex=True)
+    failed_mask = states.str.contains("失敗|可能錯過", regex=True)
+    false_break_mask = states.str.contains("衝高回落", regex=False)
+    actionable_total = int(actionable_mask.sum())
+    left_effective = int((actionable_mask & states.str.contains("有效", regex=False)).sum())
+    left_success_rate = (left_effective / actionable_total * 100) if actionable_total else np.nan
+    avg_high = float(pd.to_numeric(log_df.get("最高報酬%", 0), errors="coerce").fillna(0).mean())
+    avg_drawdown = float(pd.to_numeric(log_df.get("最大回撤%", 0), errors="coerce").fillna(0).mean())
+    best_type, worst_type = "-", "-"
+    try:
+        tmp = log_df.copy()
+        tmp["成功"] = tmp["學習狀態"].astype(str).str.contains("有效|避開成功", regex=True).astype(int)
+        by_type = tmp.groupby("訊號分類")["成功"].mean().sort_values(ascending=False)
+        if not by_type.empty:
+            best_type = f"{by_type.index[0]} {by_type.iloc[0]*100:.0f}%"
+            worst_type = f"{by_type.index[-1]} {by_type.iloc[-1]*100:.0f}%"
+    except Exception:
+        pass
+    return {"total": int(len(log_df)), "actionable": actionable_total, "effective": int(effective_mask.sum()), "failed": int(failed_mask.sum()), "false_break": int(false_break_mask.sum()), "left_success_rate": left_success_rate, "avg_high": avg_high, "avg_drawdown": avg_drawdown, "best_type": best_type, "worst_type": worst_type}
+
+
 # ---------- Surge radar ----------
 
 def _load_last_snapshot() -> pd.DataFrame:
@@ -2492,8 +2829,8 @@ def clear_intraday_memory() -> None:
 
 # ---------- UI ----------
 
-st.title("🧠 盤中即時看盤 v2.10 交易員決策中控台｜穩定重構版")
-st.caption("這版把畫面重點收斂成一張決策表：先判斷我會不會買，再給左側試單區、停損、右側加碼、追價上限。不再讓一堆訊號互相打架。")
+st.title("📊 盤中即時看盤 v2.11 AI 訊號學習引擎｜交易員決策中控台")
+st.caption("v2.11 在 v2.10 的交易員決策上加入訊號學習：記錄每次左側試單、早期雷達、右側確認與不買訊號，追蹤後續報酬、回撤、停損與可能錯過漲停原因。")
 
 refresh_default = _get_query_int("refresh", 30, 15, 120, 15)
 top_n_default = _get_query_int("top_n", 15, 5, 50, 5)
@@ -2603,6 +2940,10 @@ live_df = apply_v28_entry_signal_overrides(live_df)
 live_df, intraday_memory_df = update_intraday_memory_features(live_df)
 live_df = add_v29_left_predictive_ai(live_df, chase_pct=chase_pct)
 live_df = add_v210_trader_decision(live_df, chase_pct=chase_pct)
+# v2.11: update signal learning log after all decision layers are ready.
+v211_learning_log_df = update_v211_signal_learning(live_df)
+v211_missed_limit_df = build_v211_missed_limit_report(live_df, v211_learning_log_df)
+v211_summary = build_v211_learning_summary(v211_learning_log_df)
 # v2.5.1: Keep the internal boolean, but show a readable text column instead of a non-clickable checkbox.
 if "手動加入" in live_df.columns:
     live_df["加入來源"] = np.where(live_df["手動加入"].astype(bool), "手動監控", "自動掃描")
@@ -2693,10 +3034,55 @@ if scan_mode == "盤中市場池掃描":
     st.warning("市場池掃描股若顯示『市場池估分』，代表它只有盤中動能與成交金額排序，沒有完整盤後AI/籌碼驗證。入場判斷要更保守。")
 
 
+
+
 st.divider()
 
+st.subheader("📊 v2.11 AI 訊號學習報告")
+st.caption("這區用來檢查系統剛剛給的訊號到底有沒有用：左側試單是否有效、是否衝高回落、是否碰停損、哪些近漲停股可能被錯過。這是前台 runtime 學習紀錄，重開或重新部署可能重置；長期準確率下一版再接後台資料庫。")
+
+l1, l2, l3, l4 = st.columns(4)
+l1.metric("今日學習訊號", int(v211_summary.get("total", 0)))
+l2.metric("左側試單數", int(v211_summary.get("actionable", 0)))
+left_rate = v211_summary.get("left_success_rate", np.nan)
+l3.metric("左側試單成功率", "-" if pd.isna(left_rate) else f"{left_rate:.0f}%")
+l4.metric("假突破 / 衝高回落", int(v211_summary.get("false_break", 0)))
+
+l5, l6, l7, l8 = st.columns(4)
+l5.metric("有效 / 避開成功", int(v211_summary.get("effective", 0)))
+l6.metric("失敗 / 可能錯過", int(v211_summary.get("failed", 0)))
+l7.metric("平均最高報酬", f"{float(v211_summary.get('avg_high', 0.0)):.2f}%")
+l8.metric("平均最大回撤", f"{float(v211_summary.get('avg_drawdown', 0.0)):.2f}%")
+
+if v211_learning_log_df.empty:
+    st.info("目前還沒有 v2.11 學習紀錄。等交易員中控台出現左側試單、前兆等低吸、右側確認或核心股不買訊號後，這裡會開始追蹤。")
+else:
+    c1, c2 = st.columns(2)
+    c1.caption(f"最準訊號類型：{v211_summary.get('best_type', '-')}")
+    c2.caption(f"最容易失敗類型：{v211_summary.get('worst_type', '-')}")
+    learn_cols = ["首次時間", "代號", "名稱", "股票型態", "訊號分類", "交易員訊號", "學習狀態", "首次價格", "目前價格", "目前報酬%", "最高報酬%", "最大回撤%", "5分鐘後報酬%", "15分鐘後報酬%", "是否碰停損", "是否接近漲停", "第一買點", "防守停損", "右側加碼價", "追價上限", "v210決策分", "即時入場分", "左側低吸分", "盤中資金分", "漲停前兆分", "AI總分", "風險分", "還缺什麼確認", "錯誤歸因", "最新時間"]
+    learn_cols = [c for c in learn_cols if c in v211_learning_log_df.columns]
+    show_learn = v211_learning_log_df.copy()
+    if "首次時間" in show_learn.columns:
+        show_learn = show_learn.sort_values(["首次時間", "最高報酬%"], ascending=[False, False])
+    st.dataframe(show_learn[learn_cols], use_container_width=True, hide_index=True)
+    csv_bytes = v211_learning_log_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+    st.download_button("下載 v2.11 AI 訊號學習 CSV", data=csv_bytes, file_name=f"v211_ai_signal_learning_{now_taipei().strftime('%Y%m%d')}.csv", mime="text/csv")
+    if st.button("清除 v2.11 今日學習紀錄", type="secondary"):
+        clear_v211_learning_log()
+        st.rerun()
+
+st.subheader("📌 錯過漲停 / 近漲停歸因檢查")
+st.caption("如果有股票已接近漲停，但沒有早期或左側訊號，系統會列出可能原因。這是之後 v2.12 自動調權重的依據。")
+if v211_missed_limit_df.empty:
+    st.info("目前沒有近漲停但疑似錯過的股票。")
+else:
+    miss_cols = [c for c in ["代號", "名稱", "目前價", "盤中漲跌幅", "漲停距離%", "交易員訊號", "檢查結果", "可能原因", "左側低吸分", "盤中資金分", "漲停前兆分", "AI來源"] if c in v211_missed_limit_df.columns]
+    st.dataframe(v211_missed_limit_df[miss_cols].head(top_n), use_container_width=True, hide_index=True)
+
+
 st.subheader("🧠 v2.10 交易員決策中控台")
-st.caption("這張表是新的主畫面。先看『交易員訊號』和『我會不會買』：✅ 才能小量，👀/🟡 只等待，🟢 是右側加碼不是第一買點，🔴/⚫ 不碰。")
+st.caption("這張表仍然是盤中主決策：先看『交易員訊號』和『我會不會買』。v2.11 會把這些訊號記錄下來，追蹤後續有沒有準。")
 
 try:
     trader_counts = live_df.get("交易員訊號", pd.Series(dtype=str)).astype(str).value_counts()
