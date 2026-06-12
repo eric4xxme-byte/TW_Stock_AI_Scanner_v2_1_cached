@@ -482,11 +482,11 @@ def compute_live_strength(df: pd.DataFrame, attack_threshold=65, watch_threshold
     ).round(1)
 
     def alert(row):
-        strength = float(row.get("即時強度分", 0) or 0)
-        ai = float(row.get("AI總分", 0) or 0)
-        risk = float(row.get("風險分", 0) or 0)
-        pct = float(row.get("盤中漲跌幅", 0) or 0)
-        vol_score = float(row.get("盤中量能分", 0) or 0)
+        strength = _clean_number(row.get("即時強度分"))
+        ai = _clean_number(row.get("AI總分"))
+        risk = _clean_number(row.get("風險分"))
+        pct = _clean_number(row.get("盤中漲跌幅"))
+        vol_score = _clean_number(row.get("盤中量能分"))
 
         if pct >= chase_pct and risk >= 30:
             return "不要追高", "漲幅過大且風險偏高，容易震盪或倒貨。"
@@ -568,19 +568,19 @@ def add_entry_timing(df: pd.DataFrame, chase_pct=7.0) -> pd.DataFrame:
     df = df.copy()
 
     def plan(row):
-        ai = float(row.get("AI總分", 0) or 0)
-        risk = float(row.get("風險分", 0) or 0)
-        strength = float(row.get("即時強度分", 0) or 0)
-        pct = float(row.get("盤中漲跌幅", 0) or 0)
-        vol_score = float(row.get("盤中量能分", 0) or 0)
+        ai = _clean_number(row.get("AI總分"))
+        risk = _clean_number(row.get("風險分"))
+        strength = _clean_number(row.get("即時強度分"))
+        pct = _clean_number(row.get("盤中漲跌幅"))
+        vol_score = _clean_number(row.get("盤中量能分"))
         alert = str(row.get("盤中警示", "中性"))
         ai_source = str(row.get("AI來源", ""))
 
-        px = _to_float(row.get("盤中現價"))
-        high = _to_float(row.get("最高"))
-        low = _to_float(row.get("最低"))
-        open_px = _to_float(row.get("開盤"))
-        prev = _to_float(row.get("昨收"))
+        px = _to__clean_number(row.get("盤中現價"))
+        high = _to__clean_number(row.get("最高"))
+        low = _to__clean_number(row.get("最低"))
+        open_px = _to__clean_number(row.get("開盤"))
+        prev = _to__clean_number(row.get("昨收"))
 
         if math.isnan(px) or px <= 0:
             return pd.Series({
@@ -700,17 +700,17 @@ def add_decision_dashboard(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
     def decision(row):
-        ai = float(row.get("AI總分", 0) or 0)
-        risk = float(row.get("風險分", 0) or 0)
-        strength = float(row.get("即時強度分", 0) or 0)
-        pct = float(row.get("盤中漲跌幅", 0) or 0)
-        vol_score = float(row.get("盤中量能分", 0) or 0)
-        speed = float(row.get("刷新漲速%", 0) or 0)
-        vol_jump = float(row.get("量能跳升分", 0) or 0)
-        px = _to_float(row.get("盤中現價"))
-        prev = _to_float(row.get("昨收"))
-        high = _to_float(row.get("最高"))
-        low = _to_float(row.get("最低"))
+        ai = _clean_number(row.get("AI總分"))
+        risk = _clean_number(row.get("風險分"))
+        strength = _clean_number(row.get("即時強度分"))
+        pct = _clean_number(row.get("盤中漲跌幅"))
+        vol_score = _clean_number(row.get("盤中量能分"))
+        speed = _clean_number(row.get("刷新漲速%"))
+        vol_jump = _clean_number(row.get("量能跳升分"))
+        px = _to__clean_number(row.get("盤中現價"))
+        prev = _to__clean_number(row.get("昨收"))
+        high = _to__clean_number(row.get("最高"))
+        low = _to__clean_number(row.get("最低"))
         alert = str(row.get("盤中警示", ""))
         entry = str(row.get("盤中入場判斷", ""))
         surge = str(row.get("爆衝警示", ""))
@@ -826,14 +826,23 @@ def add_decision_dashboard(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _parse_price_text(value) -> float:
-    """Parse display price text such as '72.5' or '-' into float."""
+    """Parse display price text such as '72.5', '72.5～73.0', or '-' into float.
+
+    Some upstream columns may contain labels like '高', '中', '等二次攻擊觸發', or
+    ranges. This parser must never crash the Streamlit app.
+    """
     try:
         if value is None:
             return np.nan
-        text = str(value).replace(",", "").strip()
-        if text in {"", "-", "--", "nan", "None"}:
+        text = str(value).replace(",", "").replace("％", "%").strip()
+        if text in {"", "-", "--", "nan", "None", "NaN"}:
             return np.nan
-        return float(text)
+        # If the cell is a price range, use the first price as conservative reference.
+        text = text.replace("～", "~").replace("至", "~")
+        if "~" in text:
+            text = text.split("~", 1)[0].strip()
+        m = re.search(r"-?\d+(?:\.\d+)?", text)
+        return float(m.group(0)) if m else np.nan
     except Exception:
         return np.nan
 
@@ -847,21 +856,21 @@ def add_entry_signal_layer(df: pd.DataFrame, chase_pct: float = 7.0) -> pd.DataF
     df = df.copy()
 
     def signal(row):
-        px = _to_float(row.get("盤中現價"))
-        prev_px = _to_float(row.get("上一輪價格"))
+        px = _to__clean_number(row.get("盤中現價"))
+        prev_px = _to__clean_number(row.get("上一輪價格"))
         trigger = _parse_price_text(row.get("觸發價"))
-        pct = float(row.get("盤中漲跌幅", 0) or 0)
-        speed = float(row.get("刷新漲速%", 0) or 0)
-        ai = float(row.get("AI總分", 0) or 0)
-        risk = float(row.get("風險分", 0) or 0)
-        strength = float(row.get("即時強度分", 0) or 0)
-        vol_score = float(row.get("盤中量能分", 0) or 0)
-        vol_jump = float(row.get("量能跳升分", 0) or 0)
+        pct = _clean_number(row.get("盤中漲跌幅"))
+        speed = _clean_number(row.get("刷新漲速%"))
+        ai = _clean_number(row.get("AI總分"))
+        risk = _clean_number(row.get("風險分"))
+        strength = _clean_number(row.get("即時強度分"))
+        vol_score = _clean_number(row.get("盤中量能分"))
+        vol_jump = _clean_number(row.get("量能跳升分"))
         decision = str(row.get("決策等級", ""))
         entry = str(row.get("盤中入場判斷", ""))
         surge = str(row.get("爆衝警示", ""))
         ai_source = str(row.get("AI來源", ""))
-        limit_dist = _to_float(row.get("漲停距離%"))
+        limit_dist = _to__clean_number(row.get("漲停距離%"))
 
         if math.isnan(px) or px <= 0:
             return pd.Series({
@@ -1031,19 +1040,19 @@ def add_limitup_reattack_engine(df: pd.DataFrame, chase_pct: float = 7.0) -> pd.
 
     def calc(row):
         code = _normalize_code(row.get("代號"))
-        px = _to_float(row.get("盤中現價"))
-        prev = _to_float(row.get("昨收"))
-        open_px = _to_float(row.get("開盤"))
-        high = _to_float(row.get("最高"))
-        low = _to_float(row.get("最低"))
-        pct = float(row.get("盤中漲跌幅", 0) or 0)
-        speed = float(row.get("刷新漲速%", 0) or 0)
-        vol_score = float(row.get("盤中量能分", 0) or 0)
-        vol_jump = float(row.get("量能跳升分", 0) or 0)
-        strength = float(row.get("即時強度分", 0) or 0)
-        ai = float(row.get("AI總分", 0) or 0)
-        risk = float(row.get("風險分", 0) or 0)
-        surge_score = float(row.get("爆衝分", 0) or 0)
+        px = _to__clean_number(row.get("盤中現價"))
+        prev = _to__clean_number(row.get("昨收"))
+        open_px = _to__clean_number(row.get("開盤"))
+        high = _to__clean_number(row.get("最高"))
+        low = _to__clean_number(row.get("最低"))
+        pct = _clean_number(row.get("盤中漲跌幅"))
+        speed = _clean_number(row.get("刷新漲速%"))
+        vol_score = _clean_number(row.get("盤中量能分"))
+        vol_jump = _clean_number(row.get("量能跳升分"))
+        strength = _clean_number(row.get("即時強度分"))
+        ai = _clean_number(row.get("AI總分"))
+        risk = _clean_number(row.get("風險分"))
+        surge_score = _clean_number(row.get("爆衝分"))
         is_focus = code in FOCUS_CODES
 
         if math.isnan(px) or px <= 0:
@@ -1193,13 +1202,13 @@ def add_v281_three_zone_entry(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
     def calc(row):
-        px = _to_float(row.get("盤中現價"))
-        pct = float(row.get("盤中漲跌幅", 0) or 0)
-        speed = float(row.get("刷新漲速%", 0) or 0)
-        vol_score = float(row.get("盤中量能分", 0) or 0)
-        vol_jump = float(row.get("量能跳升分", 0) or 0)
-        risk = float(row.get("風險分", 0) or 0)
-        precursor = float(row.get("漲停前兆分", 0) or 0)
+        px = _to__clean_number(row.get("盤中現價"))
+        pct = _clean_number(row.get("盤中漲跌幅"))
+        speed = _clean_number(row.get("刷新漲速%"))
+        vol_score = _clean_number(row.get("盤中量能分"))
+        vol_jump = _clean_number(row.get("量能跳升分"))
+        risk = _clean_number(row.get("風險分"))
+        precursor = _clean_number(row.get("漲停前兆分"))
         state = _safe_text(row.get("回檔再攻狀態"), "")
 
         support = _parse_price_text(row.get("回測支撐價"))
@@ -1304,10 +1313,10 @@ def apply_v28_entry_signal_overrides(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     for idx, row in df.iterrows():
         state = _safe_text(row.get("回檔再攻狀態"), "")
-        precursor = float(row.get("漲停前兆分", 0) or 0)
-        risk = float(row.get("風險分", 0) or 0)
-        pct = float(row.get("盤中漲跌幅", 0) or 0)
-        limit_dist = _to_float(row.get("漲停距離%"))
+        precursor = _clean_number(row.get("漲停前兆分"))
+        risk = _clean_number(row.get("風險分"))
+        pct = _clean_number(row.get("盤中漲跌幅"))
+        limit_dist = _to__clean_number(row.get("漲停距離%"))
         near_limit = bool(pct >= 8.8 or (not math.isnan(limit_dist) and limit_dist <= 1.2))
 
         if state == "✅ 二次攻擊可小量試單" and risk < 38 and not near_limit:
@@ -1315,7 +1324,7 @@ def apply_v28_entry_signal_overrides(df: pd.DataFrame) -> pd.DataFrame:
             df.at[idx, "可否入場"] = "可以小量觀察進場"
             df.at[idx, "入場確認"] = "回檔後二次攻擊觸發"
             df.at[idx, "入場優先級"] = 1
-            df.at[idx, "入場訊號分"] = max(float(row.get("入場訊號分", 0) or 0), precursor)
+            df.at[idx, "入場訊號分"] = max(_clean_number(row.get("入場訊號分")), precursor)
             df.at[idx, "入場條件檢查"] = _safe_text(row.get("回檔再攻判斷"), "")
             df.at[idx, "建議下單方式"] = "只小量；不要市價追過觸發價太多；跌破防守停損價退出"
         elif state == "🟢 等二次攻擊觸發":
@@ -1497,11 +1506,11 @@ def should_track_signal(row: pd.Series, alert_name: str, entry_name: str) -> boo
     positive momentum and volume support. This makes the tracking table useful in practice.
     """
     try:
-        strength = float(row.get("即時強度分", 0) or 0)
-        pct = float(row.get("盤中漲跌幅", 0) or 0)
-        vol_score = float(row.get("盤中量能分", 0) or 0)
-        risk = float(row.get("風險分", 0) or 0)
-        ai = float(row.get("AI總分", 0) or 0)
+        strength = _clean_number(row.get("即時強度分"))
+        pct = _clean_number(row.get("盤中漲跌幅"))
+        vol_score = _clean_number(row.get("盤中量能分"))
+        risk = _clean_number(row.get("風險分"))
+        ai = _clean_number(row.get("AI總分"))
         ai_source = _safe_text(row.get("AI來源"), "")
     except Exception:
         return False
@@ -1557,7 +1566,7 @@ def update_runtime_signal_log(live_df: pd.DataFrame) -> pd.DataFrame:
     current_by_code: Dict[str, Dict[str, Any]] = {}
     for _, row in live_df.iterrows():
         code = _normalize_code(row.get("代號"))
-        px = _to_float(row.get("盤中現價"))
+        px = _to__clean_number(row.get("盤中現價"))
         if not re.match(r"^\d{4}$", code):
             continue
         current_by_code[code] = row.to_dict() | {"_current_px": px}
@@ -1596,13 +1605,13 @@ def update_runtime_signal_log(live_df: pd.DataFrame) -> pd.DataFrame:
                 "目前報酬%": 0.0,
                 "最高報酬%": 0.0,
                 "最大回撤%": 0.0,
-                "AI總分": round(float(row.get("AI總分", 0) or 0), 1),
-                "風險分": round(float(row.get("風險分", 0) or 0), 1),
-                "首次即時強度分": round(float(row.get("即時強度分", 0) or 0), 1),
-                "最新即時強度分": round(float(row.get("即時強度分", 0) or 0), 1),
-                "首次盤中漲跌幅": round(float(row.get("盤中漲跌幅", 0) or 0), 2),
-                "最新盤中漲跌幅": round(float(row.get("盤中漲跌幅", 0) or 0), 2),
-                "盤中成交量": round(float(row.get("盤中成交量", 0) or 0), 0),
+                "AI總分": round(_clean_number(row.get("AI總分")), 1),
+                "風險分": round(_clean_number(row.get("風險分")), 1),
+                "首次即時強度分": round(_clean_number(row.get("即時強度分")), 1),
+                "最新即時強度分": round(_clean_number(row.get("即時強度分")), 1),
+                "首次盤中漲跌幅": round(_clean_number(row.get("盤中漲跌幅")), 2),
+                "最新盤中漲跌幅": round(_clean_number(row.get("盤中漲跌幅")), 2),
+                "盤中成交量": round(_clean_number(row.get("盤中成交量")), 0),
                 "觸發價": _safe_text(row.get("觸發價"), "-"),
                 "停損參考": _safe_text(row.get("停損參考"), "-"),
                 "壓力參考": _safe_text(row.get("壓力參考"), "-"),
@@ -1651,9 +1660,9 @@ def update_runtime_signal_log(live_df: pd.DataFrame) -> pd.DataFrame:
             log_df.loc[idx, "最新時間"] = now_time
 
         def status(row):
-            ret = float(row.get("目前報酬%", 0) or 0)
-            high_ret = float(row.get("最高報酬%", 0) or 0)
-            drawdown = float(row.get("最大回撤%", 0) or 0)
+            ret = _clean_number(row.get("目前報酬%"))
+            high_ret = _clean_number(row.get("最高報酬%"))
+            drawdown = _clean_number(row.get("最大回撤%"))
             sig = _safe_text(row.get("首次訊號"), "")
             if ret >= 1.5:
                 return "✅ 訊號有效"
@@ -1766,11 +1775,11 @@ def update_surge_radar(live_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFram
         df["突破日內高"] = np.where((current_px > 0) & (day_high > 0), current_px >= day_high * 0.998, False)
 
         def surge_label(row):
-            speed = float(row.get("刷新漲速%", 0) or 0)
-            vol_jump = float(row.get("量能跳升分", 0) or 0)
-            pct = float(row.get("盤中漲跌幅", 0) or 0)
-            risk = float(row.get("風險分", 0) or 0)
-            strength = float(row.get("即時強度分", 0) or 0)
+            speed = _clean_number(row.get("刷新漲速%"))
+            vol_jump = _clean_number(row.get("量能跳升分"))
+            pct = _clean_number(row.get("盤中漲跌幅"))
+            risk = _clean_number(row.get("風險分"))
+            strength = _clean_number(row.get("即時強度分"))
             is_manual = bool(row.get("手動加入", False))
             high_break = bool(row.get("突破日內高", False))
 
@@ -1836,7 +1845,7 @@ def _nearest_past_values(group: pd.DataFrame, now_ts: pd.Timestamp, minutes: int
         if g.empty:
             return np.nan, np.nan, np.nan
         row = g.iloc[-1]
-        return _to_float(row.get("盤中現價")), _to_float(row.get("盤中成交量")), _to_float(row.get("盤中漲跌幅"))
+        return _to__clean_number(row.get("盤中現價")), _to__clean_number(row.get("盤中成交量")), _to__clean_number(row.get("盤中漲跌幅"))
     except Exception:
         return np.nan, np.nan, np.nan
 
@@ -1977,26 +1986,26 @@ def add_v29_left_predictive_ai(df: pd.DataFrame, chase_pct: float = 7.0) -> pd.D
 
     def calc(row):
         code = _normalize_code(row.get("代號"))
-        px = _to_float(row.get("盤中現價"))
-        prev = _to_float(row.get("昨收"))
-        open_px = _to_float(row.get("開盤"))
-        day_high = _to_float(row.get("最高"))
-        day_low = _to_float(row.get("最低"))
-        ai = float(row.get("AI總分", 0) or 0)
-        risk = float(row.get("風險分", 0) or 0)
-        strength = float(row.get("即時強度分", 0) or 0)
-        pct = float(row.get("盤中漲跌幅", 0) or 0)
-        vol_score = float(row.get("盤中量能分", 0) or 0)
-        vol_jump = float(row.get("量能跳升分", 0) or 0)
-        speed1 = float(row.get("1分漲速%", 0) or 0)
-        speed3 = float(row.get("3分漲速%", 0) or 0)
-        speed5 = float(row.get("5分漲速%", 0) or 0)
-        speed10 = float(row.get("10分漲速%", 0) or 0)
-        vol3 = float(row.get("3分量增%", 0) or 0)
-        vol5 = float(row.get("5分量增%", 0) or 0)
+        px = _to__clean_number(row.get("盤中現價"))
+        prev = _to__clean_number(row.get("昨收"))
+        open_px = _to__clean_number(row.get("開盤"))
+        day_high = _to__clean_number(row.get("最高"))
+        day_low = _to__clean_number(row.get("最低"))
+        ai = _clean_number(row.get("AI總分"))
+        risk = _clean_number(row.get("風險分"))
+        strength = _clean_number(row.get("即時強度分"))
+        pct = _clean_number(row.get("盤中漲跌幅"))
+        vol_score = _clean_number(row.get("盤中量能分"))
+        vol_jump = _clean_number(row.get("量能跳升分"))
+        speed1 = _clean_number(row.get("1分漲速%"))
+        speed3 = _clean_number(row.get("3分漲速%"))
+        speed5 = _clean_number(row.get("5分漲速%"))
+        speed10 = _clean_number(row.get("10分漲速%"))
+        vol3 = _clean_number(row.get("3分量增%"))
+        vol5 = _clean_number(row.get("5分量增%"))
         memory_pullback = _to_float(row.get("記憶回檔幅度%"), default=np.nan)
-        precursor = float(row.get("漲停前兆分", 0) or 0)
-        reattack_prob = float(row.get("再攻機率", 0) or 0)
+        precursor = _clean_number(row.get("漲停前兆分"))
+        reattack_prob = _clean_number(row.get("再攻機率"))
         ai_source = _safe_text(row.get("AI來源"), "")
         entry_strategy = _safe_text(row.get("入場價位策略"), "")
         old_signal = _safe_text(row.get("入場訊號"), "")
@@ -2199,7 +2208,7 @@ def clear_intraday_memory() -> None:
 
 # ---------- UI ----------
 
-st.title("⚡ 盤中即時看盤 v2.9 左側預判 AI 引擎")
+st.title("⚡ 盤中即時看盤 v2.9.1 左側預判 AI 引擎｜穩定修正版")
 st.caption("把判斷核心改成：資金是否提前進來、回檔是否守住、停損距離是否夠短、是否真的可以左側小量試單。右側突破只當加碼點，不再當第一買點。")
 
 refresh_default = _get_query_int("refresh", 30, 15, 120, 15)
@@ -2401,7 +2410,7 @@ if scan_mode == "盤中市場池掃描":
 
 st.divider()
 
-st.subheader("🎯 AI 即時入場決策 v2.9")
+st.subheader("🎯 AI 即時入場決策 v2.9.1")
 st.caption("這區才是新版核心：先判斷能不能左側小量試單。✅ 左側可小量試單 = 價格靠近支撐、資金進來、停損距離短；🟢 右側突破只當加碼點，不當第一買點。")
 
 v29_cols = [
