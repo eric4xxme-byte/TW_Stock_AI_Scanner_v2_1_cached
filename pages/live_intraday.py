@@ -4057,6 +4057,32 @@ def _v216_pct_text(v: Any) -> str:
         return "-"
 
 
+def _v216_price_text(v: Any, digits: int = 2) -> str:
+    try:
+        if v is None or str(v).strip() in {"", "-", "None", "nan", "NaN"}:
+            return "-"
+        f = float(str(v).replace(",", ""))
+        if abs(f) >= 1000:
+            return f"{f:,.2f}"
+        if abs(f) >= 100:
+            return f"{f:.2f}"
+        return f"{f:.{digits}f}"
+    except Exception:
+        return "-"
+
+
+def _v216_asset_row(obj: Dict[str, Any], fallback_label: str) -> Dict[str, Any]:
+    obj = obj or {}
+    return {
+        "項目": str(obj.get("label") or fallback_label),
+        "最新價格": _v216_price_text(obj.get("price")),
+        "漲跌幅": _v216_pct_text(obj.get("change_pct")),
+        "昨收/前收": _v216_price_text(obj.get("previous_close")),
+        "來源": str(obj.get("source") or "-"),
+        "狀態": "✅" if obj.get("ok") else "⚠️",
+    }
+
+
 def load_v216_context() -> Dict[str, Any]:
     ctx = _v216_read_json(V216_MARKET_CONTEXT_PATH)
     night = _v216_read_json(V216_NIGHT_CONTEXT_PATH)
@@ -4157,14 +4183,49 @@ def render_v216_context(ctx: Dict[str, Any]) -> None:
     idx = ctx.get("indices", {}) or {}
     night = ctx.get("night_proxies", {}) or {}
     breadth = ctx.get("breadth", {}) or {}
+
+    twii = idx.get("TWII") or {}
+    twoii = idx.get("TWOII") or {}
+    nq = night.get("NQ=F") or {}
+    es = night.get("ES=F") or {}
+    sox = night.get("SOX") or {}
+    tnx = night.get("TNX") or {}
+    dxy = night.get("DXY") or {}
+    oil = night.get("CL=F") or {}
+
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("加權 / 櫃買", f"{_v216_pct_text((idx.get('TWII') or {}).get('change_pct'))} / {_v216_pct_text((idx.get('TWOII') or {}).get('change_pct'))}")
-    k2.metric("NASDAQ期 / S&P期", f"{_v216_pct_text((night.get('NQ=F') or {}).get('change_pct'))} / {_v216_pct_text((night.get('ES=F') or {}).get('change_pct'))}")
-    k3.metric("費半 / 美債", f"{_v216_pct_text((night.get('SOX') or {}).get('change_pct'))} / {_v216_pct_text((night.get('TNX') or {}).get('change_pct'))}")
+    k1.metric("加權指數", _v216_price_text(twii.get("price")), _v216_pct_text(twii.get("change_pct")))
+    k2.metric("櫃買指數", _v216_price_text(twoii.get("price")), _v216_pct_text(twoii.get("change_pct")))
+    k3.metric("NASDAQ 期貨", _v216_price_text(nq.get("price")), _v216_pct_text(nq.get("change_pct")))
+    k4.metric("S&P 500 期貨", _v216_price_text(es.get("price")), _v216_pct_text(es.get("change_pct")))
+
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric("費半指數", _v216_price_text(sox.get("price")), _v216_pct_text(sox.get("change_pct")))
+    p2.metric("美10年殖利率", _v216_price_text(tnx.get("price")), _v216_pct_text(tnx.get("change_pct")))
+    p3.metric("美元指數", _v216_price_text(dxy.get("price")), _v216_pct_text(dxy.get("change_pct")))
+    p4.metric("WTI 油價", _v216_price_text(oil.get("price")), _v216_pct_text(oil.get("change_pct")))
+
     if breadth.get("ok"):
-        k4.metric("漲跌家數 / 平均", f"{breadth.get('up_count', 0)} / {breadth.get('down_count', 0)}", f"{breadth.get('avg_pct', 0)}%")
+        b1, b2, b3, b4 = st.columns(4)
+        b1.metric("漲 / 跌家數", f"{breadth.get('up_count', 0)} / {breadth.get('down_count', 0)}")
+        b2.metric("平均漲跌", f"{breadth.get('avg_pct', 0)}%")
+        b3.metric("上漲比率", f"{float(breadth.get('up_ratio', 0))*100:.1f}%")
+        b4.metric("最強 / 最弱", f"{breadth.get('max_pct', 0)}% / {breadth.get('min_pct', 0)}%")
     else:
-        k4.metric("市場廣度", "尚無", str(breadth.get("message", "-")))
+        st.caption(f"市場廣度：{breadth.get('message', '-')}")
+
+    detail_rows = [
+        _v216_asset_row(twii, "加權指數"),
+        _v216_asset_row(twoii, "櫃買指數"),
+        _v216_asset_row(nq, "NASDAQ 100 期貨"),
+        _v216_asset_row(es, "S&P 500 期貨"),
+        _v216_asset_row(sox, "費半指數"),
+        _v216_asset_row(tnx, "美10年殖利率"),
+        _v216_asset_row(dxy, "美元指數"),
+        _v216_asset_row(oil, "WTI 原油期貨"),
+    ]
+    with st.expander("大盤 / 夜盤價格明細", expanded=False):
+        st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
 
     action = str(ctx.get("market_action", ""))
     next_day = str(ctx.get("next_day_note", ""))
@@ -4176,8 +4237,8 @@ def render_v216_context(ctx: Dict[str, Any]) -> None:
 
 v216_context = load_v216_context()
 
-st.title("🌐 盤中即時看盤 v2.16 大盤 / 夜盤 / 盤後分流引擎")
-st.caption("v2.16 新增：大盤環境分、夜盤風險分、盤後驗證分流；個股訊號會被大盤/夜盤環境保守修正，不再只看單一個股。")
+st.title("🌐 盤中即時看盤 v2.16.2 大盤 / 夜盤價格顯示版")
+st.caption("v2.16.2 新增：直接顯示加權、櫃買、NASDAQ期、S&P期、費半、美債、美元、油價的最新價格與漲跌幅；個股訊號仍會被大盤/夜盤環境保守修正。")
 render_v216_context(v216_context)
 st.divider()
 
