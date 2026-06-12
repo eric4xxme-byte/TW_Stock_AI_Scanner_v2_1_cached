@@ -1,5 +1,5 @@
 # pages/live_intraday.py
-# v2.5 Live Intraday Market Pool Scanner
+# v2.6 Live Intraday Signal Tracking
 # Purpose:
 # - Keep v2.4.x live AI candidate monitoring.
 # - Add a safer "market pool scan" mode: TWSE + TPEx turnover pool + live quotes.
@@ -774,10 +774,202 @@ def append_manual_codes(df: pd.DataFrame, codes: List[str], manual_ai_score: int
     return df
 
 
+
+# ---------- Intraday signal tracking ----------
+
+SIGNAL_LOG_PATH = DATA_DIR / "intraday_signal_log_runtime.csv"
+IMPORTANT_ALERTS = {"強勢進攻", "觀察偏強", "AI高分轉弱", "不要追高", "高風險上漲", "盤中轉弱"}
+IMPORTANT_ENTRIES = {
+    "強勢進攻，可盯突破",
+    "觀察偏強，等回測確認",
+    "AI高分但盤中轉弱",
+    "漲幅偏高，不追",
+    "風險偏高，暫不追",
+    "盤中轉弱，避開",
+}
+
+
+def _safe_text(value: Any, default: str = "") -> str:
+    try:
+        if value is None:
+            return default
+        if isinstance(value, float) and math.isnan(value):
+            return default
+        return str(value)
+    except Exception:
+        return default
+
+
+def _load_runtime_signal_log() -> pd.DataFrame:
+    if SIGNAL_LOG_PATH.exists():
+        try:
+            df = pd.read_csv(SIGNAL_LOG_PATH, dtype={"代號": str})
+            if "代號" in df.columns:
+                df["代號"] = df["代號"].astype(str).str.zfill(4)
+            return df
+        except Exception:
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+
+def _save_runtime_signal_log(df: pd.DataFrame) -> None:
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        df.to_csv(SIGNAL_LOG_PATH, index=False, encoding="utf-8-sig")
+    except Exception:
+        pass
+
+
+def update_runtime_signal_log(live_df: pd.DataFrame) -> pd.DataFrame:
+    """Keep a local runtime signal log.
+
+    This file is written by the Streamlit app instance. It survives browser refreshes,
+    but it is not committed to GitHub and may reset after Streamlit reboot/redeploy.
+    """
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    now_time = now.strftime("%H:%M:%S")
+
+    log_df = _load_runtime_signal_log()
+    if log_df.empty:
+        log_df = pd.DataFrame()
+
+    # Keep today's records only to avoid the runtime CSV growing forever.
+    if not log_df.empty and "日期" in log_df.columns:
+        log_df = log_df[log_df["日期"].astype(str) == today].copy()
+
+    existing_keys = set(log_df["訊號Key"].astype(str)) if "訊號Key" in log_df.columns else set()
+    new_rows: List[Dict[str, Any]] = []
+
+    current_by_code: Dict[str, Dict[str, Any]] = {}
+    for _, row in live_df.iterrows():
+        code = _normalize_code(row.get("代號"))
+        px = _to_float(row.get("盤中現價"))
+        if not re.match(r"^\d{4}$", code):
+            continue
+        current_by_code[code] = row.to_dict() | {"_current_px": px}
+
+        alert_name = _safe_text(row.get("盤中警示"), "中性")
+        entry_name = _safe_text(row.get("盤中入場判斷"), "僅觀察，未達入場條件")
+
+        should_log = (alert_name in IMPORTANT_ALERTS) or (entry_name in IMPORTANT_ENTRIES)
+        if not should_log or math.isnan(px) or px <= 0:
+            continue
+
+        signal_key = f"{today}|{code}|{alert_name}|{entry_name}"
+        if signal_key in existing_keys:
+            continue
+
+        new_rows.append(
+            {
+                "訊號Key": signal_key,
+                "日期": today,
+                "首次時間": now_time,
+                "代號": code,
+                "名稱": _safe_text(row.get("名稱"), code),
+                "市場": _safe_text(row.get("市場"), "未知"),
+                "產業": _safe_text(row.get("產業"), "未知"),
+                "AI來源": _safe_text(row.get("AI來源"), ""),
+                "資料來源": _safe_text(row.get("資料來源"), ""),
+                "首次訊號": alert_name,
+                "首次入場判斷": entry_name,
+                "首次標籤": _safe_text(row.get("盤中標籤"), alert_name),
+                "首次訊號價": round(px, 2),
+                "目前價格": round(px, 2),
+                "最高價格": round(px, 2),
+                "最低價格": round(px, 2),
+                "目前報酬%": 0.0,
+                "最高報酬%": 0.0,
+                "最大回撤%": 0.0,
+                "AI總分": round(float(row.get("AI總分", 0) or 0), 1),
+                "風險分": round(float(row.get("風險分", 0) or 0), 1),
+                "首次即時強度分": round(float(row.get("即時強度分", 0) or 0), 1),
+                "最新即時強度分": round(float(row.get("即時強度分", 0) or 0), 1),
+                "首次盤中漲跌幅": round(float(row.get("盤中漲跌幅", 0) or 0), 2),
+                "最新盤中漲跌幅": round(float(row.get("盤中漲跌幅", 0) or 0), 2),
+                "盤中成交量": round(float(row.get("盤中成交量", 0) or 0), 0),
+                "觸發價": _safe_text(row.get("觸發價"), "-"),
+                "停損參考": _safe_text(row.get("停損參考"), "-"),
+                "壓力參考": _safe_text(row.get("壓力參考"), "-"),
+                "建議動作": _safe_text(row.get("建議動作"), ""),
+                "最新時間": now_time,
+            }
+        )
+        existing_keys.add(signal_key)
+
+    if new_rows:
+        log_df = pd.concat([log_df, pd.DataFrame(new_rows)], ignore_index=True)
+
+    # Update current price and running max/min for all logged signals.
+    if not log_df.empty:
+        for idx, record in log_df.iterrows():
+            code = _normalize_code(record.get("代號"))
+            if code not in current_by_code:
+                continue
+            current_row = current_by_code[code]
+            px = current_row.get("_current_px", np.nan)
+            if math.isnan(px) or px <= 0:
+                continue
+
+            first_px = _to_float(record.get("首次訊號價"))
+            if math.isnan(first_px) or first_px <= 0:
+                continue
+
+            prev_high = _to_float(record.get("最高價格"), px)
+            prev_low = _to_float(record.get("最低價格"), px)
+            high_px = max(prev_high if not math.isnan(prev_high) else px, px)
+            low_px = min(prev_low if not math.isnan(prev_low) else px, px)
+
+            current_ret = (px - first_px) / first_px * 100
+            high_ret = (high_px - first_px) / first_px * 100
+            low_ret = (low_px - first_px) / first_px * 100
+
+            log_df.loc[idx, "目前價格"] = round(px, 2)
+            log_df.loc[idx, "最高價格"] = round(high_px, 2)
+            log_df.loc[idx, "最低價格"] = round(low_px, 2)
+            log_df.loc[idx, "目前報酬%"] = round(current_ret, 2)
+            log_df.loc[idx, "最高報酬%"] = round(high_ret, 2)
+            log_df.loc[idx, "最大回撤%"] = round(low_ret, 2)
+            log_df.loc[idx, "最新即時強度分"] = round(float(current_row.get("即時強度分", 0) or 0), 1)
+            log_df.loc[idx, "最新盤中漲跌幅"] = round(float(current_row.get("盤中漲跌幅", 0) or 0), 2)
+            log_df.loc[idx, "盤中成交量"] = round(float(current_row.get("盤中成交量", 0) or 0), 0)
+            log_df.loc[idx, "最新時間"] = now_time
+
+        def status(row):
+            ret = float(row.get("目前報酬%", 0) or 0)
+            high_ret = float(row.get("最高報酬%", 0) or 0)
+            drawdown = float(row.get("最大回撤%", 0) or 0)
+            sig = _safe_text(row.get("首次訊號"), "")
+            if ret >= 1.5:
+                return "✅ 訊號有效"
+            if high_ret >= 2.0 and ret < 0.5:
+                return "⚠️ 衝高回落"
+            if ret <= -1.5:
+                return "❌ 訊號失效"
+            if sig in {"AI高分轉弱", "盤中轉弱", "不要追高", "高風險上漲"}:
+                return "🛡️ 風險提醒中"
+            if drawdown <= -1.0 and ret <= 0:
+                return "⚠️ 觀察轉弱"
+            return "⏳ 追蹤中"
+
+        log_df["目前狀態"] = log_df.apply(status, axis=1)
+
+    _save_runtime_signal_log(log_df)
+    return log_df
+
+
+def clear_runtime_signal_log() -> None:
+    try:
+        if SIGNAL_LOG_PATH.exists():
+            SIGNAL_LOG_PATH.unlink()
+    except Exception:
+        pass
+
+
 # ---------- UI ----------
 
-st.title("⚡ 盤中即時看盤 v2.5.1 市場池掃描")
-st.caption("盤後 AI 候選 + 盤中市場池掃描 + 前台即時報價 + 入場時機輔助判斷。市場池不是完整盤後AI，只是盤中動能擴大掃描。")
+st.title("⚡ 盤中即時看盤 v2.6 訊號追蹤")
+st.caption("盤後 AI 候選 + 盤中市場池掃描 + 前台即時報價 + 入場時機輔助判斷 + 今日訊號追蹤。")
 
 refresh_default = _get_query_int("refresh", 30, 15, 120, 15)
 top_n_default = _get_query_int("top_n", 15, 5, 50, 5)
@@ -921,7 +1113,52 @@ st.caption(f"掃描來源：{universe_source}")
 if scan_mode == "盤中市場池掃描":
     st.warning("市場池掃描股若顯示『市場池估分』，代表它只有盤中動能與成交金額排序，沒有完整盤後AI/籌碼驗證。入場判斷要更保守。")
 
+
 st.divider()
+
+# v2.6: signal tracking
+signal_log_df = update_runtime_signal_log(live_df)
+
+st.subheader("今日訊號追蹤")
+st.caption("系統會紀錄盤中警示第一次出現的時間與價格，並追蹤目前報酬、最高報酬與最大回撤。這是前台即時紀錄；Streamlit 重開或重新部署後可能會重置，長期統計仍要靠後台回測。")
+
+if signal_log_df.empty:
+    st.info("目前尚未出現可追蹤的盤中訊號。")
+else:
+    sig_total = len(signal_log_df)
+    sig_effective = int((pd.to_numeric(signal_log_df.get("目前報酬%", 0), errors="coerce").fillna(0) > 0).sum())
+    sig_failed = int((pd.to_numeric(signal_log_df.get("目前報酬%", 0), errors="coerce").fillna(0) <= -1.5).sum())
+    best_ret = float(pd.to_numeric(signal_log_df.get("最高報酬%", 0), errors="coerce").fillna(0).max())
+
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("今日訊號數", sig_total)
+    s2.metric("目前為正", sig_effective)
+    s3.metric("失效訊號", sig_failed)
+    s4.metric("最高訊號報酬", f"{best_ret:.2f}%")
+
+    track_cols = [
+        "首次時間", "代號", "名稱", "市場", "首次標籤", "首次入場判斷", "首次訊號價", "目前價格",
+        "目前報酬%", "最高報酬%", "最大回撤%", "目前狀態", "AI總分", "風險分",
+        "首次即時強度分", "最新即時強度分", "最新盤中漲跌幅", "觸發價", "停損參考", "壓力參考", "建議動作", "最新時間"
+    ]
+    track_cols = [c for c in track_cols if c in signal_log_df.columns]
+    show_log = signal_log_df.copy()
+    if "首次時間" in show_log.columns:
+        show_log = show_log.sort_values(["首次時間", "目前報酬%"], ascending=[False, False])
+    st.dataframe(show_log[track_cols], use_container_width=True, hide_index=True)
+
+    csv_bytes = signal_log_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+    st.download_button(
+        "下載今日訊號紀錄 CSV",
+        data=csv_bytes,
+        file_name=f"intraday_signal_log_{datetime.now().strftime('%Y%m%d')}.csv",
+        mime="text/csv",
+    )
+
+    if st.button("清除今日前台訊號紀錄", type="secondary"):
+        clear_runtime_signal_log()
+        st.rerun()
+
 
 # Manual watchlist always visible.
 manual_live_df = live_df[live_df.get("手動加入", False).astype(bool)].copy()
