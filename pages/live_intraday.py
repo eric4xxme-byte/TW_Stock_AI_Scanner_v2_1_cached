@@ -1,5 +1,5 @@
 # pages/live_intraday.py
-# v2.9 Live Intraday Left-Side Predictive AI Engine
+# v2.15 Live Intraday Permanent Learning DB + Post-close Verifier
 # Purpose:
 # - Keep v2.4.x live AI candidate monitoring.
 # - Add a safer "market pool scan" mode: TWSE + TPEx turnover pool + live quotes.
@@ -12,6 +12,8 @@ import json
 import math
 import re
 import time
+import urllib.request
+import urllib.error
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -1531,7 +1533,7 @@ def _load_runtime_signal_log() -> pd.DataFrame:
             df = pd.read_csv(SIGNAL_LOG_PATH, dtype={"代號": str})
             if "代號" in df.columns:
                 df["代號"] = df["代號"].astype(str).str.zfill(4)
-            return df
+            return _v213_make_object_df(df)
         except Exception:
             return pd.DataFrame()
     return pd.DataFrame()
@@ -1765,7 +1767,7 @@ def _load_v211_learning_log() -> pd.DataFrame:
             df = pd.read_csv(V211_SIGNAL_LOG_PATH, dtype={"代號": str})
             if "代號" in df.columns:
                 df["代號"] = df["代號"].astype(str).str.zfill(4)
-            return df
+            return _v213_make_object_df(df)
         except Exception:
             return pd.DataFrame()
     return pd.DataFrame()
@@ -2281,7 +2283,7 @@ def _load_last_snapshot() -> pd.DataFrame:
             df = pd.read_csv(SURGE_SNAPSHOT_PATH, dtype={"代號": str})
             if "代號" in df.columns:
                 df["代號"] = df["代號"].astype(str).str.zfill(4)
-            return df
+            return _v213_make_object_df(df)
         except Exception:
             return pd.DataFrame()
     return pd.DataFrame()
@@ -3250,6 +3252,8 @@ def _v212_style_signal(v: Any) -> str:
 
 V213_SIGNAL_JOURNAL_PATH = DATA_DIR / "v213_signal_journal.csv"
 V214_WEIGHT_PROFILE_PATH = DATA_DIR / "v214_weight_profile.json"
+V215_VERIFIED_JOURNAL_PATH = DATA_DIR / "v215_verified_signal_journal.csv"
+V215_SYNC_LOG_PATH = DATA_DIR / "v215_google_sheet_sync_log.csv"
 
 
 def _v213_today() -> str:
@@ -3263,27 +3267,79 @@ def _v213_now_str() -> str:
 def _v213_scalar(value: Any) -> Any:
     """Return a CSV-safe scalar so Pandas assignment never crashes."""
     try:
+        if isinstance(value, pd.DataFrame):
+            if value.empty:
+                return ""
+            return value.to_json(force_ascii=False)
         if isinstance(value, pd.Series):
             if value.empty:
                 return ""
-            value = value.iloc[0]
+            value = value.dropna().iloc[0] if not value.dropna().empty else ""
+        if isinstance(value, np.ndarray):
+            arr = value.flatten()
+            if arr.size == 0:
+                return ""
+            if arr.size == 1:
+                value = arr[0]
+            else:
+                return " → ".join([_safe_text(x) for x in arr[:20]])
         if isinstance(value, (list, tuple, set)):
-            return " → ".join([_safe_text(x) for x in value])
+            return " → ".join([_safe_text(x) for x in list(value)[:20]])
         if isinstance(value, dict):
             return json.dumps(value, ensure_ascii=False)
         if value is None:
             return ""
-        if isinstance(value, float) and math.isnan(value):
-            return ""
+        try:
+            if pd.isna(value):
+                return ""
+        except Exception:
+            pass
         if isinstance(value, (np.integer,)):
             return int(value)
         if isinstance(value, (np.floating,)):
             v = float(value)
             return "" if math.isnan(v) else v
+        if isinstance(value, (pd.Timestamp,)):
+            return value.strftime("%Y-%m-%d %H:%M:%S")
         return value
     except Exception:
         return _safe_text(value, "")
 
+
+def _v213_make_object_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Pandas 3+ may reject writing text into numeric columns. Force object dtype before journal updates."""
+    try:
+        if df is None or df.empty:
+            return pd.DataFrame()
+        df = df.loc[:, ~df.columns.duplicated()].copy()
+        return df.astype(object)
+    except Exception:
+        try:
+            return df.copy()
+        except Exception:
+            return pd.DataFrame()
+
+
+def _v213_safe_set(df: pd.DataFrame, idx: Any, col: str, val: Any) -> pd.DataFrame:
+    """Set one cell without letting dtype/list-like values crash the Streamlit page."""
+    try:
+        scalar = _v213_scalar(val)
+        if col not in df.columns:
+            df[col] = pd.Series([""] * len(df), index=df.index, dtype=object)
+        else:
+            try:
+                df[col] = df[col].astype(object)
+            except Exception:
+                pass
+        if idx not in df.index:
+            df.loc[idx, col] = ""
+        df.at[idx, col] = scalar
+    except Exception:
+        try:
+            df.loc[idx, col] = _safe_text(val, "")
+        except Exception:
+            pass
+    return df
 
 def _v213_load_journal() -> pd.DataFrame:
     if V213_SIGNAL_JOURNAL_PATH.exists():
@@ -3291,7 +3347,7 @@ def _v213_load_journal() -> pd.DataFrame:
             df = pd.read_csv(V213_SIGNAL_JOURNAL_PATH, dtype={"代號": str})
             if "代號" in df.columns:
                 df["代號"] = df["代號"].astype(str).str.zfill(4)
-            return df
+            return _v213_make_object_df(df)
         except Exception:
             return pd.DataFrame()
     return pd.DataFrame()
@@ -3358,7 +3414,7 @@ def update_v213_signal_journal(lifecycle_df: pd.DataFrame) -> pd.DataFrame:
     if log_df is None or log_df.empty:
         log_df = pd.DataFrame()
     else:
-        log_df = log_df.loc[:, ~log_df.columns.duplicated()].copy()
+        log_df = _v213_make_object_df(log_df)
         if "代號" in log_df.columns:
             log_df["代號"] = log_df["代號"].astype(str).str.zfill(4)
 
@@ -3411,10 +3467,10 @@ def update_v213_signal_journal(lifecycle_df: pd.DataFrame) -> pd.DataFrame:
             prev_hist = ""
             change_count = 0
             # Create a blank row first so .at can address it safely.
-            log_df.loc[idx, "日期"] = today
-            log_df.loc[idx, "代號"] = code
-            log_df.loc[idx, "首次時間"] = now_s
-            log_df.loc[idx, "首次價格"] = round(px, 4)
+            log_df = _v213_safe_set(log_df, idx, "日期", today)
+            log_df = _v213_safe_set(log_df, idx, "代號", code)
+            log_df = _v213_safe_set(log_df, idx, "首次時間", now_s)
+            log_df = _v213_safe_set(log_df, idx, "首次價格", round(px, 4))
 
         current_ret = (px - first_price) / first_price * 100 if first_price > 0 else 0.0
         high_ret = max(high_ret_old, current_ret)
@@ -3470,7 +3526,7 @@ def update_v213_signal_journal(lifecycle_df: pd.DataFrame) -> pd.DataFrame:
         if "首次時間" not in log_df.columns or not _safe_text(log_df.at[idx, "首次時間"] if idx in log_df.index and "首次時間" in log_df.columns else ""):
             updates["首次時間"] = now_s
         for col, val in updates.items():
-            log_df.at[idx, col] = _v213_scalar(val)
+            log_df = _v213_safe_set(log_df, idx, col, val)
 
     # Keep file compact: current day plus recent prior records if any.
     try:
@@ -3650,8 +3706,228 @@ def build_v213_journal_summary(journal_df: pd.DataFrame) -> Dict[str, Any]:
     return out
 
 
-st.title("🧠 盤中即時看盤 v2.14 永久紀錄 + 自動調權｜生命週期決策版")
-st.caption("v2.13 開始把每檔訊號寫入本機 CSV 紀錄；v2.14 依照訊號後表現保守調整分數權重。這不是無腦買入系統，而是高信心小量 + 嚴格停損的決策閘門。")
+def _v215_secret_value(*keys: str, default: str = "") -> str:
+    """Read optional Streamlit secrets without crashing when secrets are absent."""
+    try:
+        for key in keys:
+            try:
+                val = st.secrets.get(key)
+                if val:
+                    return str(val).strip()
+            except Exception:
+                pass
+            try:
+                if "." in key:
+                    cur = st.secrets
+                    for part in key.split("."):
+                        cur = cur[part]
+                    if cur:
+                        return str(cur).strip()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return default
+
+
+def _v215_json_safe(value: Any) -> Any:
+    value = _v213_scalar(value)
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        if not np.isfinite(value):
+            return None
+        return float(value)
+    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+        return None
+    if isinstance(value, (datetime, pd.Timestamp)):
+        try:
+            return value.isoformat()
+        except Exception:
+            return str(value)
+    if value is None:
+        return None
+    return str(value) if not isinstance(value, (int, float, bool, list, dict)) else value
+
+
+def _v215_row_key(date_s: str, code: str) -> str:
+    return f"{str(date_s)}_{str(code).zfill(4)}"
+
+
+def build_v215_postclose_verification(journal_df: pd.DataFrame, live_df: pd.DataFrame) -> pd.DataFrame:
+    """v2.15: merge local signal journal with current/closing-like quotes for post-close verification.
+
+    During the trading session this is a provisional verification; after 13:30 Taipei
+    time it becomes a close-like verification based on the latest quote available.
+    """
+    try:
+        if journal_df is None or journal_df.empty:
+            return pd.DataFrame()
+        out = journal_df.copy()
+        out["代號"] = out.get("代號", "").astype(str).str.replace(".0", "", regex=False).str.zfill(4)
+        today = _v213_today()
+        now_dt = now_taipei()
+        close_like = (now_dt.hour, now_dt.minute) >= (13, 30)
+        status_text = "收盤近似驗證" if close_like else "盤中暫估驗證"
+
+        live_cols = [c for c in ["代號", "盤中現價", "報價時間", "最高", "最低", "盤中漲跌幅", "刷新漲速%", "v212生命週期狀態", "v214信心閘門"] if c in live_df.columns]
+        if live_cols:
+            q = live_df[live_cols].copy()
+            q["代號"] = q["代號"].astype(str).str.replace(".0", "", regex=False).str.zfill(4)
+            q = q.drop_duplicates("代號", keep="last")
+            out = out.merge(q, on="代號", how="left", suffixes=("", "_驗證"))
+
+        first_price = pd.to_numeric(out.get("首次價格"), errors="coerce")
+        cur_price = pd.to_numeric(out.get("盤中現價"), errors="coerce").combine_first(pd.to_numeric(out.get("目前價格"), errors="coerce"))
+        high_ret_old = pd.to_numeric(out.get("最高報酬%"), errors="coerce").fillna(0)
+        low_dd_old = pd.to_numeric(out.get("最大回撤%"), errors="coerce").fillna(0)
+        verify_ret = np.where(first_price > 0, (cur_price - first_price) / first_price * 100, np.nan)
+        verify_ret_s = pd.Series(verify_ret, index=out.index)
+        out["驗證Key"] = [_v215_row_key(d, c) for d, c in zip(out.get("日期", today).astype(str), out["代號"].astype(str))]
+        out["驗證狀態"] = np.where(out.get("日期", "").astype(str) == today, status_text, out.get("驗證狀態", "待後續驗證"))
+        out["驗證時間"] = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+        out["驗證價格"] = np.round(cur_price, 2)
+        out["驗證報酬%"] = np.round(verify_ret_s, 2)
+        out["驗證最高報酬%"] = np.round(np.maximum(high_ret_old, verify_ret_s.fillna(0)), 2)
+        out["驗證最大回撤%"] = np.round(np.minimum(low_dd_old, verify_ret_s.fillna(0)), 2)
+
+        stage = out.get("目前狀態", pd.Series(index=out.index, dtype=str)).astype(str)
+        stop_hit = out.get("是否碰停損", pd.Series(False, index=out.index)).astype(str).str.contains("True|1|是", regex=True, na=False)
+        near_limit = out.get("是否接近漲停", pd.Series(False, index=out.index)).astype(str).str.contains("True|1|是", regex=True, na=False)
+        result = []
+        for i in out.index:
+            r = float(verify_ret_s.loc[i]) if pd.notna(verify_ret_s.loc[i]) else 0.0
+            stg = str(stage.loc[i])
+            if stop_hit.loc[i]:
+                result.append("❌ 觸停損")
+            elif near_limit.loc[i] or r >= 6.5:
+                result.append("🚀 接近漲停/大漲")
+            elif r >= 2.0:
+                result.append("✅ 有效上漲")
+            elif r >= 0.5:
+                result.append("🟢 小幅有效")
+            elif r <= -2.0 and re.search("可試單|到價確認|高信心|嚴格小量", stg):
+                result.append("❌ 試單失敗")
+            elif r <= -1.0:
+                result.append("⚠️ 偏弱")
+            else:
+                result.append("⏳ 待觀察")
+        out["盤後驗證結果"] = result
+        out = out.drop_duplicates("驗證Key", keep="last")
+        return out
+    except Exception as e:
+        tmp = journal_df.copy() if isinstance(journal_df, pd.DataFrame) else pd.DataFrame()
+        tmp["驗證狀態"] = f"驗證防呆：{type(e).__name__}"
+        return tmp
+
+
+def _v215_save_verified_journal(df: pd.DataFrame) -> None:
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        if df is None or df.empty:
+            return
+        df.to_csv(V215_VERIFIED_JOURNAL_PATH, index=False, encoding="utf-8-sig")
+    except Exception:
+        pass
+
+
+def build_v215_stats(verified_df: pd.DataFrame) -> Dict[str, Any]:
+    out = {"samples": 0, "verified": 0, "win_rate": 0.0, "avg_ret": 0.0, "best_type": "樣本不足", "weak_type": "樣本不足", "near_limit": 0}
+    try:
+        if verified_df is None or verified_df.empty:
+            return out
+        df = verified_df.copy()
+        out["samples"] = int(len(df))
+        res = df.get("盤後驗證結果", pd.Series(dtype=str)).astype(str)
+        ret = pd.to_numeric(df.get("驗證報酬%"), errors="coerce")
+        valid = ret.notna()
+        out["verified"] = int(valid.sum())
+        if valid.any():
+            out["avg_ret"] = round(float(ret[valid].mean()), 2)
+            win = res.str.contains("✅|🟢|🚀", regex=True, na=False) | (ret >= 1.0)
+            out["win_rate"] = round(float(win[valid].mean() * 100), 1)
+        out["near_limit"] = int(res.str.contains("🚀|漲停|大漲", regex=True, na=False).sum())
+        if "股票型態" in df.columns and valid.any():
+            g = df.loc[valid].assign(_ret=ret[valid]).groupby("股票型態")['_ret'].agg(['count','mean']).reset_index()
+            g2 = g[g['count'] >= 2] if len(g) else g
+            if not g2.empty:
+                best = g2.sort_values('mean', ascending=False).iloc[0]
+                weak = g2.sort_values('mean', ascending=True).iloc[0]
+                out["best_type"] = f"{best['股票型態']} / {best['mean']:.2f}%"
+                out["weak_type"] = f"{weak['股票型態']} / {weak['mean']:.2f}%"
+    except Exception:
+        pass
+    return out
+
+
+def _v215_sync_log(status: str, rows: int, message: str) -> None:
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        item = pd.DataFrame([{
+            "時間": now_taipei().strftime("%Y-%m-%d %H:%M:%S"),
+            "狀態": status,
+            "筆數": rows,
+            "訊息": message[:500],
+        }])
+        if V215_SYNC_LOG_PATH.exists():
+            old = pd.read_csv(V215_SYNC_LOG_PATH)
+            item = pd.concat([old, item], ignore_index=True)
+        item.tail(200).to_csv(V215_SYNC_LOG_PATH, index=False, encoding="utf-8-sig")
+    except Exception:
+        pass
+
+
+def push_v215_to_google_sheet(verified_df: pd.DataFrame, webhook_url: str, max_rows: int = 500) -> Tuple[bool, str]:
+    """Push verified journal to a Google Apps Script webhook using only stdlib.
+
+    The Apps Script should upsert by 驗證Key. If no webhook is configured, this
+    function is not called.
+    """
+    if verified_df is None or verified_df.empty:
+        return False, "沒有可同步的紀錄"
+    if not webhook_url or not str(webhook_url).startswith("http"):
+        return False, "尚未設定 Google Sheet Webhook URL"
+    try:
+        df = verified_df.tail(max_rows).copy()
+        rows = []
+        for rec in df.to_dict(orient="records"):
+            rows.append({str(k): _v215_json_safe(v) for k, v in rec.items()})
+        payload = {
+            "source": "TW_Stock_AI_Scanner",
+            "version": "v2.15",
+            "sent_at": now_taipei().strftime("%Y-%m-%d %H:%M:%S"),
+            "rows": rows,
+        }
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            webhook_url,
+            data=data,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            body = resp.read().decode("utf-8", errors="ignore")
+            ok = 200 <= int(resp.status) < 300
+        msg = f"HTTP {getattr(resp, 'status', '')}｜{body[:300]}"
+        _v215_sync_log("成功" if ok else "失敗", len(rows), msg)
+        return ok, msg
+    except Exception as e:
+        msg = f"{type(e).__name__}: {e}"
+        _v215_sync_log("失敗", 0, msg)
+        return False, msg
+
+
+def load_v215_sync_log() -> pd.DataFrame:
+    try:
+        if V215_SYNC_LOG_PATH.exists():
+            return pd.read_csv(V215_SYNC_LOG_PATH)
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+st.title("🧬 盤中即時看盤 v2.15.1 真永久學習資料庫 + 盤後驗證器｜穩定紀錄修正版")
+st.caption("v2.15 把訊號紀錄升級成：本機 CSV + 可選 Google Sheet Webhook 同步 + 盤後/盤中驗證。重點是讓系統長記性；最高信號仍是小量試單，不是無腦重倉。")
 
 refresh_default = _get_query_int("refresh", 30, 15, 120, 15)
 top_n_default = _get_query_int("top_n", 15, 5, 50, 5)
@@ -3705,6 +3981,13 @@ with st.sidebar:
         except Exception:
             pass
         st.rerun()
+
+    st.markdown("---")
+    st.subheader("v2.15 永久學習")
+    default_webhook = _v215_secret_value("GSHEET_WEBHOOK_URL", "google_sheet.webhook_url", default="")
+    v215_enable_gsheet = st.toggle("啟用 Google Sheet 同步", value=bool(default_webhook))
+    v215_webhook_url = st.text_input("Google Sheet Webhook URL", value=default_webhook, type="password", help="可放在 Streamlit secrets：GSHEET_WEBHOOK_URL。未設定時仍會保留本機 CSV 與下載功能。")
+    v215_auto_sync = st.toggle("每輪自動同步最近紀錄", value=False, help="建議先手動同步；確認 Apps Script 有 upsert 後再開自動。")
 
 _set_query_if_changed({
     "view": view_mode,
@@ -3807,6 +4090,16 @@ v213_signal_journal_df = update_v213_signal_journal(lifecycle_df)
 v214_weight_profile = build_v214_weight_profile(v213_signal_journal_df)
 lifecycle_df = apply_v214_auto_weights(lifecycle_df, v214_weight_profile)
 v213_summary = build_v213_journal_summary(v213_signal_journal_df)
+v215_verified_journal_df = build_v215_postclose_verification(v213_signal_journal_df, lifecycle_df)
+_v215_save_verified_journal(v215_verified_journal_df)
+v215_stats = build_v215_stats(v215_verified_journal_df)
+
+if "v215_enable_gsheet" in globals() and v215_enable_gsheet and v215_auto_sync:
+    # Auto-sync only the latest rows to reduce repeated traffic. The webhook should upsert by 驗證Key.
+    try:
+        push_v215_to_google_sheet(v215_verified_journal_df.tail(120), v215_webhook_url)
+    except Exception:
+        pass
 
 if "手動加入" in lifecycle_df.columns:
     lifecycle_df["加入來源"] = np.where(lifecycle_df["手動加入"].astype(bool), "手動監控", "自動掃描")
@@ -3835,12 +4128,40 @@ m5, m6, m7, m8 = st.columns(4)
 m5.metric("盤中最強漲幅", f"{best_pct:.2f}%")
 m6.metric("最高刷新漲速", f"{max_speed:.2f}%")
 m7.metric("爆衝雷達", surge_count)
-m8.metric("永久紀錄 / 今日", f"{int(v213_summary.get("total", 0))} / {int(v213_summary.get("today", 0))}")
+m8.metric("學習紀錄 / 驗證", f"{int(v213_summary.get("total", 0))} / {int(v215_stats.get("verified", 0))}")
 
 st.divider()
 
+st.subheader("🧬 v2.15.1 真永久學習資料庫 + 盤後驗證器｜穩定紀錄修正版")
+st.caption("目前會先把驗證後訊號寫到 data/v215_verified_signal_journal.csv；若設定 Google Sheet Webhook，可手動或自動同步到 Google Sheet。盤中是暫估，13:30 後會以最後抓到的報價做收盤近似驗證。")
+vm1, vm2, vm3, vm4 = st.columns(4)
+vm1.metric("驗證樣本", int(v215_stats.get("verified", 0)))
+vm2.metric("驗證勝率", f"{float(v215_stats.get('win_rate', 0)):.1f}%")
+vm3.metric("平均驗證報酬", f"{float(v215_stats.get('avg_ret', 0)):.2f}%")
+vm4.metric("接近漲停/大漲", int(v215_stats.get("near_limit", 0)))
+vm5, vm6 = st.columns(2)
+vm5.info(f"目前較有效型態：{_safe_text(v215_stats.get('best_type'), '樣本不足')}")
+vm6.warning(f"目前較弱型態：{_safe_text(v215_stats.get('weak_type'), '樣本不足')}")
+
+if 'v215_enable_gsheet' in globals() and v215_enable_gsheet:
+    c_sync, c_log = st.columns([1, 2])
+    with c_sync:
+        if st.button("同步到 Google Sheet", type="primary"):
+            ok, msg = push_v215_to_google_sheet(v215_verified_journal_df, v215_webhook_url)
+            if ok:
+                st.success("已送出 Google Sheet 同步。")
+            else:
+                st.error("同步失敗：" + msg)
+    with c_log:
+        sync_log = load_v215_sync_log()
+        if not sync_log.empty:
+            st.caption("最近同步紀錄")
+            st.dataframe(sync_log.tail(3), use_container_width=True, hide_index=True)
+else:
+    st.info("尚未啟用 Google Sheet 同步；目前仍會保留本機 CSV，並可在下方下載。")
+
 # v2.14 compact weight-learning status.
-st.subheader("🧠 v2.14 自動調權狀態")
+st.subheader("🧠 v2.14 / v2.15 自動調權狀態")
 wm1, wm2, wm3, wm4 = st.columns(4)
 wm1.metric("樣本數", int(v214_weight_profile.get("sample_size", 0)))
 wm2.metric("學習勝率", f"{float(v214_weight_profile.get('success_rate', 0)):.1f}%")
@@ -3895,19 +4216,20 @@ if life_df.empty:
 else:
     st.dataframe(life_df[life_cols], use_container_width=True, hide_index=True)
 
-st.subheader("🧾 v2.13 永久訊號紀錄")
-st.caption("這是本機 CSV 訊號日誌。Streamlit Cloud 重新部署可能清掉本機檔案；要真正跨部署永久保存，下一步需接 GitHub 寫回或資料庫。")
-journal_cols = _cols_exist(v213_signal_journal_df, [
-    "日期", "最新時間", "代號", "名稱", "股票型態", "目前狀態", "目前決策", "結果分類", "首次價格", "目前價格", "目前報酬%", "最高報酬%", "最大回撤%",
+st.subheader("🧾 v2.15 訊號紀錄 + 盤後驗證")
+st.caption("這區顯示已驗證後的訊號紀錄。若 Google Sheet Webhook 已設定，請用上方按鈕同步；否則先用 CSV 下載保存。")
+journal_cols = _cols_exist(v215_verified_journal_df, [
+    "日期", "最新時間", "代號", "名稱", "股票型態", "目前狀態", "目前決策", "結果分類", "盤後驗證結果", "驗證狀態", "驗證時間",
+    "首次價格", "驗證價格", "驗證報酬%", "驗證最高報酬%", "驗證最大回撤%", "目前報酬%", "最高報酬%", "最大回撤%",
     "左側低吸分", "盤中資金分", "漲停前兆分", "AI總分", "風險分", "狀態變更次數", "狀態歷程"
 ])
-if v213_signal_journal_df.empty:
-    st.info("尚未累積 v2.13 訊號紀錄。")
+if v215_verified_journal_df.empty:
+    st.info("尚未累積 v2.15 訊號驗證紀錄。")
 else:
-    show_journal = _safe_sort(v213_signal_journal_df, ["日期", "最新時間"], ascending=[False, False]).head(top_n * 2)
+    show_journal = _safe_sort(v215_verified_journal_df, ["日期", "最新時間"], ascending=[False, False]).head(top_n * 2)
     st.dataframe(show_journal[journal_cols], use_container_width=True, hide_index=True)
-    csv_bytes = v213_signal_journal_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-    st.download_button("下載 v2.13 永久訊號紀錄 CSV", csv_bytes, file_name=f"v213_signal_journal_{now_taipei().strftime('%Y%m%d')}.csv", mime="text/csv")
+    csv_bytes = v215_verified_journal_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+    st.download_button("下載 v2.15 驗證訊號紀錄 CSV", csv_bytes, file_name=f"v215_verified_signal_journal_{now_taipei().strftime('%Y%m%d')}.csv", mime="text/csv")
 
 # 4) Near limit / missed check only if relevant.
 if not v211_missed_limit_df.empty:
@@ -3949,4 +4271,4 @@ with st.expander("🧪 進階診斷 / 市場池 / 爆衝雷達 / 原始學習紀
         ])
         st.dataframe(lifecycle_df[all_cols], use_container_width=True, hide_index=True)
 
-st.caption("提醒：這是盤中快照與規則化風控系統，不是保證獲利或券商逐筆資料。v2.13/2.14 的目的，是把訊號結果記錄下來並保守調權；最高信號仍只代表「小量試單 + 嚴格停損」，不是無腦重倉。")
+st.caption("提醒：這是盤中快照與規則化風控系統，不是保證獲利或券商逐筆資料。v2.15 的目的，是把訊號結果保存並驗證，讓後續調權有根據；最高信號仍只代表「小量試單 + 嚴格停損」，不是無腦重倉。")
