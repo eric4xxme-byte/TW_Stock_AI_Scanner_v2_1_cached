@@ -1,5 +1,5 @@
 # pages/live_intraday.py
-# v2.8.1 Live Intraday Limit-Up Precursor + Three-Zone Entry Engine
+# v2.9 Live Intraday Left-Side Predictive AI Engine
 # Purpose:
 # - Keep v2.4.x live AI candidate monitoring.
 # - Add a safer "market pool scan" mode: TWSE + TPEx turnover pool + live quotes.
@@ -1800,10 +1800,407 @@ def update_surge_radar(live_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFram
     return df, surge_df, has_prev
 
 
+
+# ---------- v2.9 Intraday memory + left-side predictive AI engine ----------
+
+MEMORY_PATH = DATA_DIR / "intraday_memory_runtime.csv"
+
+
+def _load_intraday_memory() -> pd.DataFrame:
+    if MEMORY_PATH.exists():
+        try:
+            df = pd.read_csv(MEMORY_PATH, dtype={"代號": str})
+            if "代號" in df.columns:
+                df["代號"] = df["代號"].astype(str).str.zfill(4)
+            if "時間戳" in df.columns:
+                df["時間戳"] = pd.to_datetime(df["時間戳"], errors="coerce")
+            return df.dropna(subset=["時間戳"]) if "時間戳" in df.columns else pd.DataFrame()
+        except Exception:
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+
+def _save_intraday_memory(df: pd.DataFrame) -> None:
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        df.to_csv(MEMORY_PATH, index=False, encoding="utf-8-sig")
+    except Exception:
+        pass
+
+
+def _nearest_past_values(group: pd.DataFrame, now_ts: pd.Timestamp, minutes: int) -> Tuple[float, float, float]:
+    """Return price, volume and pct near or before now-minutes."""
+    try:
+        target = now_ts - pd.Timedelta(minutes=minutes)
+        g = group[group["時間戳"] <= target]
+        if g.empty:
+            return np.nan, np.nan, np.nan
+        row = g.iloc[-1]
+        return _to_float(row.get("盤中現價")), _to_float(row.get("盤中成交量")), _to_float(row.get("盤中漲跌幅"))
+    except Exception:
+        return np.nan, np.nan, np.nan
+
+
+def update_intraday_memory_features(live_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """v2.9: Keep a short runtime memory so the system can judge acceleration and pullback.
+
+    Without memory, the app can only judge right-side strength. With memory, it can ask:
+    - Was money already coming in before price ran?
+    - Did the pullback hold above support?
+    - Is the stop distance short enough for a left-side test?
+    """
+    df = live_df.copy()
+    now_dt = now_taipei()
+    now_ts = pd.Timestamp(now_dt.replace(tzinfo=None))
+    today = now_dt.strftime("%Y-%m-%d")
+    now_time = now_dt.strftime("%H:%M:%S")
+
+    hist = _load_intraday_memory()
+    if not hist.empty and "日期" in hist.columns:
+        hist = hist[hist["日期"].astype(str) == today].copy()
+    if not hist.empty and "時間戳" in hist.columns:
+        # Keep recent data only. This keeps the file small while preserving enough context.
+        hist = hist[hist["時間戳"] >= now_ts - pd.Timedelta(minutes=150)].copy()
+
+    snap_cols = ["代號", "名稱", "市場", "產業", "盤中現價", "盤中成交量", "盤中漲跌幅", "最高", "最低", "開盤", "昨收"]
+    snap_cols = [c for c in snap_cols if c in df.columns]
+    snap = df[snap_cols].copy()
+    snap["代號"] = snap["代號"].astype(str).str.zfill(4)
+    snap["日期"] = today
+    snap["時間"] = now_time
+    snap["時間戳"] = now_ts
+    for col in ["盤中現價", "盤中成交量", "盤中漲跌幅", "最高", "最低", "開盤", "昨收"]:
+        if col in snap.columns:
+            snap[col] = pd.to_numeric(snap[col], errors="coerce")
+    snap = snap[pd.to_numeric(snap.get("盤中現價"), errors="coerce").fillna(0) > 0].copy()
+
+    if not snap.empty:
+        # Avoid writing multiple identical rows for same refresh second.
+        hist = pd.concat([hist, snap], ignore_index=True) if not hist.empty else snap.copy()
+        hist = hist.drop_duplicates(subset=["代號", "時間戳"], keep="last")
+        hist = hist.sort_values(["代號", "時間戳"]).reset_index(drop=True)
+        _save_intraday_memory(hist)
+
+    defaults = {
+        "1分漲速%": 0.0,
+        "3分漲速%": 0.0,
+        "5分漲速%": 0.0,
+        "10分漲速%": 0.0,
+        "3分量增%": 0.0,
+        "5分量增%": 0.0,
+        "10分量增%": 0.0,
+        "記憶高點": np.nan,
+        "記憶低點": np.nan,
+        "記憶回檔幅度%": np.nan,
+        "盤中記憶筆數": 0,
+    }
+    for col, default in defaults.items():
+        df[col] = default
+
+    if hist.empty:
+        return df, hist
+
+    hist = hist.sort_values(["代號", "時間戳"])
+    feature_rows: List[Dict[str, Any]] = []
+    for code, group in hist.groupby("代號", sort=False):
+        group = group.dropna(subset=["盤中現價"]).sort_values("時間戳")
+        if group.empty:
+            continue
+        latest = group.iloc[-1]
+        px_now = _to_float(latest.get("盤中現價"))
+        vol_now = _to_float(latest.get("盤中成交量"), default=0.0)
+        if math.isnan(px_now) or px_now <= 0:
+            continue
+        row: Dict[str, Any] = {"代號": str(code).zfill(4), "盤中記憶筆數": int(len(group))}
+        for m in [1, 3, 5, 10]:
+            px_past, vol_past, _ = _nearest_past_values(group, now_ts, m)
+            speed = 0.0
+            vol_inc = 0.0
+            if not math.isnan(px_past) and px_past > 0:
+                speed = (px_now - px_past) / px_past * 100
+            if not math.isnan(vol_past) and vol_past > 0:
+                vol_inc = (vol_now - vol_past) / vol_past * 100
+            elif vol_now > 0:
+                vol_inc = 0.0
+            row[f"{m}分漲速%"] = round(speed, 2)
+            if m in [3, 5, 10]:
+                row[f"{m}分量增%"] = round(max(0.0, vol_inc), 1)
+
+        recent = group[group["時間戳"] >= now_ts - pd.Timedelta(minutes=30)]
+        if recent.empty:
+            recent = group
+        high = float(pd.to_numeric(recent.get("盤中現價"), errors="coerce").max())
+        low = float(pd.to_numeric(recent.get("盤中現價"), errors="coerce").min())
+        pullback = (high - px_now) / high * 100 if high > 0 else np.nan
+        row["記憶高點"] = round(high, 2) if high > 0 else np.nan
+        row["記憶低點"] = round(low, 2) if low > 0 else np.nan
+        row["記憶回檔幅度%"] = round(pullback, 2) if not math.isnan(pullback) else np.nan
+        feature_rows.append(row)
+
+    if feature_rows:
+        features = pd.DataFrame(feature_rows)
+        df = df.drop(columns=[c for c in defaults if c in df.columns], errors="ignore")
+        df = df.merge(features, on="代號", how="left")
+        for col, default in defaults.items():
+            if col not in df.columns:
+                df[col] = default
+            df[col] = df[col].fillna(default)
+
+    return df, hist
+
+
+def _parse_zone_low_high(text: Any) -> Tuple[float, float]:
+    s = _safe_text(text, "")
+    nums = re.findall(r"\d+(?:\.\d+)?", s)
+    if not nums:
+        return np.nan, np.nan
+    vals = [_to_float(x) for x in nums]
+    vals = [v for v in vals if not math.isnan(v) and v > 0]
+    if not vals:
+        return np.nan, np.nan
+    if len(vals) == 1:
+        return vals[0], vals[0]
+    return min(vals[0], vals[1]), max(vals[0], vals[1])
+
+
+def add_v29_left_predictive_ai(df: pd.DataFrame, chase_pct: float = 7.0) -> pd.DataFrame:
+    """v2.9: Decide the way a trader would decide before buying.
+
+    The model asks five practical questions:
+    1. Is money coming in before the crowd sees it?
+    2. Is price still near a support/low-risk area instead of already extended?
+    3. Is the stop close enough to make the trade worth testing?
+    4. Is there limit-up / re-attack potential?
+    5. Is there a clear reason NOT to enter?
+    """
+    df = df.copy()
+
+    def calc(row):
+        code = _normalize_code(row.get("代號"))
+        px = _to_float(row.get("盤中現價"))
+        prev = _to_float(row.get("昨收"))
+        open_px = _to_float(row.get("開盤"))
+        day_high = _to_float(row.get("最高"))
+        day_low = _to_float(row.get("最低"))
+        ai = float(row.get("AI總分", 0) or 0)
+        risk = float(row.get("風險分", 0) or 0)
+        strength = float(row.get("即時強度分", 0) or 0)
+        pct = float(row.get("盤中漲跌幅", 0) or 0)
+        vol_score = float(row.get("盤中量能分", 0) or 0)
+        vol_jump = float(row.get("量能跳升分", 0) or 0)
+        speed1 = float(row.get("1分漲速%", 0) or 0)
+        speed3 = float(row.get("3分漲速%", 0) or 0)
+        speed5 = float(row.get("5分漲速%", 0) or 0)
+        speed10 = float(row.get("10分漲速%", 0) or 0)
+        vol3 = float(row.get("3分量增%", 0) or 0)
+        vol5 = float(row.get("5分量增%", 0) or 0)
+        memory_pullback = _to_float(row.get("記憶回檔幅度%"), default=np.nan)
+        precursor = float(row.get("漲停前兆分", 0) or 0)
+        reattack_prob = float(row.get("再攻機率", 0) or 0)
+        ai_source = _safe_text(row.get("AI來源"), "")
+        entry_strategy = _safe_text(row.get("入場價位策略"), "")
+        old_signal = _safe_text(row.get("入場訊號"), "")
+        reattack_state = _safe_text(row.get("回檔再攻狀態"), "")
+
+        if math.isnan(px) or px <= 0:
+            return pd.Series({
+                "盤後AI分": round(ai, 1),
+                "盤中資金分": 0.0,
+                "左側低吸分": 0.0,
+                "即時入場分": 0.0,
+                "AI即時入場訊號": "⚪ 無報價",
+                "左側試單區": "-",
+                "左側停損價": "-",
+                "右側加碼價": "-",
+                "AI追價上限": "-",
+                "如果是我會確認": "等下一輪報價，不用猜。",
+                "AI不進原因": "盤中報價不足",
+                "AI建議操作": "不動作",
+                "信心等級": "低",
+                "左側距停損%": np.nan,
+                "左側型態": "無報價",
+            })
+
+        support = _parse_price_text(row.get("回測支撐價"))
+        if math.isnan(support) or support <= 0:
+            support = _parse_price_text(row.get("停損參考"))
+        if math.isnan(support) or support <= 0:
+            refs = [x for x in [day_low, open_px, prev, px * 0.992] if not math.isnan(x) and x > 0]
+            support = max(min(refs), px * 0.985) if refs else px * 0.992
+
+        stop = _parse_price_text(row.get("防守停損價"))
+        if math.isnan(stop) or stop <= 0:
+            stop = _round_down_tick(support * 0.992)
+        confirm = _parse_price_text(row.get("右側確認價"))
+        if math.isnan(confirm) or confirm <= 0:
+            confirm = _parse_price_text(row.get("二次攻擊觸發價"))
+        if math.isnan(confirm) or confirm <= 0:
+            confirm = _round_up_tick(max(px, support * 1.006))
+        cap = _parse_price_text(row.get("追價上限"))
+        if math.isnan(cap) or cap <= 0:
+            cap = _round_up_tick(confirm * 1.004)
+
+        # Build a true left-side zone near support, not near the right-side confirmation price.
+        t = _tick_size(px)
+        left_lo = _round_down_tick(max(stop + t, support * 0.998))
+        left_hi = _round_down_tick(min(confirm - t, support * 1.006))
+        if math.isnan(left_hi) or left_hi < left_lo:
+            left_hi = _round_down_tick(support * 1.004)
+        left_zone = _price_zone_text(left_lo, left_hi)
+
+        stop_distance = (px - stop) / px * 100 if px > 0 and stop > 0 else np.nan
+        near_support = bool(px >= left_lo * 0.998 and px <= max(left_hi, left_lo) * 1.006)
+        above_support = bool(px >= support * 0.998)
+        not_extended = bool(pct < max(6.8, chase_pct - 0.5) and px <= cap * 1.001)
+        very_extended = bool(pct >= 8.2 or px > cap * 1.005)
+        tight_stop = bool(not math.isnan(stop_distance) and 0.25 <= stop_distance <= 2.2)
+        holding = bool(speed1 >= -0.25 and speed3 >= -0.6 and above_support)
+        money_building = bool((vol_score >= 55 or vol_jump >= 60 or vol3 >= 12 or vol5 >= 20) and (speed3 >= -0.2 or speed5 >= 0.0))
+        has_pullback = bool((not math.isnan(memory_pullback) and 0.6 <= memory_pullback <= 4.5) or reattack_state in {"🟢 等二次攻擊觸發", "✅ 二次攻擊可小量試單"})
+        day_structure_ok = bool((math.isnan(day_low) or px >= day_low * 1.002) and (math.isnan(prev) or px >= prev * 0.985))
+        market_pool_penalty = 7 if ai_source == "市場池估分" else 0
+
+        # 盤中資金分: money flow and acceleration, not just price already high.
+        fund_score = 0.0
+        fund_score += min(28.0, max(0.0, vol_score) * 0.28)
+        fund_score += min(22.0, max(0.0, vol_jump) * 0.22)
+        fund_score += min(18.0, max(0.0, vol3) * 0.45)
+        fund_score += min(12.0, max(0.0, vol5) * 0.25)
+        fund_score += min(15.0, max(0.0, speed3) * 5.0)
+        fund_score += 5.0 if strength >= 60 else 0.0
+        fund_score = round(max(0.0, min(100.0, fund_score)), 1)
+
+        # 左側低吸分: only high when price is near support and risk/reward is acceptable.
+        left_score = 0.0
+        left_score += 22.0 if near_support else 0.0
+        left_score += 18.0 if tight_stop else 0.0
+        left_score += 16.0 if holding else 0.0
+        left_score += 14.0 if money_building else 0.0
+        left_score += 10.0 if has_pullback else 0.0
+        left_score += 8.0 if day_structure_ok else 0.0
+        left_score += 7.0 if risk < 30 else 3.0 if risk < 40 else -10.0
+        left_score += 5.0 if ai >= 55 else 2.0 if ai >= 45 else -5.0
+        left_score -= 20.0 if very_extended else 0.0
+        left_score -= market_pool_penalty
+        left_score = round(max(0.0, min(100.0, left_score)), 1)
+
+        # Keep limit-up potential independent: a stock can be an early radar even if left entry is not ready.
+        limit_score = max(precursor, min(100.0, 35 + max(0, speed3) * 7 + max(0, speed5) * 4 + min(20, vol_jump * 0.2) + max(0, pct) * 2))
+        limit_score = round(max(0.0, min(100.0, limit_score)), 1)
+
+        entry_score = (
+            left_score * 0.42
+            + fund_score * 0.26
+            + limit_score * 0.18
+            + ai * 0.12
+            - risk * 0.12
+        )
+        entry_score = round(max(0.0, min(100.0, entry_score)), 1)
+
+        check_items = []
+        check_items.append("資金有進來" if money_building else "資金還沒確認")
+        check_items.append("靠近支撐" if near_support else "沒有在低風險區")
+        check_items.append("停損距離短" if tight_stop else "停損距離不夠漂亮")
+        check_items.append("回檔守住" if holding else "回檔還沒守穩")
+        check_items.append("未過熱" if not very_extended else "已過熱")
+        check_text = "、".join(check_items)
+
+        # Different personality by stock type: small attack names vs large caps.
+        is_focus_attack = code in {"3441", "3362", "3105", "6223"}
+        is_large_cap = code in {"2382", "2313", "2330", "2379", "4938"}
+        if is_focus_attack:
+            left_type = "小型強攻股：看急拉回檔守支撐、量縮不破、二次攻擊"
+        elif is_large_cap:
+            left_type = "中大型資金股：看資金延續、回測均價/支撐不破、慢推"
+        else:
+            left_type = "一般動能股：先看資金分，再看支撐與停損距離"
+
+        if very_extended:
+            signal = "🔴 錯過不追"
+            reason = "已經高於合理追價區或漲幅過高，左側已經消失。"
+            action = f"不追；只等回測 {left_zone} 附近，或尾盤確認。"
+            confidence = "中"
+            priority = 6
+        elif risk >= 45 or pct <= -2.2 or strength < 32:
+            signal = "⚫ 避開"
+            reason = "風險、盤中強度或價格結構不支持左側試單。"
+            action = "不動作，等重新轉強。"
+            confidence = "低"
+            priority = 7
+        elif left_score >= 68 and fund_score >= 48 and tight_stop and near_support and holding and not_extended:
+            signal = "✅ 左側可小量試單"
+            reason = "資金進來、回檔守住、價格在低風險區，且停損距離短。"
+            action = f"可小量在 {left_zone} 試單；跌破 {_fmt_price(stop)} 退出；站穩 {_fmt_price(confirm)} 才考慮加碼。"
+            confidence = "高" if entry_score >= 72 and ai_source == "盤後AI" else "中"
+            priority = 1
+        elif old_signal == "✅ 可小量試單" and px <= cap and holding and fund_score >= 45:
+            signal = "🟢 右側突破可加碼"
+            reason = "已偏右側確認，適合已持有者加碼觀察，不是最佳第一買點。"
+            action = f"若沒有底倉，不要追過 {_fmt_price(cap)}；等回測 {left_zone} 更漂亮。"
+            confidence = "中"
+            priority = 2
+        elif fund_score >= 62 and limit_score >= 55 and pct < 6.5:
+            signal = "👀 資金提前佈局"
+            reason = "量能與資金分升溫，但價格還沒到理想低吸條件。"
+            action = f"先掛雷達；理想低吸區 {left_zone}，右側加碼價 {_fmt_price(confirm)}。"
+            confidence = "中"
+            priority = 3
+        elif left_score >= 55 and not near_support:
+            signal = "🟡 等左側回測"
+            reason = "條件有一部分成立，但現在不在低吸區，容易買在中間。"
+            action = f"等回到 {left_zone} 且不破 {_fmt_price(stop)}。"
+            confidence = "中"
+            priority = 4
+        elif limit_score >= 60 and not very_extended:
+            signal = "🚀 漲停前兆升溫"
+            reason = "有爆衝/漲停前兆，但左側買點尚未成立。"
+            action = f"只盯不追；等回測 {left_zone} 或站穩 {_fmt_price(confirm)} 後再評估。"
+            confidence = "中"
+            priority = 4
+        else:
+            signal = "⚪ 觀察"
+            reason = "資金、價格位置、停損距離還沒有同時成立。"
+            action = "先觀察，不急著進。"
+            confidence = "低"
+            priority = 5
+
+        return pd.Series({
+            "盤後AI分": round(ai, 1),
+            "盤中資金分": fund_score,
+            "左側低吸分": left_score,
+            "即時入場分": entry_score,
+            "v29漲停前兆分": limit_score,
+            "AI即時入場訊號": signal,
+            "AI入場優先級": priority,
+            "左側試單區": left_zone,
+            "左側停損價": _fmt_price(stop),
+            "右側加碼價": _fmt_price(confirm),
+            "AI追價上限": _fmt_price(cap),
+            "如果是我會確認": check_text,
+            "AI不進原因": reason,
+            "AI建議操作": action,
+            "信心等級": confidence,
+            "左側距停損%": round(stop_distance, 2) if not math.isnan(stop_distance) else np.nan,
+            "左側型態": left_type,
+        })
+
+    out = df.apply(calc, axis=1)
+    for col in out.columns:
+        df[col] = out[col]
+    return df
+
+
+def clear_intraday_memory() -> None:
+    try:
+        if MEMORY_PATH.exists():
+            MEMORY_PATH.unlink()
+    except Exception:
+        pass
+
 # ---------- UI ----------
 
-st.title("⚡ 盤中即時看盤 v2.8 漲停前兆 + 回檔再攻入場引擎")
-st.caption("先抓漲停前兆，再判斷回檔後是否可能二次攻擊，最後給出低吸區 / 確認價 / 追價上限，避免等確認後才買高。")
+st.title("⚡ 盤中即時看盤 v2.9 左側預判 AI 引擎")
+st.caption("把判斷核心改成：資金是否提前進來、回檔是否守住、停損距離是否夠短、是否真的可以左側小量試單。右側突破只當加碼點，不再當第一買點。")
 
 refresh_default = _get_query_int("refresh", 30, 15, 120, 15)
 top_n_default = _get_query_int("top_n", 15, 5, 50, 5)
@@ -1852,7 +2249,10 @@ with st.sidebar:
     weak_drop = st.slider("AI高分轉弱跌幅", -5.0, 0.0, weak_default, 0.5)
     chase_pct = st.slider("不要追高漲幅", 3.0, 10.0, chase_default, 0.5)
 
-    st.info("設定會寫進網址參數，所以自動刷新後不會跳回預設值。v2.8 預設會固定追蹤 3441 聯一光、2382 廣達、2313 華通。市場池越大，刷新越慢。")
+    st.info("設定會寫進網址參數，所以自動刷新後不會跳回預設值。v2.9 會固定追蹤 3441 聯一光、2382 廣達、2313 華通，並保留盤中記憶來判斷左側買點。市場池越大，刷新越慢。")
+    if st.button("清除盤中記憶", type="secondary"):
+        clear_intraday_memory()
+        st.rerun()
 
 _set_query_if_changed(
     {
@@ -1907,6 +2307,8 @@ live_df = add_limitup_reattack_engine(live_df, chase_pct=chase_pct)
 live_df = add_v281_three_zone_entry(live_df)
 live_df = add_entry_signal_layer(live_df, chase_pct=chase_pct)
 live_df = apply_v28_entry_signal_overrides(live_df)
+live_df, intraday_memory_df = update_intraday_memory_features(live_df)
+live_df = add_v29_left_predictive_ai(live_df, chase_pct=chase_pct)
 # v2.5.1: Keep the internal boolean, but show a readable text column instead of a non-clickable checkbox.
 if "手動加入" in live_df.columns:
     live_df["加入來源"] = np.where(live_df["手動加入"].astype(bool), "手動監控", "自動掃描")
@@ -1985,12 +2387,56 @@ p2.metric("二次攻擊可試", reattack_ready)
 p3.metric("等二次觸發", reattack_wait)
 p4.metric("核心追蹤股", focus_active)
 
+v29_counts = live_df.get("AI即時入場訊號", pd.Series(dtype=str)).astype(str).value_counts()
+v1, v2, v3, v4 = st.columns(4)
+v1.metric("✅ 左側試單", int(v29_counts.get("✅ 左側可小量試單", 0)))
+v2.metric("👀 資金提前", int(v29_counts.get("👀 資金提前佈局", 0) + v29_counts.get("🚀 漲停前兆升溫", 0)))
+v3.metric("🟢 右側加碼", int(v29_counts.get("🟢 右側突破可加碼", 0)))
+v4.metric("🔴 錯過/避開", int(v29_counts.get("🔴 錯過不追", 0) + v29_counts.get("⚫ 避開", 0)))
+
 st.caption(f"掃描來源：{universe_source}")
 if scan_mode == "盤中市場池掃描":
     st.warning("市場池掃描股若顯示『市場池估分』，代表它只有盤中動能與成交金額排序，沒有完整盤後AI/籌碼驗證。入場判斷要更保守。")
 
 
 st.divider()
+
+st.subheader("🎯 AI 即時入場決策 v2.9")
+st.caption("這區才是新版核心：先判斷能不能左側小量試單。✅ 左側可小量試單 = 價格靠近支撐、資金進來、停損距離短；🟢 右側突破只當加碼點，不當第一買點。")
+
+v29_cols = [
+    "代號", "名稱", "市場", "產業", "AI即時入場訊號", "信心等級", "即時入場分", "左側低吸分", "盤中資金分", "v29漲停前兆分", "盤後AI分", "風險分",
+    "盤中現價", "左側試單區", "左側停損價", "左側距停損%", "右側加碼價", "AI追價上限",
+    "盤中漲跌幅", "1分漲速%", "3分漲速%", "5分漲速%", "3分量增%", "5分量增%", "記憶回檔幅度%",
+    "漲停前兆狀態", "回檔再攻狀態", "再攻機率", "如果是我會確認", "AI不進原因", "AI建議操作", "左側型態", "資料來源", "AI來源", "報價時間"
+]
+v29_cols = [c for c in v29_cols if c in live_df.columns]
+v29_show = live_df[live_df["AI即時入場訊號"].isin([
+    "✅ 左側可小量試單", "👀 資金提前佈局", "🚀 漲停前兆升溫", "🟢 右側突破可加碼", "🟡 等左側回測"
+])].copy()
+v29_show = v29_show.sort_values(["AI入場優先級", "即時入場分", "左側低吸分", "盤中資金分"], ascending=[True, False, False, False])
+if v29_show.empty:
+    st.info("目前沒有 v2.9 認可的左側試單或資金提前訊號。先不要硬追。")
+else:
+    st.dataframe(v29_show[v29_cols].head(top_n), use_container_width=True, hide_index=True)
+
+with st.expander("🔴 v2.9 不建議進場 / 已錯過", expanded=False):
+    v29_block = live_df[live_df["AI即時入場訊號"].isin(["🔴 錯過不追", "⚫ 避開"])].copy()
+    v29_block = v29_block.sort_values(["AI入場優先級", "盤中漲跌幅"], ascending=[True, False])
+    if v29_block.empty:
+        st.caption("目前沒有 v2.9 明確判定錯過或避開的股票。")
+    else:
+        st.dataframe(v29_block[v29_cols].head(top_n), use_container_width=True, hide_index=True)
+
+st.subheader("🧠 我的買進檢查清單")
+st.caption("v2.9 會把『如果是我準備買，我會確認什麼』直接寫進表格：資金、位置、停損、回檔、是否過熱。只要有一項不漂亮，就不會給左側試單。")
+focus_ai_df = live_df[live_df["代號"].astype(str).str.zfill(4).isin(FOCUS_CODES)].copy()
+focus_ai_df["焦點排序"] = focus_ai_df["代號"].map({"3441": 1, "2382": 2, "2313": 3}).fillna(9)
+focus_ai_df = focus_ai_df.sort_values(["焦點排序"])
+if not focus_ai_df.empty:
+    focus_ai_cols = [c for c in v29_cols if c in focus_ai_df.columns]
+    st.dataframe(focus_ai_df[focus_ai_cols], use_container_width=True, hide_index=True)
+
 
 st.subheader("🚦 即時入場訊號中控台")
 st.caption("先看這區：只有 ✅ 可小量試單 才代表系統認為已觸發入場條件；🟢 只是等待突破或等待站穩，🟡 是等回測，🔴/⚫ 不碰。")
@@ -2188,7 +2634,7 @@ entry_df["入場排序"] = entry_df["盤中入場判斷"].map(entry_priority).fi
 entry_df = entry_df.sort_values(["入場排序", "即時強度分"], ascending=[True, False])
 
 common_cols = [
-    "代號", "名稱", "市場", "產業", "入場訊號", "可否入場", "決策等級", "是否可入場", "決策分", "爆衝分", "漲停前兆分", "漲停前兆狀態", "再攻機率", "回檔再攻狀態", "漲停雷達", "漲停距離%",
+    "代號", "名稱", "市場", "產業", "AI即時入場訊號", "信心等級", "即時入場分", "左側低吸分", "盤中資金分", "v29漲停前兆分", "左側試單區", "左側停損價", "右側加碼價", "AI追價上限", "入場訊號", "可否入場", "決策等級", "是否可入場", "決策分", "爆衝分", "漲停前兆分", "漲停前兆狀態", "再攻機率", "回檔再攻狀態", "漲停雷達", "漲停距離%",
     "資料來源", "AI來源", "加入來源", "市場池排名", "盤中標籤", "爆衝警示", "刷新漲速%", "量能跳升分", "回檔幅度%", "盤中入場判斷", "入場型態",
     "觸發價", "二次攻擊觸發價", "回測支撐價", "防守停損價", "停損參考", "壓力參考", "AI總分", "風險分", "即時強度分",
     "盤中現價", "盤中漲跌幅", "盤中成交量", "報價時間", "即時判斷", "不追原因", "建議動作", "回檔再攻判斷"
@@ -2216,4 +2662,4 @@ st.dataframe(filtered.sort_values(["警示排序", "即時強度分"], ascending
 st.subheader("全部掃描池即時快照")
 st.dataframe(live_df[market_cols], use_container_width=True, hide_index=True)
 
-st.caption("提醒：這是網頁快照更新，不是券商逐筆成交資料。v2.8.1 的漲停前兆分與三段式入場價是規則化風控參考，不保證漲停；只有 ✅ 可小量試單 才代表條件觸發，且仍需嚴守防守停損。")
+st.caption("提醒：這是網頁快照更新，不是券商逐筆成交資料。v2.9 的左側預判 AI 是規則化風控參考，不保證漲停；只有 ✅ 左側可小量試單 才代表條件初步成立，仍需小量、分批、嚴守停損。")
