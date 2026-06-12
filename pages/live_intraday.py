@@ -3009,10 +3009,189 @@ def clear_intraday_memory() -> None:
     except Exception:
         pass
 
-# ---------- UI ----------
 
-st.title("📊 盤中即時看盤 v2.11.4 訊號學習狀態機｜穩定修正版")
-st.caption("v2.11.2 修正核心：到達/低於左側試單價不再自動判失效；只有跌破防守停損才失效。到價後會直接判斷：可小量試單、等止跌確認、或跌破防守不買。")
+# ---------- v2.12 UI / Lifecycle Engine ----------
+
+def _v212_parse_price_range(value: Any) -> Tuple[float, float]:
+    """Parse strings like '72.60～73.20', '等 291', '非第一買點'."""
+    text = _safe_text(value, "")
+    nums = re.findall(r"-?\d+(?:\.\d+)?", text.replace(",", ""))
+    if not nums:
+        return (np.nan, np.nan)
+    vals = [float(x) for x in nums]
+    if len(vals) == 1:
+        return (vals[0], vals[0])
+    return (min(vals[0], vals[1]), max(vals[0], vals[1]))
+
+
+def _v212_signal_stage(row: pd.Series) -> pd.Series:
+    """One-current-state lifecycle decision. No duplicate/conflicting signals."""
+    px = _clean_number(row.get("盤中現價"))
+    stop = _clean_number(row.get("防守停損") or row.get("左側停損價") or row.get("停損參考"))
+    first_buy_text = _safe_text(row.get("第一買點") or row.get("左側試單價") or row.get("左側試單區"), "-")
+    buy_low, buy_high = _v212_parse_price_range(first_buy_text)
+    sig = _safe_text(row.get("交易員訊號"), "")
+    learn_state = _safe_text(row.get("學習狀態"), "")
+    hist = _safe_text(row.get("訊號歷程"), "")
+    risk = _clean_number(row.get("風險分"))
+    money = _clean_number(row.get("盤中資金分"))
+    left = _clean_number(row.get("左側低吸分"))
+    limit_score = _clean_number(row.get("v29漲停前兆分") or row.get("漲停前兆分"))
+    pct = _clean_number(row.get("盤中漲跌幅"))
+    ret = _clean_number(row.get("目前報酬%"))
+    high_ret = _clean_number(row.get("最高報酬%"))
+    drawdown = _clean_number(row.get("最大回撤%"))
+
+    if px <= 0:
+        return pd.Series({
+            "v212生命週期狀態": "⚪ 無報價",
+            "v212目前決策": "等待報價",
+            "v212位置判斷": "無法判斷",
+            "v212下一步": "等下一輪報價，不做決策。",
+            "v212優先級": 99,
+        })
+
+    # Position relative to left-side zone.
+    if not math.isnan(buy_low) and not math.isnan(buy_high) and buy_high > 0:
+        if px < buy_low:
+            if stop > 0 and px > stop:
+                pos = "低於左側區，但仍守防守"
+            elif stop > 0 and px <= stop:
+                pos = "跌破防守"
+            else:
+                pos = "低於左側區，需重算結構"
+        elif buy_low <= px <= buy_high:
+            pos = "已到左側試單區"
+        elif px <= buy_high * 1.01:
+            pos = "貼近左側區上緣"
+        else:
+            pos = "高於左側區"
+    else:
+        pos = "買點未定義"
+
+    # Lifecycle state machine.
+    if stop > 0 and px <= stop:
+        stage = "⚫ 取消 / 跌破防守"
+        decision = "不買"
+        next_step = "已低於防守價，這不是便宜，是結構破壞；等重新築底。"
+        priority = 90
+    elif learn_state.startswith("✅") or ("有效" in learn_state and ret >= 0):
+        stage = "✅ 訊號有效追蹤"
+        decision = "續追蹤"
+        next_step = "訊號後有利延伸，若已有試單看防守停損與量能延續；空手不追高。"
+        priority = 7
+    elif sig in {"✅ 到價可小量試單", "✅ 左側可小量試單"}:
+        stage = "✅ 到價確認 / 可試單"
+        decision = "可小量"
+        next_step = "只適合小量試單；跌破防守停損立刻退出，不用等右側確認。"
+        priority = 1
+    elif sig == "⏳ 已到價，等止跌確認" or ("已到左側" in pos and left >= 50):
+        stage = "⏳ 到價等確認"
+        decision = "等一輪止跌"
+        next_step = "已到位置，但還缺止跌/賣壓收斂；下一輪若價格不破低、資金分不掉，才轉可小量。"
+        priority = 2
+    elif "前兆" in sig or (limit_score >= 65 and money >= 55):
+        stage = "👀 前兆出現"
+        decision = "等低吸"
+        next_step = "有資金或漲停前兆，但不要追；等回到左側區或量縮守住。"
+        priority = 3
+    elif "等左側" in sig or "等低吸" in sig:
+        if "已到左側" in pos or "低於左側" in pos:
+            stage = "⏳ 到價等確認"
+            decision = "等止跌確認"
+            next_step = "價格已到/低於原本左側區，重點不是繼續等回測，而是確認有沒有止跌守防守。"
+            priority = 2
+        else:
+            stage = "🟡 候選 / 等回測"
+            decision = "等待"
+            next_step = "還沒到低風險區，不要買在中間；等價格接近第一買點。"
+            priority = 5
+    elif "右側" in sig:
+        stage = "🟢 右側確認 / 加碼點"
+        decision = "空手不追"
+        next_step = "這不是第一買點；有底倉才考慮加碼，空手等回測。"
+        priority = 6
+    elif "錯過" in sig or pct >= 7.5:
+        stage = "🔴 錯過 / 不追"
+        decision = "不追"
+        next_step = "左側機會已過或漲幅偏高；等回檔重新出現左側區。"
+        priority = 80
+    elif "不買" in sig or "結構不穩" in sig:
+        stage = "⚫ 不買 / 結構不穩"
+        decision = "不買"
+        next_step = "資金、位置或風險條件不同步；先排除。"
+        priority = 85
+    elif money >= 58 and left >= 55 and risk < 45:
+        stage = "👀 候選升溫"
+        decision = "等到價"
+        next_step = "資金與左側條件不錯，等價格進入第一買點再判斷。"
+        priority = 4
+    else:
+        stage = "⚪ 候選觀察"
+        decision = "不急"
+        next_step = "還不是交易點；不要為了怕錯過而提前買。"
+        priority = 60
+
+    # Extra note for possible whipsaw.
+    if high_ret >= 2.0 and ret < 0.5 and "追蹤" in learn_state:
+        stage = "⚠️ 衝高回落追蹤"
+        decision = "保守"
+        next_step = "曾經有利但回落，先看是否守住防守價，不要加碼。"
+        priority = min(priority, 8)
+    if drawdown <= -1.5 and decision in {"可小量", "續追蹤"}:
+        next_step += " 目前回撤偏大，部位要更小。"
+
+    return pd.Series({
+        "v212生命週期狀態": stage,
+        "v212目前決策": decision,
+        "v212位置判斷": pos,
+        "v212下一步": next_step,
+        "v212優先級": priority,
+    })
+
+
+def build_v212_lifecycle(live_df: pd.DataFrame, learning_log: pd.DataFrame) -> pd.DataFrame:
+    df = live_df.copy()
+    if df.empty:
+        return df
+    df["代號"] = df["代號"].astype(str).str.zfill(4)
+    if learning_log is not None and not learning_log.empty and "代號" in learning_log.columns:
+        keep = [
+            "代號", "首次時間", "首次價格", "目前價格", "目前報酬%", "最高報酬%", "最大回撤%",
+            "學習狀態", "訊號歷程", "訊號變更次數", "錯誤歸因", "最新時間"
+        ]
+        keep = [c for c in keep if c in learning_log.columns]
+        lg = learning_log[keep].copy()
+        lg["代號"] = lg["代號"].astype(str).str.zfill(4)
+        # Deduplicate defensively: one row per stock.
+        lg = lg.drop_duplicates(subset=["代號"], keep="last")
+        df = df.merge(lg, on="代號", how="left", suffixes=("", "_學習"))
+    stage_out = df.apply(_v212_signal_stage, axis=1)
+    for col in stage_out.columns:
+        df[col] = stage_out[col]
+    df["v212排序分"] = pd.to_numeric(df.get("v210決策分", 0), errors="coerce").fillna(0) + pd.to_numeric(df.get("即時入場分", 0), errors="coerce").fillna(0) * 0.25
+    return df.sort_values(["v212優先級", "v212排序分", "即時強度分"], ascending=[True, False, False])
+
+
+def _cols_exist(df: pd.DataFrame, cols: List[str]) -> List[str]:
+    return [c for c in cols if c in df.columns]
+
+
+def _v212_style_signal(v: Any) -> str:
+    text = str(v)
+    if "✅" in text:
+        return "background-color: #e8f7ee; color: #166534; font-weight: 700;"
+    if "⏳" in text or "👀" in text:
+        return "background-color: #fff7ed; color: #9a3412; font-weight: 650;"
+    if "🔴" in text or "⚫" in text:
+        return "background-color: #fee2e2; color: #991b1b; font-weight: 650;"
+    if "🟢" in text:
+        return "background-color: #ecfdf5; color: #047857;"
+    return ""
+
+
+st.title("🔄 盤中即時看盤 v2.12 訊號生命週期引擎｜精簡決策版")
+st.caption("這版把舊頁面重複區塊收斂成：目前決策、生命週期、焦點股、進階診斷。主表只回答：現在會不會買、買點在哪、停損在哪、下一步等什麼。")
 
 refresh_default = _get_query_int("refresh", 30, 15, 120, 15)
 top_n_default = _get_query_int("top_n", 15, 5, 50, 5)
@@ -3025,32 +3204,28 @@ chase_default = _get_query_float("chase", 7.0, 3.0, 10.0, 0.5)
 extra_codes_default = _get_query_value("extra_codes", "")
 mode_default = _get_query_value("mode", "盤中市場池掃描")
 pool_default = _get_query_int("pool_size", 300, 30, 600, 10)
+view_default = _get_query_value("view", "精簡")
 
 with st.sidebar:
     st.header("即時設定")
+    view_mode = st.radio("畫面模式", ["精簡", "完整診斷"], index=1 if view_default == "完整診斷" else 0)
     scan_mode = st.radio(
         "即時掃描範圍",
         ["盤後AI候選", "盤中市場池掃描"],
         index=1 if mode_default == "盤中市場池掃描" else 0,
-        help="盤後AI候選：只看每日AI 30檔。盤中市場池掃描：用上市+上櫃成交金額池擴大即時掃描，再依即時強度排序。",
     )
     pool_size = st.slider("市場池檔數", min_value=30, max_value=600, value=pool_default, step=10, disabled=(scan_mode != "盤中市場池掃描"))
     refresh_seconds = st.slider("自動刷新秒數", min_value=15, max_value=120, value=refresh_default, step=15)
-    top_n = st.slider("顯示前 N 檔", min_value=5, max_value=50, value=top_n_default, step=5)
+    top_n = st.slider("主表顯示前 N 檔", min_value=5, max_value=50, value=top_n_default, step=5)
     min_ai = st.slider("最低 AI / 市場池分", 0, 100, min_ai_default, 5)
     min_strength = st.slider("最低即時強度分", 0, 100, min_strength_default, 5)
 
     st.markdown("---")
-    st.subheader("手動監控股票")
-    extra_codes_text = st.text_area(
-        "額外監控代碼",
-        value=extra_codes_default,
-        placeholder="例如：3441, 6285, 2313",
-        help="手動加入股一定會固定顯示。表格中的加入來源只顯示文字，不需要點選。",
-    )
+    st.subheader("手動 / 核心監控")
+    extra_codes_text = st.text_area("額外監控代碼", value=extra_codes_default, placeholder="例如：3441, 2382, 2313")
     manual_codes = parse_extra_codes(extra_codes_text)
     tracked_codes = _unique_keep_order(manual_codes + FOCUS_CODES)
-    st.caption("v2.8 固定追蹤：" + "、".join([f"{c} {FOCUS_LABELS.get(c, '')}".strip() for c in FOCUS_CODES]))
+    st.caption("固定追蹤：" + "、".join([f"{c} {FOCUS_LABELS.get(c, '')}".strip() for c in FOCUS_CODES]))
     if manual_codes:
         st.caption("你手動加入：" + "、".join(manual_codes))
 
@@ -3061,33 +3236,35 @@ with st.sidebar:
     weak_drop = st.slider("AI高分轉弱跌幅", -5.0, 0.0, weak_default, 0.5)
     chase_pct = st.slider("不要追高漲幅", 3.0, 10.0, chase_default, 0.5)
 
-    st.info("設定會寫進網址參數，所以自動刷新後不會跳回預設值。v2.9 會固定追蹤 3441 聯一光、2382 廣達、2313 華通，並保留盤中記憶來判斷左側買點。市場池越大，刷新越慢。")
-    if st.button("清除盤中記憶", type="secondary"):
+    st.markdown("---")
+    if st.button("清除盤中記憶 / 學習暫存", type="secondary"):
         clear_intraday_memory()
+        clear_runtime_signal_log()
+        try:
+            clear_v211_learning_log()
+        except Exception:
+            pass
         st.rerun()
 
-_set_query_if_changed(
-    {
-        "mode": scan_mode,
-        "pool_size": pool_size,
-        "refresh": refresh_seconds,
-        "top_n": top_n,
-        "min_ai": min_ai,
-        "min_strength": min_strength,
-        "attack": attack_threshold,
-        "watch": watch_threshold,
-        "weak": weak_drop,
-        "chase": chase_pct,
-        "extra_codes": extra_codes_text.strip(),
-    }
-)
+_set_query_if_changed({
+    "view": view_mode,
+    "mode": scan_mode,
+    "pool_size": pool_size,
+    "refresh": refresh_seconds,
+    "top_n": top_n,
+    "min_ai": min_ai,
+    "min_strength": min_strength,
+    "attack": attack_threshold,
+    "watch": watch_threshold,
+    "weak": weak_drop,
+    "chase": chase_pct,
+    "extra_codes": extra_codes_text.strip(),
+})
 
 components.html(
     f"""
     <script>
-      setTimeout(function() {{
-        window.parent.location.reload();
-      }}, {int(refresh_seconds) * 1000});
+      setTimeout(function() {{ window.parent.location.reload(); }}, {int(refresh_seconds) * 1000});
     </script>
     """,
     height=0,
@@ -3111,6 +3288,7 @@ else:
     if "報價市場" in merged.columns:
         merged["市場"] = merged["報價市場"].fillna(merged["市場"])
 
+# Core calculation chain retained, but UI no longer repeats every old section.
 live_df = compute_live_strength(merged, attack_threshold, watch_threshold, weak_drop, chase_pct)
 live_df = add_entry_timing(live_df, chase_pct=chase_pct)
 live_df, surge_df, surge_has_prev = update_surge_radar(live_df)
@@ -3122,451 +3300,128 @@ live_df = apply_v28_entry_signal_overrides(live_df)
 live_df, intraday_memory_df = update_intraday_memory_features(live_df)
 live_df = add_v29_left_predictive_ai(live_df, chase_pct=chase_pct)
 live_df = add_v210_trader_decision(live_df, chase_pct=chase_pct)
-# v2.11: update signal learning log after all decision layers are ready.
+
+# v2.11 stable learning + v2.12 lifecycle state machine.
 v211_learning_log_df = update_v211_signal_learning(live_df)
 v211_missed_limit_df = build_v211_missed_limit_report(live_df, v211_learning_log_df)
 v211_summary = build_v211_learning_summary(v211_learning_log_df)
-# v2.5.1: Keep the internal boolean, but show a readable text column instead of a non-clickable checkbox.
-if "手動加入" in live_df.columns:
-    live_df["加入來源"] = np.where(live_df["手動加入"].astype(bool), "手動監控", "自動掃描")
+lifecycle_df = build_v212_lifecycle(live_df, v211_learning_log_df)
+
+if "手動加入" in lifecycle_df.columns:
+    lifecycle_df["加入來源"] = np.where(lifecycle_df["手動加入"].astype(bool), "手動監控", "自動掃描")
 else:
-    live_df["加入來源"] = "自動掃描"
-filtered = live_df[(live_df["AI總分"] >= min_ai) & (live_df["即時強度分"] >= min_strength)].copy()
+    lifecycle_df["加入來源"] = "自動掃描"
 
-quote_ok = int(live_df["盤中現價"].notna().sum())
-up_count = int((live_df["盤中漲跌幅"] > 0).sum())
-best_pct = float(live_df["盤中漲跌幅"].max()) if len(live_df) else 0
-best_strength = float(live_df["即時強度分"].max()) if len(live_df) else 0
-attack_count = int((live_df["盤中警示"] == "強勢進攻").sum())
-watch_count = int((live_df["盤中警示"] == "觀察偏強").sum())
-weak_count = int((live_df["盤中警示"] == "AI高分轉弱").sum())
-no_chase_count = int((live_df["盤中警示"].isin(["不要追高", "高風險上漲"])).sum())
-entry_break_count = int((live_df["盤中入場判斷"] == "強勢進攻，可盯突破").sum())
-entry_pullback_count = int((live_df["盤中入場判斷"] == "觀察偏強，等回測確認").sum())
-market_pool_count = int((live_df.get("資料來源", pd.Series(dtype=str)).astype(str).str.contains("市場池")).sum())
-daily_ai_count = int((live_df.get("AI來源", pd.Series(dtype=str)).astype(str).eq("盤後AI")).sum())
+filtered = lifecycle_df[(lifecycle_df["AI總分"] >= min_ai) & (lifecycle_df["即時強度分"] >= min_strength)].copy()
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("掃描股票數", len(universe_df))
-c2.metric("報價成功檔數", quote_ok)
-c3.metric("盤中上漲檔數", up_count)
-c4.metric("最高即時強度分", f"{best_strength:.1f}")
-
-c5, c6, c7, c8 = st.columns(4)
-c5.metric("盤中最強漲幅", f"{best_pct:.2f}%")
-c6.metric("強勢進攻", attack_count)
-c7.metric("AI高分轉弱", weak_count)
-c8.metric("不要追/高風險", no_chase_count)
-
-c9, c10, c11, c12 = st.columns(4)
-c9.metric("觀察偏強", watch_count)
-c10.metric("可盯突破", entry_break_count)
-c11.metric("等回測確認", entry_pullback_count)
-c12.metric("自動刷新", f"{refresh_seconds} 秒")
-
-c13, c14, c15, c16 = st.columns(4)
-c13.metric("最後刷新", now_taipei().strftime("%H:%M:%S"))
-c14.metric("資料模式", scan_mode)
-c15.metric("市場池股數", market_pool_count)
-c16.metric("含盤後AI分數", daily_ai_count)
-
+# Minimal, non-redundant summary.
+quote_ok = int(lifecycle_df["盤中現價"].notna().sum())
+can_try = int(lifecycle_df.get("v212生命週期狀態", pd.Series(dtype=str)).astype(str).str.contains("可試單|到價確認", regex=True).sum())
+arrived_wait = int(lifecycle_df.get("v212生命週期狀態", pd.Series(dtype=str)).astype(str).str.contains("到價等確認", regex=False).sum())
+early_count = int(lifecycle_df.get("v212生命週期狀態", pd.Series(dtype=str)).astype(str).str.contains("前兆|候選升溫", regex=True).sum())
+no_buy_count = int(lifecycle_df.get("v212生命週期狀態", pd.Series(dtype=str)).astype(str).str.contains("不買|錯過|取消", regex=True).sum())
 surge_count = int(len(surge_df)) if "surge_df" in globals() else 0
-surge_manual_count = int(surge_df.get("手動加入", pd.Series(dtype=bool)).astype(bool).sum()) if surge_count else 0
-max_speed = float(pd.to_numeric(live_df.get("刷新漲速%", 0), errors="coerce").fillna(0).max()) if len(live_df) else 0.0
-vol_jump_count = int((pd.to_numeric(live_df.get("量能跳升分", 0), errors="coerce").fillna(0) >= 80).sum()) if len(live_df) else 0
-c17, c18, c19, c20 = st.columns(4)
-c17.metric("爆衝雷達", surge_count)
-c18.metric("手動爆衝", surge_manual_count)
-c19.metric("最高刷新漲速", f"{max_speed:.2f}%")
-c20.metric("量能跳升前段", vol_jump_count)
+best_pct = float(lifecycle_df["盤中漲跌幅"].max()) if len(lifecycle_df) else 0.0
+max_speed = float(pd.to_numeric(lifecycle_df.get("刷新漲速%", 0), errors="coerce").fillna(0).max()) if len(lifecycle_df) else 0.0
 
-decision_counts = live_df.get("決策等級", pd.Series(dtype=str)).astype(str).value_counts()
-d1, d2, d3, d4 = st.columns(4)
-d1.metric("A 可盯突破", int(decision_counts.get("🟢 A 可盯突破", 0)))
-d2.metric("B 等回測", int(decision_counts.get("🟡 B 等回測", 0)))
-d3.metric("不追/高風險", int(decision_counts.get("🔴 D 不追高", 0) + decision_counts.get("🔴 D 高風險", 0)))
-d4.metric("轉弱避開", int(decision_counts.get("⚫ E 轉弱避開", 0) + decision_counts.get("🟠 C 高分轉弱", 0)))
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("掃描 / 報價", f"{len(universe_df)} / {quote_ok}")
+m2.metric("可試單 / 到價等確認", f"{can_try} / {arrived_wait}")
+m3.metric("前兆 / 風險不買", f"{early_count} / {no_buy_count}")
+m4.metric("最後刷新", now_taipei().strftime("%H:%M:%S"))
 
-entry_counts = live_df.get("入場訊號", pd.Series(dtype=str)).astype(str).value_counts()
-e1, e2, e3, e4 = st.columns(4)
-e1.metric("✅ 可小量試單", int(entry_counts.get("✅ 可小量試單", 0)))
-e2.metric("🟢 觸發/二攻", int(entry_counts.get("🟢 觸發中，等站穩", 0) + entry_counts.get("🟢 等突破觸發", 0) + entry_counts.get("🟢 等二次攻擊觸發", 0)))
-e3.metric("👀 早期雷達/回測", int(entry_counts.get("👀 早期雷達", 0) + entry_counts.get("🟡 等回測確認", 0)))
-e4.metric("🔴 不可追/避開", int(entry_counts.get("🔴 不可追", 0) + entry_counts.get("⚫ 避開", 0)))
-
-p1, p2, p3, p4 = st.columns(4)
-precursor_high = int((pd.to_numeric(live_df.get("漲停前兆分", 0), errors="coerce").fillna(0) >= 62).sum())
-reattack_ready = int((live_df.get("回檔再攻狀態", pd.Series(dtype=str)).astype(str) == "✅ 二次攻擊可小量試單").sum())
-reattack_wait = int((live_df.get("回檔再攻狀態", pd.Series(dtype=str)).astype(str) == "🟢 等二次攻擊觸發").sum())
-focus_active = int((live_df.get("v28核心追蹤", pd.Series(dtype=str)).astype(str) == "是").sum())
-p1.metric("漲停前兆升溫", precursor_high)
-p2.metric("二次攻擊可試", reattack_ready)
-p3.metric("等二次觸發", reattack_wait)
-p4.metric("核心追蹤股", focus_active)
-
-v29_counts = live_df.get("AI即時入場訊號", pd.Series(dtype=str)).astype(str).value_counts()
-v1, v2, v3, v4 = st.columns(4)
-v1.metric("✅ 左側試單", int(v29_counts.get("✅ 左側可小量試單", 0)))
-v2.metric("👀 資金提前", int(v29_counts.get("👀 資金提前佈局", 0) + v29_counts.get("🚀 漲停前兆升溫", 0)))
-v3.metric("🟢 右側加碼", int(v29_counts.get("🟢 右側突破可加碼", 0)))
-v4.metric("🔴 錯過/避開", int(v29_counts.get("🔴 錯過不追", 0) + v29_counts.get("⚫ 避開", 0)))
-
-st.caption(f"掃描來源：{universe_source}")
-if scan_mode == "盤中市場池掃描":
-    st.warning("市場池掃描股若顯示『市場池估分』，代表它只有盤中動能與成交金額排序，沒有完整盤後AI/籌碼驗證。入場判斷要更保守。")
-
-
-
+m5, m6, m7, m8 = st.columns(4)
+m5.metric("盤中最強漲幅", f"{best_pct:.2f}%")
+m6.metric("最高刷新漲速", f"{max_speed:.2f}%")
+m7.metric("爆衝雷達", surge_count)
+m8.metric("學習追蹤筆數", int(v211_summary.get("total", 0)))
 
 st.divider()
 
-st.subheader("📊 v2.11.3 AI 訊號學習報告")
-st.caption("這區用來檢查系統剛剛給的訊號到底有沒有用。v2.11.4 已改成「每檔股票每天只保留一筆目前學習狀態」，不會再讓同一檔同時出現錯過、可小量、等低吸等互相矛盾訊號。這是前台 runtime 學習紀錄，重開或重新部署可能重置；v2.11.4 已加強 pandas 型別/重複欄位防呆，避免學習區因舊紀錄或非純量欄位當機。")
-
-l1, l2, l3, l4 = st.columns(4)
-l1.metric("今日學習訊號", int(v211_summary.get("total", 0)))
-l2.metric("左側試單數", int(v211_summary.get("actionable", 0)))
-left_rate = v211_summary.get("left_success_rate", np.nan)
-l3.metric("左側試單成功率", "-" if pd.isna(left_rate) else f"{left_rate:.0f}%")
-l4.metric("假突破 / 衝高回落", int(v211_summary.get("false_break", 0)))
-
-l5, l6, l7, l8 = st.columns(4)
-l5.metric("有效 / 避開成功", int(v211_summary.get("effective", 0)))
-l6.metric("失敗 / 可能錯過", int(v211_summary.get("failed", 0)))
-l7.metric("平均最高報酬", f"{float(v211_summary.get('avg_high', 0.0)):.2f}%")
-l8.metric("平均最大回撤", f"{float(v211_summary.get('avg_drawdown', 0.0)):.2f}%")
-
-if v211_learning_log_df.empty:
-    st.info("目前還沒有 v2.11.4 學習紀錄。等交易員中控台出現左側試單、前兆等低吸、右側確認或核心股不買訊號後，這裡會開始追蹤。")
+# 1) Primary current decision table.
+st.subheader("🧭 v2.12 交易員目前決策")
+st.caption("主表只保留會影響進場的欄位：訊號、生命週期、第一買點、現價、停損、下一步。看到 ✅ 才是可小量試單；⏳ 是到價但還要止跌確認。")
+main_cols = _cols_exist(lifecycle_df, [
+    "代號", "名稱", "市場", "產業", "交易型態", "v212生命週期狀態", "v212目前決策", "我會不會買",
+    "第一買點", "盤中現價", "v212位置判斷", "防守停損", "右側加碼價", "追價上限",
+    "盤中漲跌幅", "刷新漲速%", "左側低吸分", "盤中資金分", "v29漲停前兆分", "v210決策分",
+    "v212下一步", "還缺什麼確認", "不能買原因", "資料來源", "AI來源", "報價時間"
+])
+main_df = filtered.sort_values(["v212優先級", "v212排序分", "即時強度分"], ascending=[True, False, False]).head(top_n)
+if main_df.empty:
+    st.info("目前沒有符合篩選條件的股票。可以降低左側篩選的 AI / 即時強度門檻，或等待下一輪刷新。")
 else:
-    c1, c2 = st.columns(2)
-    c1.caption(f"最準訊號類型：{v211_summary.get('best_type', '-')}")
-    c2.caption(f"最容易失敗類型：{v211_summary.get('worst_type', '-')}")
-    learn_cols = ["首次時間", "代號", "名稱", "股票型態", "訊號分類", "交易員訊號", "訊號歷程", "訊號變更次數", "學習狀態", "首次價格", "目前價格", "目前報酬%", "最高報酬%", "最大回撤%", "5分鐘後報酬%", "15分鐘後報酬%", "是否碰停損", "是否接近漲停", "第一買點", "防守停損", "右側加碼價", "追價上限", "v210決策分", "即時入場分", "左側低吸分", "盤中資金分", "漲停前兆分", "AI總分", "風險分", "還缺什麼確認", "錯誤歸因", "最新時間"]
-    learn_cols = [c for c in learn_cols if c in v211_learning_log_df.columns]
-    show_learn = v211_learning_log_df.copy()
-    if "首次時間" in show_learn.columns:
-        show_learn = show_learn.sort_values(["首次時間", "最高報酬%"], ascending=[False, False])
-    st.dataframe(show_learn[learn_cols], use_container_width=True, hide_index=True)
-    csv_bytes = v211_learning_log_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-    st.download_button("下載 v2.11.4 AI 訊號學習 CSV", data=csv_bytes, file_name=f"v211_ai_signal_learning_{now_taipei().strftime('%Y%m%d')}.csv", mime="text/csv")
-    if st.button("清除 v2.11.4 今日學習紀錄", type="secondary"):
-        clear_v211_learning_log()
-        st.rerun()
+    try:
+        st.dataframe(main_df[main_cols].style.applymap(_v212_style_signal, subset=["v212生命週期狀態"]), use_container_width=True, hide_index=True)
+    except Exception:
+        st.dataframe(main_df[main_cols], use_container_width=True, hide_index=True)
 
-st.subheader("📌 錯過漲停 / 近漲停歸因檢查")
-st.caption("如果有股票已接近漲停，但沒有早期或左側訊號，系統會列出可能原因。這是之後 v2.12 自動調權重的依據。")
-if v211_missed_limit_df.empty:
-    st.info("目前沒有近漲停但疑似錯過的股票。")
-else:
-    miss_cols = [c for c in ["代號", "名稱", "目前價", "盤中漲跌幅", "漲停距離%", "交易員訊號", "檢查結果", "可能原因", "左側低吸分", "盤中資金分", "漲停前兆分", "AI來源"] if c in v211_missed_limit_df.columns]
-    st.dataframe(v211_missed_limit_df[miss_cols].head(top_n), use_container_width=True, hide_index=True)
-
-
-st.subheader("🧠 v2.10 交易員決策中控台")
-st.caption("這張表仍然是盤中主決策：先看『交易員訊號』和『我會不會買』。v2.11.2 會把這些訊號記錄下來，追蹤後續有沒有準。")
-
-try:
-    trader_counts = live_df.get("交易員訊號", pd.Series(dtype=str)).astype(str).value_counts()
-    t1, t2, t3, t4 = st.columns(4)
-    t1.metric("✅ 可小量", int(trader_counts.get("✅ 左側可小量試單", 0) + trader_counts.get("✅ 到價可小量試單", 0)))
-    t2.metric("⏳ 到價/前兆", int(trader_counts.get("⏳ 已到價，等止跌確認", 0) + trader_counts.get("👀 前兆出現，等低吸", 0)))
-    t3.metric("🟡 等回測", int(trader_counts.get("🟡 等左側回測", 0)))
-    t4.metric("🔴/⚫ 不買", int(trader_counts.get("🔴 已錯過，不追", 0) + trader_counts.get("⚫ 不買，結構不穩", 0)))
-except Exception:
-    pass
-
-trader_cols = [
-    "代號", "名稱", "市場", "產業", "交易員訊號", "我會不會買", "v210決策分", "第一買點", "現在位置", "到價狀態",
-    "盤中現價", "左側試單價", "防守停損", "右側加碼價", "追價上限", "我會怎麼做", "還缺什麼確認", "不能買原因",
-    "盤中漲跌幅", "1分漲速%", "3分漲速%", "記憶回檔幅度%", "盤中資金分", "左側低吸分", "即時入場分", "v29漲停前兆分", "AI總分", "風險分", "交易型態", "資料來源", "AI來源", "報價時間"
-]
-trader_cols = [c for c in trader_cols if c in live_df.columns]
-trader_show = live_df[live_df["交易員訊號"].isin([
-    "✅ 左側可小量試單", "✅ 到價可小量試單", "⏳ 已到價，等止跌確認", "👀 前兆出現，等低吸", "🟡 等左側回測", "🟡 跌到低吸區下方，等止跌", "⚫ 買點失效，等止跌", "⚫ 跌破防守，不買", "🟢 右側確認，只能加碼"
-])].copy()
-trader_show = trader_show.sort_values(["v210優先級", "v210決策分", "盤中資金分"], ascending=[True, False, False])
-if trader_show.empty:
-    st.info("目前 v2.10 沒有給出可小量試單。這代表不是系統沒訊號，而是資金、位置、停損距離尚未同時成立。")
-else:
-    st.dataframe(trader_show[trader_cols].head(top_n), use_container_width=True, hide_index=True)
-
-focus_trader = live_df[live_df["代號"].astype(str).str.zfill(4).isin(FOCUS_CODES)].copy()
-if not focus_trader.empty:
-    focus_trader["焦點排序"] = focus_trader["代號"].astype(str).str.zfill(4).map({"3441": 1, "2382": 2, "2313": 3}).fillna(9)
-    focus_trader = focus_trader.sort_values(["焦點排序"])
-    with st.expander("🎯 聯一光 / 廣達 / 華通：我現在會不會買", expanded=True):
-        st.dataframe(focus_trader[trader_cols], use_container_width=True, hide_index=True)
-
-with st.expander("🔴 v2.10 不買 / 已錯過 / 結構不穩", expanded=False):
-    no_buy = live_df[live_df["交易員訊號"].isin(["🔴 已錯過，不追", "⚫ 不買，結構不穩", "⚪ 觀察，不急", "⚪ 無報價"])].copy()
-    no_buy = no_buy.sort_values(["v210優先級", "盤中漲跌幅"], ascending=[True, False])
-    if no_buy.empty:
-        st.caption("目前沒有明確不買名單。")
-    else:
-        st.dataframe(no_buy[trader_cols].head(top_n), use_container_width=True, hide_index=True)
-
-st.divider()
-
-st.subheader("🎯 AI 即時入場決策 v2.9 / 舊版細節")
-st.caption("這區才是新版核心：先判斷能不能左側小量試單。✅ 左側可小量試單 = 價格靠近支撐、資金進來、停損距離短；🟢 右側突破只當加碼點，不當第一買點。")
-
-v29_cols = [
-    "代號", "名稱", "市場", "產業", "AI即時入場訊號", "信心等級", "即時入場分", "左側低吸分", "盤中資金分", "v29漲停前兆分", "盤後AI分", "風險分",
-    "盤中現價", "左側試單區", "左側停損價", "左側距停損%", "右側加碼價", "AI追價上限",
-    "盤中漲跌幅", "1分漲速%", "3分漲速%", "5分漲速%", "3分量增%", "5分量增%", "記憶回檔幅度%",
-    "漲停前兆狀態", "回檔再攻狀態", "再攻機率", "如果是我會確認", "AI不進原因", "AI建議操作", "左側型態", "資料來源", "AI來源", "報價時間"
-]
-v29_cols = [c for c in v29_cols if c in live_df.columns]
-v29_show = live_df[live_df["AI即時入場訊號"].isin([
-    "✅ 左側可小量試單", "👀 資金提前佈局", "🚀 漲停前兆升溫", "🟢 右側突破可加碼", "🟡 等左側回測"
-])].copy()
-v29_show = v29_show.sort_values(["AI入場優先級", "即時入場分", "左側低吸分", "盤中資金分"], ascending=[True, False, False, False])
-if v29_show.empty:
-    st.info("目前沒有 v2.9 認可的左側試單或資金提前訊號。先不要硬追。")
-else:
-    st.dataframe(v29_show[v29_cols].head(top_n), use_container_width=True, hide_index=True)
-
-with st.expander("🔴 v2.9 不建議進場 / 已錯過", expanded=False):
-    v29_block = live_df[live_df["AI即時入場訊號"].isin(["🔴 錯過不追", "⚫ 避開"])].copy()
-    v29_block = v29_block.sort_values(["AI入場優先級", "盤中漲跌幅"], ascending=[True, False])
-    if v29_block.empty:
-        st.caption("目前沒有 v2.9 明確判定錯過或避開的股票。")
-    else:
-        st.dataframe(v29_block[v29_cols].head(top_n), use_container_width=True, hide_index=True)
-
-st.subheader("🧠 我的買進檢查清單")
-st.caption("v2.9 會把『如果是我準備買，我會確認什麼』直接寫進表格：資金、位置、停損、回檔、是否過熱。只要有一項不漂亮，就不會給左側試單。")
-focus_ai_df = live_df[live_df["代號"].astype(str).str.zfill(4).isin(FOCUS_CODES)].copy()
-focus_ai_df["焦點排序"] = focus_ai_df["代號"].map({"3441": 1, "2382": 2, "2313": 3}).fillna(9)
-focus_ai_df = focus_ai_df.sort_values(["焦點排序"])
-if not focus_ai_df.empty:
-    focus_ai_cols = [c for c in v29_cols if c in focus_ai_df.columns]
-    st.dataframe(focus_ai_df[focus_ai_cols], use_container_width=True, hide_index=True)
-
-
-st.subheader("🚦 即時入場訊號中控台")
-st.caption("先看這區：只有 ✅ 可小量試單 才代表系統認為已觸發入場條件；🟢 只是等待突破或等待站穩，🟡 是等回測，🔴/⚫ 不碰。")
-
-entry_signal_cols = [
-    "代號", "名稱", "市場", "產業", "v28核心追蹤", "入場訊號", "可否入場", "入場訊號分", "入場確認",
-    "盤中現價", "左側低吸區", "右側確認價", "追價上限", "觸發價", "二次攻擊觸發價", "回測支撐價", "防守停損價", "停損參考", "壓力參考",
-    "盤中漲跌幅", "刷新漲速%", "回檔幅度%", "日內高點漲幅%", "盤中成交量",
-    "AI總分", "風險分", "即時強度分", "爆衝分", "漲停前兆分", "漲停前兆狀態", "再攻機率", "回檔再攻狀態", "漲停雷達", "漲停距離%",
-    "入場價位策略", "三段式進場建議", "買高警示", "建議進場區間", "入場條件檢查", "建議下單方式", "資料來源", "AI來源", "報價時間"
-]
-entry_signal_cols = [c for c in entry_signal_cols if c in live_df.columns]
-entry_signal_df = live_df[live_df["入場訊號"].isin(["✅ 可小量試單", "🟢 觸發中，等站穩", "🟢 等突破觸發", "🟢 等二次攻擊觸發", "👀 早期雷達", "🟡 等回測確認"])].copy()
-entry_signal_df = entry_signal_df.sort_values(["入場優先級", "入場訊號分", "決策分"], ascending=[True, False, False])
-
-if entry_signal_df.empty:
-    st.info("目前沒有明確入場訊號。先不要硬追，等下一次刷新、突破觸發價或回測確認。")
-else:
-    st.dataframe(entry_signal_df[entry_signal_cols].head(top_n), use_container_width=True, hide_index=True)
-
-with st.expander("🔴 目前不可入場 / 不可追 / 避開", expanded=False):
-    blocked_df = live_df[live_df["入場訊號"].isin(["🔴 不可追", "⚫ 避開"])].copy()
-    blocked_df = blocked_df.sort_values(["入場優先級", "盤中漲跌幅"], ascending=[True, False])
-    if blocked_df.empty:
-        st.caption("目前沒有明確不可追或轉弱避開名單。")
-    else:
-        st.dataframe(blocked_df[entry_signal_cols].head(top_n), use_container_width=True, hide_index=True)
-
-
-st.subheader("🚀 漲停前兆雷達")
-st.caption("v2.8：這區不靠盤後 AI 擋股票，優先看短線漲速、量能跳升、日內高點、距離漲停與回檔再攻條件。")
-precursor_cols = [
-    "代號", "名稱", "市場", "產業", "v28核心追蹤", "漲停前兆分", "漲停前兆狀態", "再攻機率", "回檔再攻狀態",
-    "盤中現價", "左側低吸區", "右側確認價", "追價上限", "二次攻擊觸發價", "回測支撐價", "防守停損價", "入場價位策略", "三段式進場建議", "建議進場區間",
-    "盤中漲跌幅", "刷新漲速%", "回檔幅度%", "日內高點漲幅%", "盤中成交量", "量能跳升分",
-    "入場訊號", "可否入場", "回檔再攻判斷", "AI總分", "風險分", "資料來源", "AI來源", "報價時間"
-]
-precursor_cols = [c for c in precursor_cols if c in live_df.columns]
-precursor_df = live_df[pd.to_numeric(live_df.get("漲停前兆分", 0), errors="coerce").fillna(0) >= 45].copy()
-precursor_df = precursor_df.sort_values(["漲停前兆分", "再攻機率", "即時強度分"], ascending=[False, True, False])
-if precursor_df.empty:
-    st.info("目前沒有明顯漲停前兆。")
-else:
-    st.dataframe(precursor_df[precursor_cols].head(top_n), use_container_width=True, hide_index=True)
-
-st.subheader("🎯 重點股回檔再攻分析：聯一光 / 廣達 / 華通")
-st.caption("這區固定顯示 3441、2382、2313：用來回答『急拉回檔後，是否可能再爆衝、該在低吸區還是確認價進場』。看到 ✅ 才是可小量試單；看到 🟢/👀 都只是等條件。")
-focus_df = live_df[live_df["代號"].astype(str).str.zfill(4).isin(FOCUS_CODES)].copy()
+# 2) Focus names.
+st.subheader("🎯 核心追蹤：聯一光 / 廣達 / 華通")
+focus_df = lifecycle_df[lifecycle_df["代號"].astype(str).str.zfill(4).isin(FOCUS_CODES)].copy()
 focus_df["焦點排序"] = focus_df["代號"].map({"3441": 1, "2382": 2, "2313": 3}).fillna(9)
-focus_df = focus_df.sort_values(["焦點排序"])
-focus_cols = [
-    "代號", "名稱", "入場訊號", "可否入場", "盤中現價", "左側低吸區", "右側確認價", "追價上限", "二次攻擊觸發價", "回測支撐價", "防守停損價", "入場價位策略", "三段式進場建議", "建議進場區間",
-    "回檔再攻狀態", "再攻機率", "漲停前兆分", "漲停前兆狀態", "盤中漲跌幅", "刷新漲速%", "回檔幅度%", "日內高點漲幅%",
-    "AI總分", "風險分", "即時強度分", "回檔再攻判斷", "報價時間"
-]
-focus_cols = [c for c in focus_cols if c in focus_df.columns]
+focus_df = focus_df.sort_values("焦點排序")
+focus_cols = _cols_exist(focus_df, [
+    "代號", "名稱", "v212生命週期狀態", "v212目前決策", "第一買點", "盤中現價", "防守停損", "右側加碼價", "追價上限",
+    "v212位置判斷", "盤中漲跌幅", "刷新漲速%", "回檔幅度%", "左側低吸分", "盤中資金分", "v29漲停前兆分", "v212下一步", "還缺什麼確認", "報價時間"
+])
 if focus_df.empty:
-    st.warning("目前沒有抓到 3441 / 2382 / 2313 的即時資料。")
+    st.warning("目前沒有抓到 3441 / 2382 / 2313 的報價。")
 else:
     st.dataframe(focus_df[focus_cols], use_container_width=True, hide_index=True)
 
-st.subheader("🎯 今日入場決策中控台")
-st.caption("這區保留 A/B/C/D/E 決策分層；真正要不要進，以上方『即時入場訊號』為準。")
-
-decision_cols = [
-    "代號", "名稱", "市場", "產業", "入場訊號", "可否入場", "決策等級", "決策分", "入場訊號分", "爆衝分", "漲停雷達", "漲停距離%",
-    "盤中現價", "盤中漲跌幅", "刷新漲速%", "盤中成交量", "AI總分", "風險分", "即時強度分",
-    "觸發價", "停損參考", "壓力參考", "第一優先原因", "入場建議", "入場條件檢查", "資料來源", "AI來源", "報價時間"
-]
-decision_cols = [c for c in decision_cols if c in live_df.columns]
-
-ready_df = live_df[live_df["決策等級"].isin(["🟢 A 可盯突破", "🟡 B 等回測"])].copy()
-ready_df = ready_df.sort_values(["決策排序", "決策分", "即時強度分"], ascending=[True, False, False])
-
-risk_df = live_df[live_df["決策等級"].isin(["🔴 D 不追高", "🔴 D 高風險", "🟠 C 高分轉弱", "⚫ E 轉弱避開"])].copy()
-risk_df = risk_df.sort_values(["決策排序", "決策分"], ascending=[True, False])
-
-if ready_df.empty:
-    st.info("目前沒有 A/B 級入場觀察股。先不要硬追，等下一次刷新或等回測訊號。")
+# 3) Lifecycle learning/tracking.
+st.subheader("🔄 訊號生命週期追蹤")
+st.caption("同一檔股票每天只保留一個目前狀態，歷程放在『訊號歷程』；不再同時顯示互相矛盾的可買/不買訊號。")
+life_cols = _cols_exist(lifecycle_df, [
+    "代號", "名稱", "v212生命週期狀態", "交易員訊號", "首次時間", "首次價格", "目前價格", "目前報酬%", "最高報酬%", "最大回撤%",
+    "學習狀態", "訊號歷程", "訊號變更次數", "錯誤歸因", "v212下一步", "最新時間"
+])
+life_df = lifecycle_df[~lifecycle_df.get("學習狀態", pd.Series(index=lifecycle_df.index, dtype=str)).isna()].copy()
+life_df = life_df.sort_values(["v212優先級", "最新時間"], ascending=[True, False]).head(top_n)
+if life_df.empty:
+    st.info("目前尚未累積生命週期追蹤資料。等待訊號出現後會開始記錄。")
 else:
-    st.dataframe(ready_df[decision_cols].head(top_n), use_container_width=True, hide_index=True)
+    st.dataframe(life_df[life_cols], use_container_width=True, hide_index=True)
 
-with st.expander("🔴 目前不建議追價 / 轉弱避開", expanded=False):
-    if risk_df.empty:
-        st.caption("目前沒有明顯 D/E 風險股。")
-    else:
-        st.dataframe(risk_df[decision_cols].head(top_n), use_container_width=True, hide_index=True)
+# 4) Near limit / missed check only if relevant.
+if not v211_missed_limit_df.empty:
+    st.subheader("📌 近漲停 / 錯過檢查")
+    miss_cols = _cols_exist(v211_missed_limit_df, ["代號", "名稱", "目前價", "盤中漲跌幅", "漲停距離%", "交易員訊號", "檢查結果", "可能原因", "左側低吸分", "盤中資金分", "漲停前兆分", "AI來源"])
+    st.dataframe(v211_missed_limit_df[miss_cols].head(top_n), use_container_width=True, hide_index=True)
 
-st.subheader("🔥 漲停爆衝雷達")
-st.caption("v2.6.2：比較上一輪與目前報價，抓短時間價格加速度、量能跳升、日內高點突破。這用來補足『突然爆衝』，不是單純看目前漲幅排行。")
-if not surge_has_prev:
-    st.info("這是本次啟動後第一輪快照，還沒有上一輪價格可比較。等下一次自動刷新後，爆衝雷達才會開始判斷。")
-elif surge_df.empty:
-    st.info("目前沒有偵測到明顯爆衝或急轉弱。")
-else:
-    surge_cols = [
-        "代號", "名稱", "市場", "產業", "加入來源", "資料來源", "AI來源", "爆衝警示", "刷新漲速%", "上一輪價格", "盤中現價",
-        "量能增量", "量能跳升分", "突破日內高", "盤中漲跌幅", "即時強度分", "盤中入場判斷", "觸發價", "停損參考", "壓力參考", "爆衝建議", "報價時間"
-    ]
-    surge_cols = [c for c in surge_cols if c in surge_df.columns]
-    st.dataframe(surge_df[surge_cols].head(top_n), use_container_width=True, hide_index=True)
+# 5) Advanced diagnostics: collapsed by default to reduce page chaos.
+with st.expander("🧪 進階診斷 / 市場池 / 爆衝雷達 / 原始學習紀錄", expanded=(view_mode == "完整診斷")):
+    tabs = st.tabs(["爆衝雷達", "市場池前段", "學習原始紀錄", "全部快照"])
+    with tabs[0]:
+        if not surge_has_prev:
+            st.info("第一輪快照還沒有上一輪資料可比較；下一次刷新後爆衝雷達才會啟動。")
+        elif surge_df.empty:
+            st.info("目前沒有明顯爆衝或急轉弱。")
+        else:
+            surge_cols = _cols_exist(surge_df, [
+                "代號", "名稱", "市場", "產業", "爆衝警示", "刷新漲速%", "上一輪價格", "盤中現價", "量能增量", "量能跳升分", "突破日內高", "盤中漲跌幅", "即時強度分", "爆衝建議", "報價時間"
+            ])
+            st.dataframe(surge_df[surge_cols].head(top_n), use_container_width=True, hide_index=True)
+    with tabs[1]:
+        market_cols = _cols_exist(lifecycle_df, [
+            "代號", "名稱", "市場", "產業", "v212生命週期狀態", "盤中現價", "盤中漲跌幅", "刷新漲速%", "即時強度分", "AI總分", "風險分", "市場池排名", "資料來源", "AI來源", "報價時間"
+        ])
+        st.dataframe(filtered.sort_values(["v212優先級", "即時強度分"], ascending=[True, False])[market_cols].head(top_n), use_container_width=True, hide_index=True)
+    with tabs[2]:
+        if v211_learning_log_df.empty:
+            st.info("尚無學習紀錄。")
+        else:
+            learn_cols = _cols_exist(v211_learning_log_df, [
+                "首次時間", "代號", "名稱", "訊號分類", "交易員訊號", "訊號歷程", "訊號變更次數", "首次價格", "目前價格", "目前報酬%", "最高報酬%", "最大回撤%", "學習狀態", "錯誤歸因", "最新時間"
+            ])
+            st.dataframe(v211_learning_log_df[learn_cols].sort_values("最新時間", ascending=False).head(top_n * 2), use_container_width=True, hide_index=True)
+            csv_bytes = v211_learning_log_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+            st.download_button("下載 v2.12 學習紀錄 CSV", csv_bytes, file_name=f"v212_learning_{now_taipei().strftime('%Y%m%d')}.csv", mime="text/csv")
+    with tabs[3]:
+        all_cols = _cols_exist(lifecycle_df, [
+            "代號", "名稱", "市場", "產業", "v212生命週期狀態", "交易員訊號", "第一買點", "盤中現價", "防守停損", "右側加碼價", "追價上限", "盤中漲跌幅", "刷新漲速%", "左側低吸分", "盤中資金分", "v29漲停前兆分", "即時入場分", "AI總分", "風險分", "即時強度分", "資料來源", "AI來源", "報價時間"
+        ])
+        st.dataframe(lifecycle_df[all_cols], use_container_width=True, hide_index=True)
 
-# v2.6.1/2: signal tracking
-signal_log_df = update_runtime_signal_log(live_df)
-
-st.subheader("今日訊號追蹤")
-st.caption("v2.6.1：只記錄有效進攻、觀察訊號、轉弱訊號與風險訊號，不再把大量普通中性股塞進紀錄。時間統一使用台灣時間。這是前台即時紀錄；Streamlit 重開或重新部署後可能會重置，長期統計仍要靠後台回測。")
-
-if signal_log_df.empty:
-    st.info("目前尚未出現可追蹤的盤中訊號。")
-else:
-    sig_total = len(signal_log_df)
-    sig_effective = int((pd.to_numeric(signal_log_df.get("目前報酬%", 0), errors="coerce").fillna(0) > 0).sum())
-    sig_failed = int((pd.to_numeric(signal_log_df.get("目前報酬%", 0), errors="coerce").fillna(0) <= -1.5).sum())
-    best_ret = float(pd.to_numeric(signal_log_df.get("最高報酬%", 0), errors="coerce").fillna(0).max())
-
-    s1, s2, s3, s4 = st.columns(4)
-    s1.metric("今日有效訊號數", sig_total)
-    s2.metric("目前為正", sig_effective)
-    s3.metric("失效訊號", sig_failed)
-    s4.metric("最高訊號報酬", f"{best_ret:.2f}%")
-
-    type_counts = signal_log_df.get("訊號類型", pd.Series(dtype=str)).astype(str).value_counts()
-    t1, t2, t3, t4 = st.columns(4)
-    t1.metric("有效進攻", int(type_counts.get("有效進攻", 0)))
-    t2.metric("觀察訊號", int(type_counts.get("觀察訊號", 0)))
-    t3.metric("轉弱訊號", int(type_counts.get("轉弱訊號", 0)))
-    t4.metric("風險訊號", int(type_counts.get("風險訊號", 0)))
-
-    track_cols = [
-        "首次時間", "代號", "名稱", "市場", "訊號類型", "首次標籤", "首次入場判斷", "首次訊號價", "目前價格",
-        "目前報酬%", "最高報酬%", "最大回撤%", "目前狀態", "AI總分", "風險分",
-        "首次即時強度分", "最新即時強度分", "最新盤中漲跌幅", "觸發價", "停損參考", "壓力參考", "建議動作", "最新時間"
-    ]
-    track_cols = [c for c in track_cols if c in signal_log_df.columns]
-    show_log = signal_log_df.copy()
-    if "首次時間" in show_log.columns:
-        show_log = show_log.sort_values(["首次時間", "目前報酬%"], ascending=[False, False])
-    st.dataframe(show_log[track_cols], use_container_width=True, hide_index=True)
-
-    csv_bytes = signal_log_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-    st.download_button(
-        "下載今日訊號紀錄 CSV",
-        data=csv_bytes,
-        file_name=f"intraday_signal_log_{now_taipei().strftime('%Y%m%d')}.csv",
-        mime="text/csv",
-    )
-
-    if st.button("清除今日前台訊號紀錄", type="secondary"):
-        clear_runtime_signal_log()
-        st.rerun()
-
-
-# Manual watchlist always visible.
-manual_live_df = live_df[live_df.get("手動加入", False).astype(bool)].copy()
-if tracked_codes:
-    st.subheader("手動 / 核心監控股票即時狀態")
-    st.caption("這區固定顯示你左側輸入的股票，以及 v2.8 核心追蹤股 3441 / 2382 / 2313。表格不需要勾選。")
-    manual_cols = [
-        "代號", "名稱", "市場", "產業", "資料來源", "AI來源", "加入來源", "v28核心追蹤", "市場池排名", "入場訊號", "可否入場", "漲停前兆分", "回檔再攻狀態", "再攻機率", "盤中標籤", "爆衝警示", "刷新漲速%", "量能跳升分", "盤中入場判斷", "入場型態",
-        "左側低吸區", "右側確認價", "追價上限", "觸發價", "二次攻擊觸發價", "回測支撐價", "防守停損價", "入場價位策略", "三段式進場建議", "建議進場區間", "停損參考", "壓力參考", "AI總分", "風險分", "即時強度分",
-        "盤中現價", "盤中漲跌幅", "盤中成交量", "報價時間", "即時判斷", "建議動作", "回檔再攻判斷"
-    ]
-    manual_cols = [c for c in manual_cols if c in manual_live_df.columns]
-    if manual_live_df.empty:
-        st.warning("已收到手動監控代碼，但目前沒有產生資料。請確認代碼是否為 4 碼台股代號，或等待下一次刷新。")
-    else:
-        st.dataframe(manual_live_df[manual_cols], use_container_width=True, hide_index=True)
-    st.divider()
-
-# Priority watchlist.
-watch_df = live_df[
-    (
-        live_df["盤中警示"].isin(["強勢進攻", "觀察偏強"])
-        & (live_df["風險分"] < 40)
-        & (live_df["AI總分"] >= 45)
-        & (live_df["盤中漲跌幅"] > 0)
-    )
-].copy()
-watch_df = watch_df.sort_values(["警示排序", "即時強度分"], ascending=[True, False])
-
-st.subheader("盤中入場時機判斷")
-st.caption("優先看『可盯突破』與『等回測確認』；觸發價、停損與壓力只做盤中觀察參考，不是下單指令。")
-
-entry_df = live_df[
-    live_df["盤中入場判斷"].isin(["強勢進攻，可盯突破", "觀察偏強，等回測確認", "AI高分但盤中轉弱", "漲幅偏高，不追"])
-].copy()
-entry_priority = {
-    "強勢進攻，可盯突破": 1,
-    "觀察偏強，等回測確認": 2,
-    "AI高分但盤中轉弱": 3,
-    "漲幅偏高，不追": 4,
-}
-entry_df["入場排序"] = entry_df["盤中入場判斷"].map(entry_priority).fillna(9)
-entry_df = entry_df.sort_values(["入場排序", "即時強度分"], ascending=[True, False])
-
-common_cols = [
-    "代號", "名稱", "市場", "產業", "AI即時入場訊號", "信心等級", "即時入場分", "左側低吸分", "盤中資金分", "v29漲停前兆分", "左側試單區", "左側停損價", "右側加碼價", "AI追價上限", "入場訊號", "可否入場", "決策等級", "是否可入場", "決策分", "爆衝分", "漲停前兆分", "漲停前兆狀態", "再攻機率", "回檔再攻狀態", "漲停雷達", "漲停距離%",
-    "資料來源", "AI來源", "加入來源", "市場池排名", "盤中標籤", "爆衝警示", "刷新漲速%", "量能跳升分", "回檔幅度%", "盤中入場判斷", "入場型態",
-    "觸發價", "二次攻擊觸發價", "回測支撐價", "防守停損價", "停損參考", "壓力參考", "AI總分", "風險分", "即時強度分",
-    "盤中現價", "盤中漲跌幅", "盤中成交量", "報價時間", "即時判斷", "不追原因", "建議動作", "回檔再攻判斷"
-]
-
-entry_cols = [c for c in common_cols if c in entry_df.columns]
-if entry_df.empty:
-    st.info("目前沒有明確入場時機訊號。先觀察，不急著追。")
-else:
-    st.dataframe(entry_df[entry_cols].head(top_n), use_container_width=True, hide_index=True)
-
-st.subheader("今日優先盯盤")
-st.caption("只列出：強勢進攻 / 觀察偏強，且風險分不高、AI/市場池分不太低、盤中漲幅為正。")
-watch_cols = [c for c in common_cols if c in watch_df.columns]
-if watch_df.empty:
-    st.info("目前沒有符合『優先盯盤』條件的股票。先觀察，不急著追。")
-else:
-    st.dataframe(watch_df[watch_cols].head(top_n), use_container_width=True, hide_index=True)
-
-st.subheader("盤中市場池即時前段")
-st.caption("這區是 v2.5 重點：從市場池中依即時強度排序，不只限於盤後 AI 30 檔。")
-market_cols = [c for c in common_cols if c in filtered.columns]
-st.dataframe(filtered.sort_values(["警示排序", "即時強度分"], ascending=[True, False])[market_cols].head(top_n), use_container_width=True, hide_index=True)
-
-st.subheader("全部掃描池即時快照")
-st.dataframe(live_df[market_cols], use_container_width=True, hide_index=True)
-
-st.caption("提醒：這是網頁快照更新，不是券商逐筆成交資料。v2.9 的左側預判 AI 是規則化風控參考，不保證漲停；只有 ✅ 左側可小量試單 才代表條件初步成立，仍需小量、分批、嚴守停損。")
+st.caption("提醒：這是盤中快照與規則化風控系統，不是保證獲利或券商逐筆資料。v2.12 的目的，是把同一檔股票的訊號整理成單一生命週期狀態，避免同時出現可買/不買/錯過等矛盾訊號。")
