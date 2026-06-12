@@ -2218,6 +2218,271 @@ def add_v29_left_predictive_ai(df: pd.DataFrame, chase_pct: float = 7.0) -> pd.D
     return df
 
 
+def _safe_price_text(value: Any) -> str:
+    try:
+        if value is None:
+            return "-"
+        s = str(value).strip()
+        return s if s and s.lower() not in {"nan", "none"} else "-"
+    except Exception:
+        return "-"
+
+
+def _price_or_nan(value: Any) -> float:
+    try:
+        v = _to_float(value, default=np.nan)
+        if isinstance(v, float) and math.isnan(v):
+            return np.nan
+        return float(v)
+    except Exception:
+        return np.nan
+
+
+def _price_range_from_text(value: Any) -> Tuple[float, float]:
+    try:
+        s = _safe_price_text(value)
+        nums = re.findall(r"-?\d+(?:\.\d+)?", s.replace(",", ""))
+        vals = []
+        for n in nums[:2]:
+            v = _price_or_nan(n)
+            if not math.isnan(v) and v > 0:
+                vals.append(v)
+        if not vals:
+            return np.nan, np.nan
+        if len(vals) == 1:
+            return vals[0], vals[0]
+        return min(vals), max(vals)
+    except Exception:
+        return np.nan, np.nan
+
+
+def add_v210_trader_decision(df: pd.DataFrame, chase_pct: float = 7.0) -> pd.DataFrame:
+    """v2.10: one-table trader decision layer.
+
+    This layer does not replace all old columns. It reads them and compresses them
+    into one practical answer:
+    - Would I buy now?
+    - If not, what price/condition am I waiting for?
+    - Where is the stop?
+    - Where does it become too high to chase?
+    """
+    df = df.copy()
+
+    def calc(row: pd.Series) -> pd.Series:
+        code = _normalize_code(row.get("代號"))
+        name = str(row.get("名稱", code))
+        px = _price_or_nan(row.get("盤中現價"))
+        prev = _price_or_nan(row.get("昨收"))
+        open_px = _price_or_nan(row.get("開盤"))
+        day_high = _price_or_nan(row.get("最高"))
+        day_low = _price_or_nan(row.get("最低"))
+        ai = _clean_number(row.get("AI總分"))
+        risk = _clean_number(row.get("風險分"))
+        strength = _clean_number(row.get("即時強度分"))
+        pct = _clean_number(row.get("盤中漲跌幅"))
+        vol_score = _clean_number(row.get("盤中量能分"))
+        fund_score = _clean_number(row.get("盤中資金分"))
+        left_score = _clean_number(row.get("左側低吸分"))
+        entry_score = _clean_number(row.get("即時入場分"))
+        limit_score = _clean_number(row.get("v29漲停前兆分", row.get("漲停前兆分")))
+        speed1 = _clean_number(row.get("1分漲速%", row.get("刷新漲速%")))
+        speed3 = _clean_number(row.get("3分漲速%"))
+        pullback = _to_float(row.get("記憶回檔幅度%", row.get("回檔幅度%")), default=np.nan)
+        ai_source = str(row.get("AI來源", ""))
+        v29_signal = str(row.get("AI即時入場訊號", ""))
+
+        if math.isnan(px) or px <= 0:
+            return pd.Series({
+                "交易員訊號": "⚪ 無報價",
+                "我會不會買": "不判斷",
+                "v210優先級": 9,
+                "v210決策分": 0.0,
+                "第一買點": "-",
+                "現在位置": "無報價",
+                "左側試單價": "-",
+                "防守停損": "-",
+                "右側加碼價": "-",
+                "追價上限": "-",
+                "我會怎麼做": "等下一次報價刷新。",
+                "不能買原因": "盤中報價不足",
+                "還缺什麼確認": "需要先有現價、漲跌幅、量能。",
+                "交易型態": "無資料",
+            })
+
+        zone_lo, zone_hi = _price_range_from_text(row.get("左側試單區", row.get("左側低吸區")))
+        if math.isnan(zone_lo) or zone_lo <= 0:
+            candidates = [x for x in [day_low, prev, open_px, px * 0.985] if not math.isnan(x) and x > 0]
+            base = min(candidates) if candidates else px * 0.985
+            zone_lo = _round_tick(base)
+            zone_hi = _round_tick(min(px, base * 1.006))
+            if zone_hi < zone_lo:
+                zone_lo, zone_hi = zone_hi, zone_lo
+
+        stop = _price_or_nan(row.get("左側停損價", row.get("防守停損價", row.get("停損參考"))))
+        if math.isnan(stop) or stop <= 0:
+            stop = _round_tick(zone_lo * 0.99)
+        confirm = _price_or_nan(row.get("右側加碼價", row.get("右側確認價", row.get("觸發價"))))
+        if math.isnan(confirm) or confirm <= 0:
+            base_high = day_high if not math.isnan(day_high) and day_high > 0 else px
+            confirm = _round_tick(max(px * 1.006, base_high * 1.001))
+        cap = _price_or_nan(row.get("AI追價上限", row.get("追價上限")))
+        if math.isnan(cap) or cap <= 0:
+            cap = _round_tick(max(zone_hi * 1.018, confirm * 1.01, px * 1.018))
+
+        zone_mid = (zone_lo + zone_hi) / 2 if zone_lo > 0 and zone_hi > 0 else px
+        dist_to_zone = (px - zone_hi) / px * 100 if px > 0 else np.nan
+        stop_dist = (px - stop) / px * 100 if px > 0 and stop > 0 else np.nan
+        near_left_zone = (zone_lo * 0.998 <= px <= zone_hi * 1.006) or (not math.isnan(dist_to_zone) and -0.3 <= dist_to_zone <= 0.9)
+        under_cap = px <= cap * 1.001
+        too_hot = pct >= chase_pct or px > cap * 1.004 or speed1 >= 2.8
+        stop_tight = not math.isnan(stop_dist) and 0.3 <= stop_dist <= 2.2
+        holding_support = True
+        if not math.isnan(day_low) and day_low > 0:
+            holding_support = px >= max(day_low * 1.003, stop * 1.002)
+        money_in = (fund_score >= 55) or (vol_score >= 60 and strength >= 55) or (speed3 > 0.4 and limit_score >= 55)
+        pullback_ok = (not math.isnan(pullback) and 0.4 <= pullback <= 4.0) or near_left_zone
+        market_pool_discount = 4 if ai_source == "市場池估分" else 0
+
+        decision_score = (
+            min(100, left_score) * 0.28
+            + min(100, fund_score) * 0.24
+            + min(100, entry_score) * 0.20
+            + min(100, limit_score) * 0.14
+            + min(100, ai) * 0.10
+            - min(100, risk) * 0.16
+        ) - market_pool_discount
+        if near_left_zone:
+            decision_score += 8
+        if stop_tight:
+            decision_score += 8
+        if too_hot:
+            decision_score -= 25
+        if not holding_support:
+            decision_score -= 15
+        decision_score = round(max(0.0, min(100.0, decision_score)), 1)
+
+        if code in {"3441", "3362", "3105", "6223"}:
+            trade_type = "強攻股：重點看急拉回檔是否守住、量能是否縮後再放大"
+        elif code in {"2382", "2313", "2330", "2379", "4938"}:
+            trade_type = "資金股：重點看回測支撐、量能延續，不用追極短線急拉"
+        else:
+            trade_type = "動能股：先看資金分，再看位置與停損距離"
+
+        missing = []
+        if not money_in:
+            missing.append("資金/量能還不夠明確")
+        if not near_left_zone:
+            missing.append("價格還沒回到低風險試單區")
+        if not stop_tight:
+            missing.append("停損距離不夠漂亮")
+        if not holding_support:
+            missing.append("支撐尚未守穩")
+        if too_hot:
+            missing.append("短線已過熱")
+        if risk >= 42:
+            missing.append("風險分偏高")
+        if not missing:
+            missing_text = "條件大致同步，重點是只小量，不重倉。"
+        else:
+            missing_text = "；".join(missing[:4])
+
+        if risk >= 48 or strength < 30 or pct <= -2.5 or not holding_support:
+            signal = "⚫ 不買，結構不穩"
+            can_buy = "不可買"
+            priority = 8
+            action = f"不接刀；等重新站回 {_fmt_price(confirm)} 且量能回來。"
+            reason = "支撐/強度/風險其中一項不合格。"
+            first_buy = "不成立"
+            pos = "轉弱或結構不穩"
+        elif too_hot:
+            signal = "🔴 已錯過，不追"
+            can_buy = "不可買"
+            priority = 7
+            action = f"不追；等回測 { _fmt_price(zone_lo) }～{ _fmt_price(zone_hi) }，或尾盤重新確認。"
+            reason = "離左側區太遠或漲速過快，追高容易買在尖端。"
+            first_buy = "已錯過"
+            pos = "過熱區"
+        elif near_left_zone and money_in and stop_tight and risk < 42 and decision_score >= 58:
+            signal = "✅ 左側可小量試單"
+            can_buy = "可小量"
+            priority = 1
+            action = f"只用小量在 { _fmt_price(zone_lo) }～{ _fmt_price(zone_hi) } 試單；跌破 { _fmt_price(stop) } 立刻退出；站穩 { _fmt_price(confirm) } 才看加碼。"
+            reason = "資金、位置、停損距離較同步，符合左側試單條件。"
+            first_buy = f"{_fmt_price(zone_lo)}～{_fmt_price(zone_hi)}"
+            pos = "左側低風險區"
+        elif money_in and limit_score >= 62 and pct < chase_pct and under_cap:
+            signal = "👀 前兆出現，等低吸"
+            can_buy = "先不買"
+            priority = 2
+            action = f"放進雷達，不追現價；等回到 { _fmt_price(zone_lo) }～{ _fmt_price(zone_hi) } 且不破 { _fmt_price(stop) }。"
+            reason = "有資金/漲停前兆，但第一買點還沒出現。"
+            first_buy = f"等 {_fmt_price(zone_lo)}～{_fmt_price(zone_hi)}"
+            pos = "前兆區，還不是買點"
+        elif px >= confirm and under_cap and money_in and risk < 42:
+            signal = "🟢 右側確認，只能加碼"
+            can_buy = "空手不追"
+            priority = 3
+            action = f"這不是第一買點；有底倉才考慮加碼，空手等回測 { _fmt_price(zone_lo) }～{ _fmt_price(zone_hi) }。"
+            reason = "已經右側確認，勝率來自底倉優勢，不適合空手追。"
+            first_buy = "非第一買點"
+            pos = "右側確認區"
+        elif left_score >= 52 or v29_signal in {"🟡 等左側回測", "⚪ 觀察"}:
+            signal = "🟡 等左側回測"
+            can_buy = "等待"
+            priority = 4
+            action = f"等價格靠近 { _fmt_price(zone_lo) }～{ _fmt_price(zone_hi) }，且量縮不破，再評估小試。"
+            reason = "還沒到漂亮位置，現在買容易卡中間。"
+            first_buy = f"{_fmt_price(zone_lo)}～{_fmt_price(zone_hi)}"
+            pos = "等待區"
+        else:
+            signal = "⚪ 觀察，不急"
+            can_buy = "不急"
+            priority = 5
+            action = "沒有同時出現資金、位置、停損優勢；先等下一輪。"
+            reason = "分數或條件尚未同步。"
+            first_buy = "尚未出現"
+            pos = "普通觀察區"
+
+        return pd.Series({
+            "交易員訊號": signal,
+            "我會不會買": can_buy,
+            "v210優先級": priority,
+            "v210決策分": decision_score,
+            "第一買點": first_buy,
+            "現在位置": pos,
+            "左側試單價": f"{_fmt_price(zone_lo)}～{_fmt_price(zone_hi)}",
+            "防守停損": _fmt_price(stop),
+            "右側加碼價": _fmt_price(confirm),
+            "追價上限": _fmt_price(cap),
+            "我會怎麼做": action,
+            "不能買原因": reason,
+            "還缺什麼確認": missing_text,
+            "交易型態": trade_type,
+        })
+
+    try:
+        out = df.apply(calc, axis=1)
+        for col in out.columns:
+            df[col] = out[col]
+    except Exception as e:
+        # Never kill the whole app because the decision layer failed.
+        df["交易員訊號"] = "⚪ 決策層暫停"
+        df["我會不會買"] = "不判斷"
+        df["v210優先級"] = 9
+        df["v210決策分"] = 0.0
+        df["第一買點"] = "-"
+        df["現在位置"] = "-"
+        df["左側試單價"] = "-"
+        df["防守停損"] = "-"
+        df["右側加碼價"] = "-"
+        df["追價上限"] = "-"
+        df["我會怎麼做"] = f"決策層防呆啟動：{type(e).__name__}"
+        df["不能買原因"] = "決策層錯誤已攔截，主表不當機。"
+        df["還缺什麼確認"] = "請檢查資料欄位。"
+        df["交易型態"] = "防呆"
+    return df
+
+
 def clear_intraday_memory() -> None:
     try:
         if MEMORY_PATH.exists():
@@ -2227,8 +2492,8 @@ def clear_intraday_memory() -> None:
 
 # ---------- UI ----------
 
-st.title("⚡ 盤中即時看盤 v2.9.2 左側預判 AI 引擎｜穩定防呆版")
-st.caption("把判斷核心改成：資金是否提前進來、回檔是否守住、停損距離是否夠短、是否真的可以左側小量試單。右側突破只當加碼點，不再當第一買點。")
+st.title("🧠 盤中即時看盤 v2.10 交易員決策中控台｜穩定重構版")
+st.caption("這版把畫面重點收斂成一張決策表：先判斷我會不會買，再給左側試單區、停損、右側加碼、追價上限。不再讓一堆訊號互相打架。")
 
 refresh_default = _get_query_int("refresh", 30, 15, 120, 15)
 top_n_default = _get_query_int("top_n", 15, 5, 50, 5)
@@ -2337,6 +2602,7 @@ live_df = add_entry_signal_layer(live_df, chase_pct=chase_pct)
 live_df = apply_v28_entry_signal_overrides(live_df)
 live_df, intraday_memory_df = update_intraday_memory_features(live_df)
 live_df = add_v29_left_predictive_ai(live_df, chase_pct=chase_pct)
+live_df = add_v210_trader_decision(live_df, chase_pct=chase_pct)
 # v2.5.1: Keep the internal boolean, but show a readable text column instead of a non-clickable checkbox.
 if "手動加入" in live_df.columns:
     live_df["加入來源"] = np.where(live_df["手動加入"].astype(bool), "手動監控", "自動掃描")
@@ -2429,7 +2695,52 @@ if scan_mode == "盤中市場池掃描":
 
 st.divider()
 
-st.subheader("🎯 AI 即時入場決策 v2.9.1")
+st.subheader("🧠 v2.10 交易員決策中控台")
+st.caption("這張表是新的主畫面。先看『交易員訊號』和『我會不會買』：✅ 才能小量，👀/🟡 只等待，🟢 是右側加碼不是第一買點，🔴/⚫ 不碰。")
+
+try:
+    trader_counts = live_df.get("交易員訊號", pd.Series(dtype=str)).astype(str).value_counts()
+    t1, t2, t3, t4 = st.columns(4)
+    t1.metric("✅ 左側可小量", int(trader_counts.get("✅ 左側可小量試單", 0)))
+    t2.metric("👀 前兆等低吸", int(trader_counts.get("👀 前兆出現，等低吸", 0)))
+    t3.metric("🟡 等回測", int(trader_counts.get("🟡 等左側回測", 0)))
+    t4.metric("🔴/⚫ 不買", int(trader_counts.get("🔴 已錯過，不追", 0) + trader_counts.get("⚫ 不買，結構不穩", 0)))
+except Exception:
+    pass
+
+trader_cols = [
+    "代號", "名稱", "市場", "產業", "交易員訊號", "我會不會買", "v210決策分", "第一買點", "現在位置",
+    "盤中現價", "左側試單價", "防守停損", "右側加碼價", "追價上限", "我會怎麼做", "還缺什麼確認", "不能買原因",
+    "盤中漲跌幅", "1分漲速%", "3分漲速%", "記憶回檔幅度%", "盤中資金分", "左側低吸分", "即時入場分", "v29漲停前兆分", "AI總分", "風險分", "交易型態", "資料來源", "AI來源", "報價時間"
+]
+trader_cols = [c for c in trader_cols if c in live_df.columns]
+trader_show = live_df[live_df["交易員訊號"].isin([
+    "✅ 左側可小量試單", "👀 前兆出現，等低吸", "🟡 等左側回測", "🟢 右側確認，只能加碼"
+])].copy()
+trader_show = trader_show.sort_values(["v210優先級", "v210決策分", "盤中資金分"], ascending=[True, False, False])
+if trader_show.empty:
+    st.info("目前 v2.10 沒有給出可小量試單。這代表不是系統沒訊號，而是資金、位置、停損距離尚未同時成立。")
+else:
+    st.dataframe(trader_show[trader_cols].head(top_n), use_container_width=True, hide_index=True)
+
+focus_trader = live_df[live_df["代號"].astype(str).str.zfill(4).isin(FOCUS_CODES)].copy()
+if not focus_trader.empty:
+    focus_trader["焦點排序"] = focus_trader["代號"].astype(str).str.zfill(4).map({"3441": 1, "2382": 2, "2313": 3}).fillna(9)
+    focus_trader = focus_trader.sort_values(["焦點排序"])
+    with st.expander("🎯 聯一光 / 廣達 / 華通：我現在會不會買", expanded=True):
+        st.dataframe(focus_trader[trader_cols], use_container_width=True, hide_index=True)
+
+with st.expander("🔴 v2.10 不買 / 已錯過 / 結構不穩", expanded=False):
+    no_buy = live_df[live_df["交易員訊號"].isin(["🔴 已錯過，不追", "⚫ 不買，結構不穩", "⚪ 觀察，不急", "⚪ 無報價"])].copy()
+    no_buy = no_buy.sort_values(["v210優先級", "盤中漲跌幅"], ascending=[True, False])
+    if no_buy.empty:
+        st.caption("目前沒有明確不買名單。")
+    else:
+        st.dataframe(no_buy[trader_cols].head(top_n), use_container_width=True, hide_index=True)
+
+st.divider()
+
+st.subheader("🎯 AI 即時入場決策 v2.9 / 舊版細節")
 st.caption("這區才是新版核心：先判斷能不能左側小量試單。✅ 左側可小量試單 = 價格靠近支撐、資金進來、停損距離短；🟢 右側突破只當加碼點，不當第一買點。")
 
 v29_cols = [
