@@ -3244,8 +3244,414 @@ def _v212_style_signal(v: Any) -> str:
     return ""
 
 
-st.title("🔄 盤中即時看盤 v2.12.1 訊號生命週期引擎｜報價與欄位防呆版")
-st.caption("這版把舊頁面重複區塊收斂成：目前決策、生命週期、焦點股、進階診斷。主表只回答：現在會不會買、買點在哪、停損在哪、下一步等什麼。")
+
+
+# ---------- v2.13 / v2.14 Permanent Journal + Auto Weight Engine ----------
+
+V213_SIGNAL_JOURNAL_PATH = DATA_DIR / "v213_signal_journal.csv"
+V214_WEIGHT_PROFILE_PATH = DATA_DIR / "v214_weight_profile.json"
+
+
+def _v213_today() -> str:
+    return now_taipei().strftime("%Y-%m-%d")
+
+
+def _v213_now_str() -> str:
+    return now_taipei().strftime("%H:%M:%S")
+
+
+def _v213_scalar(value: Any) -> Any:
+    """Return a CSV-safe scalar so Pandas assignment never crashes."""
+    try:
+        if isinstance(value, pd.Series):
+            if value.empty:
+                return ""
+            value = value.iloc[0]
+        if isinstance(value, (list, tuple, set)):
+            return " → ".join([_safe_text(x) for x in value])
+        if isinstance(value, dict):
+            return json.dumps(value, ensure_ascii=False)
+        if value is None:
+            return ""
+        if isinstance(value, float) and math.isnan(value):
+            return ""
+        if isinstance(value, (np.integer,)):
+            return int(value)
+        if isinstance(value, (np.floating,)):
+            v = float(value)
+            return "" if math.isnan(v) else v
+        return value
+    except Exception:
+        return _safe_text(value, "")
+
+
+def _v213_load_journal() -> pd.DataFrame:
+    if V213_SIGNAL_JOURNAL_PATH.exists():
+        try:
+            df = pd.read_csv(V213_SIGNAL_JOURNAL_PATH, dtype={"代號": str})
+            if "代號" in df.columns:
+                df["代號"] = df["代號"].astype(str).str.zfill(4)
+            return df
+        except Exception:
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+
+def _v213_save_journal(df: pd.DataFrame) -> None:
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        if df is None:
+            df = pd.DataFrame()
+        df = df.copy()
+        if "代號" in df.columns:
+            df["代號"] = df["代號"].astype(str).str.zfill(4)
+        df.to_csv(V213_SIGNAL_JOURNAL_PATH, index=False, encoding="utf-8-sig")
+    except Exception:
+        pass
+
+
+def clear_v213_signal_journal() -> None:
+    try:
+        if V213_SIGNAL_JOURNAL_PATH.exists():
+            V213_SIGNAL_JOURNAL_PATH.unlink()
+    except Exception:
+        pass
+
+
+def _v213_success_label(current_ret: float, high_ret: float, drawdown: float, stage: str) -> str:
+    if "取消" in stage or "跌破" in stage or drawdown <= -2.0:
+        return "❌ 失敗 / 破防"
+    if high_ret >= 2.0 and drawdown > -1.5:
+        return "✅ 有效 / 最高報酬達標"
+    if current_ret >= 1.0 and drawdown > -1.2:
+        return "✅ 有效 / 目前仍正"
+    if high_ret >= 1.0 and current_ret < 0.2:
+        return "⚠️ 衝高回落"
+    if "錯過" in stage or "不追" in stage:
+        return "🟡 避開追高"
+    return "⏳ 追蹤中"
+
+
+def _v213_classify_trade_type(row: pd.Series) -> str:
+    code = _safe_text(row.get("代號"), "").zfill(4)
+    pct = _clean_number(row.get("盤中漲跌幅"))
+    limit_score = _clean_number(row.get("v29漲停前兆分") or row.get("漲停前兆分"))
+    name = _safe_text(row.get("名稱"), "")
+    if code in {"3441", "3362"} or pct >= 6 or limit_score >= 70:
+        return "小型強攻 / 漲停前兆"
+    if code in {"2382", "2313", "2330"}:
+        return "中大型資金股"
+    if "ETF" in name or code.startswith("00"):
+        return "ETF / 市場動能"
+    return _safe_text(row.get("交易型態"), "一般候選")
+
+
+def update_v213_signal_journal(lifecycle_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    v2.13: One row per stock per day, stored in data/v213_signal_journal.csv.
+    This is a robust local journal. On Streamlit Cloud it persists during the app runtime;
+    true cross-redeploy permanence still needs GitHub/DB write-back.
+    """
+    today = _v213_today()
+    now_s = _v213_now_str()
+    log_df = _v213_load_journal()
+    if log_df is None or log_df.empty:
+        log_df = pd.DataFrame()
+    else:
+        log_df = log_df.loc[:, ~log_df.columns.duplicated()].copy()
+        if "代號" in log_df.columns:
+            log_df["代號"] = log_df["代號"].astype(str).str.zfill(4)
+
+    if lifecycle_df is None or lifecycle_df.empty or "代號" not in lifecycle_df.columns:
+        return log_df
+
+    rows = lifecycle_df.copy()
+    rows["代號"] = rows["代號"].astype(str).str.zfill(4)
+
+    # Do not journal rows without any quote/decision information.
+    if "盤中現價" in rows.columns:
+        rows = rows[pd.to_numeric(rows["盤中現價"], errors="coerce").notna()].copy()
+    if rows.empty:
+        return log_df
+
+    # Existing index by date-code.
+    if "日期" not in log_df.columns:
+        log_df["日期"] = ""
+    if "代號" not in log_df.columns:
+        log_df["代號"] = ""
+
+    for _, row in rows.iterrows():
+        code = _safe_text(row.get("代號"), "").zfill(4)
+        if not code or code == "0000":
+            continue
+        stage = _safe_text(row.get("v212生命週期狀態"), "⚪ 候選觀察")
+        decision = _safe_text(row.get("v212目前決策"), "等待")
+        signal = _safe_text(row.get("交易員訊號"), stage)
+        px = _clean_number(row.get("盤中現價"))
+        if px <= 0:
+            continue
+
+        mask = (log_df.get("日期", pd.Series(dtype=str)).astype(str) == today) & (log_df.get("代號", pd.Series(dtype=str)).astype(str).str.zfill(4) == code)
+        match_idx = list(log_df.index[mask]) if len(log_df) else []
+
+        if match_idx:
+            idx = match_idx[-1]
+            first_price = _clean_number(log_df.at[idx, "首次價格"] if "首次價格" in log_df.columns else px) or px
+            high_ret_old = _clean_number(log_df.at[idx, "最高報酬%"] if "最高報酬%" in log_df.columns else 0)
+            drawdown_old = _clean_number(log_df.at[idx, "最大回撤%"] if "最大回撤%" in log_df.columns else 0)
+            prev_stage = _safe_text(log_df.at[idx, "目前狀態"] if "目前狀態" in log_df.columns else "")
+            prev_hist = _safe_text(log_df.at[idx, "狀態歷程"] if "狀態歷程" in log_df.columns else "")
+            change_count = int(_clean_number(log_df.at[idx, "狀態變更次數"] if "狀態變更次數" in log_df.columns else 0))
+        else:
+            idx = len(log_df)
+            first_price = px
+            high_ret_old = 0.0
+            drawdown_old = 0.0
+            prev_stage = ""
+            prev_hist = ""
+            change_count = 0
+            # Create a blank row first so .at can address it safely.
+            log_df.loc[idx, "日期"] = today
+            log_df.loc[idx, "代號"] = code
+            log_df.loc[idx, "首次時間"] = now_s
+            log_df.loc[idx, "首次價格"] = round(px, 4)
+
+        current_ret = (px - first_price) / first_price * 100 if first_price > 0 else 0.0
+        high_ret = max(high_ret_old, current_ret)
+        drawdown = min(drawdown_old, current_ret)
+        if stage != prev_stage:
+            change_count += 1
+            hist_piece = f"{now_s} {stage}"
+            hist = hist_piece if not prev_hist else f"{prev_hist} → {hist_piece}"
+        else:
+            hist = prev_hist or f"{now_s} {stage}"
+
+        stop = _clean_number(row.get("防守停損"))
+        hit_stop = bool(stop > 0 and px <= stop)
+        near_limit = bool(_clean_number(row.get("盤中漲跌幅")) >= 8.5 or _clean_number(row.get("漲停距離%")) <= 1.5)
+        result = _v213_success_label(current_ret, high_ret, drawdown, stage)
+
+        updates = {
+            "日期": today,
+            "代號": code,
+            "名稱": row.get("名稱", ""),
+            "市場": row.get("市場", ""),
+            "產業": row.get("產業", ""),
+            "股票型態": _v213_classify_trade_type(row),
+            "目前狀態": stage,
+            "目前決策": decision,
+            "交易員訊號": signal,
+            "第一買點": row.get("第一買點", ""),
+            "防守停損": row.get("防守停損", ""),
+            "右側加碼價": row.get("右側加碼價", ""),
+            "追價上限": row.get("追價上限", ""),
+            "首次價格": round(first_price, 4),
+            "目前價格": round(px, 4),
+            "目前報酬%": round(current_ret, 3),
+            "最高報酬%": round(high_ret, 3),
+            "最大回撤%": round(drawdown, 3),
+            "是否碰停損": "是" if hit_stop else "否",
+            "是否接近漲停": "是" if near_limit else "否",
+            "結果分類": result,
+            "左側低吸分": round(_clean_number(row.get("左側低吸分")), 2),
+            "盤中資金分": round(_clean_number(row.get("盤中資金分")), 2),
+            "漲停前兆分": round(_clean_number(row.get("v29漲停前兆分") or row.get("漲停前兆分")), 2),
+            "即時入場分": round(_clean_number(row.get("即時入場分")), 2),
+            "AI總分": round(_clean_number(row.get("AI總分")), 2),
+            "風險分": round(_clean_number(row.get("風險分")), 2),
+            "盤中漲跌幅": round(_clean_number(row.get("盤中漲跌幅")), 3),
+            "刷新漲速%": round(_clean_number(row.get("刷新漲速%")), 3),
+            "狀態歷程": hist[-900:],
+            "狀態變更次數": change_count,
+            "最新時間": now_s,
+            "下一步": row.get("v212下一步", ""),
+            "不能買原因": row.get("不能買原因", ""),
+        }
+        if "首次時間" not in log_df.columns or not _safe_text(log_df.at[idx, "首次時間"] if idx in log_df.index and "首次時間" in log_df.columns else ""):
+            updates["首次時間"] = now_s
+        for col, val in updates.items():
+            log_df.at[idx, col] = _v213_scalar(val)
+
+    # Keep file compact: current day plus recent prior records if any.
+    try:
+        if "日期" in log_df.columns:
+            log_df = log_df.sort_values(["日期", "最新時間"], ascending=[False, False]).head(2000).copy()
+    except Exception:
+        pass
+    _v213_save_journal(log_df)
+    return log_df
+
+
+def build_v214_weight_profile(journal_df: pd.DataFrame) -> Dict[str, Any]:
+    """v2.14 conservative auto-weight suggestions based on the local journal."""
+    base = {
+        "sample_size": 0,
+        "success_rate": 0.0,
+        "left_weight": 1.0,
+        "money_weight": 1.0,
+        "limit_weight": 1.0,
+        "ai_weight": 1.0,
+        "risk_penalty": 1.0,
+        "confidence": "資料不足，使用保守權重",
+        "note": "至少累積 30 筆以上才會明顯調整。",
+    }
+    try:
+        if journal_df is None or journal_df.empty:
+            return base
+        df = journal_df.copy()
+        for col in ["左側低吸分", "盤中資金分", "漲停前兆分", "AI總分", "風險分", "最高報酬%", "最大回撤%", "目前報酬%"]:
+            if col not in df.columns:
+                df[col] = 0
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+        df["成功"] = ((df["最高報酬%"] >= 1.2) & (df["最大回撤%"] > -1.8)) | (df["目前報酬%"] >= 0.8)
+        df["失敗"] = (df["最大回撤%"] <= -2.0) | (df.get("是否碰停損", "否").astype(str) == "是")
+        actionable = df[df.get("目前狀態", "").astype(str).str.contains("可試單|到價確認|前兆|候選升溫", regex=True, na=False)].copy()
+        if actionable.empty:
+            actionable = df.copy()
+        n = int(len(actionable))
+        sr = float(actionable["成功"].mean() * 100) if n else 0.0
+        profile = base.copy()
+        profile["sample_size"] = n
+        profile["success_rate"] = round(sr, 1)
+        if n < 30:
+            profile["confidence"] = f"樣本 {n} 筆，先保守，不大幅調權"
+            return profile
+
+        def factor_for(col: str, inverse: bool = False) -> float:
+            med = actionable[col].median()
+            hi = actionable[actionable[col] >= med]
+            lo = actionable[actionable[col] < med]
+            if len(hi) < 8 or len(lo) < 8:
+                return 1.0
+            hi_sr = hi["成功"].mean()
+            lo_sr = lo["成功"].mean()
+            diff = (hi_sr - lo_sr)
+            if inverse:
+                diff = -diff
+            # Conservative cap to avoid overfitting.
+            if diff > 0.18:
+                return 1.15
+            if diff > 0.08:
+                return 1.08
+            if diff < -0.18:
+                return 0.85
+            if diff < -0.08:
+                return 0.92
+            return 1.0
+
+        profile["left_weight"] = factor_for("左側低吸分")
+        profile["money_weight"] = factor_for("盤中資金分")
+        profile["limit_weight"] = factor_for("漲停前兆分")
+        profile["ai_weight"] = factor_for("AI總分")
+        profile["risk_penalty"] = factor_for("風險分", inverse=True)
+        profile["confidence"] = f"樣本 {n} 筆，已啟用保守自動調權"
+        profile["note"] = "權重上限僅 ±15%，避免少量樣本過度擬合。"
+        try:
+            V214_WEIGHT_PROFILE_PATH.write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+        return profile
+    except Exception as e:
+        p = base.copy()
+        p["note"] = f"調權防呆：{type(e).__name__}"
+        return p
+
+
+def apply_v214_auto_weights(lifecycle_df: pd.DataFrame, profile: Dict[str, Any]) -> pd.DataFrame:
+    df = lifecycle_df.copy()
+    if df.empty:
+        return df
+    lw = float(profile.get("left_weight", 1.0) or 1.0)
+    mw = float(profile.get("money_weight", 1.0) or 1.0)
+    limw = float(profile.get("limit_weight", 1.0) or 1.0)
+    aiw = float(profile.get("ai_weight", 1.0) or 1.0)
+    rpw = float(profile.get("risk_penalty", 1.0) or 1.0)
+
+    left = pd.to_numeric(df.get("左側低吸分", 0), errors="coerce").fillna(0)
+    money = pd.to_numeric(df.get("盤中資金分", 0), errors="coerce").fillna(0)
+    limit_s = pd.to_numeric(df.get("v29漲停前兆分", df.get("漲停前兆分", 0)), errors="coerce").fillna(0)
+    ai = pd.to_numeric(df.get("AI總分", 0), errors="coerce").fillna(0)
+    risk = pd.to_numeric(df.get("風險分", 0), errors="coerce").fillna(0)
+    stop = pd.to_numeric(df.get("防守停損", 0), errors="coerce").fillna(0)
+    px = pd.to_numeric(df.get("盤中現價", 0), errors="coerce").fillna(0)
+    stop_dist = np.where((px > 0) & (stop > 0), (px - stop) / px * 100, np.nan)
+
+    score = (
+        left * 0.34 * lw +
+        money * 0.30 * mw +
+        limit_s * 0.18 * limw +
+        ai * 0.18 * aiw -
+        risk * 0.22 * rpw
+    )
+    score = np.clip(score, 0, 100)
+    df["v214調權後分"] = np.round(score, 1)
+    df["v214停損距離%"] = np.round(stop_dist, 2)
+
+    stage = df.get("v212生命週期狀態", pd.Series(index=df.index, dtype=str)).astype(str)
+    no_buy_reason = df.get("不能買原因", pd.Series(index=df.index, dtype=str)).astype(str)
+    pct = pd.to_numeric(df.get("盤中漲跌幅", 0), errors="coerce").fillna(0)
+
+    conditions_high = (
+        stage.str.contains("可試單|到價確認", regex=True, na=False) &
+        (df["v214調權後分"] >= 72) &
+        (risk < 45) &
+        ((df["v214停損距離%"].isna()) | (df["v214停損距離%"] <= 1.8)) &
+        (pct < 7.0)
+    )
+    conditions_try = (
+        stage.str.contains("可試單|到價確認", regex=True, na=False) &
+        (df["v214調權後分"] >= 62) &
+        (risk < 55) &
+        (pct < 8.0)
+    )
+    wait = stage.str.contains("前兆|到價等確認|候選升溫", regex=True, na=False)
+    no_chase = stage.str.contains("錯過|不買|取消|跌破", regex=True, na=False) | no_buy_reason.str.contains("追|風險|破", regex=True, na=False)
+
+    df["v214信心閘門"] = "⚪ 觀察"
+    df.loc[wait, "v214信心閘門"] = "👀 等確認"
+    df.loc[conditions_try, "v214信心閘門"] = "🟡 嚴格小量"
+    df.loc[conditions_high, "v214信心閘門"] = "🟢 高信心小量"
+    df.loc[no_chase, "v214信心閘門"] = "🔴 不可無腦"
+
+    df["v214下一步"] = np.select(
+        [conditions_high, conditions_try, wait, no_chase],
+        [
+            "只允許小量；防守價跌破立即退。不是無腦重倉。",
+            "可小量但還要看下一輪是否守住；不加碼。",
+            "還缺止跌/量能/位置確認；不要提前買。",
+            "不追、不攤平；等重新形成左側結構。",
+        ],
+        default="觀察，不做交易。",
+    )
+    # Use v2.14 score as secondary sorting only; lifecycle priority remains first.
+    old_sort = pd.to_numeric(df.get("v212排序分", 0), errors="coerce").fillna(0)
+    df["v214優先排序分"] = old_sort * 0.45 + df["v214調權後分"] * 0.55
+    df["v212排序分"] = df["v214優先排序分"]
+    return df
+
+
+def build_v213_journal_summary(journal_df: pd.DataFrame) -> Dict[str, Any]:
+    out = {"total": 0, "today": 0, "success_rate": 0.0, "false_break": 0, "high_conf": 0}
+    try:
+        if journal_df is None or journal_df.empty:
+            return out
+        df = journal_df.copy()
+        today = _v213_today()
+        out["total"] = int(len(df))
+        out["today"] = int((df.get("日期", "").astype(str) == today).sum()) if "日期" in df.columns else 0
+        result = df.get("結果分類", pd.Series(dtype=str)).astype(str)
+        actionable = df.get("目前狀態", pd.Series(dtype=str)).astype(str).str.contains("可試單|到價確認|前兆|候選升溫", regex=True, na=False)
+        denom = max(int(actionable.sum()), 1)
+        out["success_rate"] = round(float(result[actionable].str.contains("✅", regex=False).sum()) / denom * 100, 1)
+        out["false_break"] = int(result.str.contains("衝高回落|失敗", regex=True).sum())
+        out["high_conf"] = int(df.get("目前狀態", pd.Series(dtype=str)).astype(str).str.contains("可試單|到價確認", regex=True, na=False).sum())
+    except Exception:
+        pass
+    return out
+
+
+st.title("🧠 盤中即時看盤 v2.14 永久紀錄 + 自動調權｜生命週期決策版")
+st.caption("v2.13 開始把每檔訊號寫入本機 CSV 紀錄；v2.14 依照訊號後表現保守調整分數權重。這不是無腦買入系統，而是高信心小量 + 嚴格停損的決策閘門。")
 
 refresh_default = _get_query_int("refresh", 30, 15, 120, 15)
 top_n_default = _get_query_int("top_n", 15, 5, 50, 5)
@@ -3396,6 +3802,12 @@ lifecycle_df = _ensure_columns(lifecycle_df, {
     "v212下一步": "等待下一輪刷新。",
 })
 
+# v2.13 / v2.14: write a robust journal, then use it for conservative auto-weighting.
+v213_signal_journal_df = update_v213_signal_journal(lifecycle_df)
+v214_weight_profile = build_v214_weight_profile(v213_signal_journal_df)
+lifecycle_df = apply_v214_auto_weights(lifecycle_df, v214_weight_profile)
+v213_summary = build_v213_journal_summary(v213_signal_journal_df)
+
 if "手動加入" in lifecycle_df.columns:
     lifecycle_df["加入來源"] = np.where(lifecycle_df["手動加入"].astype(bool), "手動監控", "自動掃描")
 else:
@@ -3423,25 +3835,35 @@ m5, m6, m7, m8 = st.columns(4)
 m5.metric("盤中最強漲幅", f"{best_pct:.2f}%")
 m6.metric("最高刷新漲速", f"{max_speed:.2f}%")
 m7.metric("爆衝雷達", surge_count)
-m8.metric("學習追蹤筆數", int(v211_summary.get("total", 0)))
+m8.metric("永久紀錄 / 今日", f"{int(v213_summary.get("total", 0))} / {int(v213_summary.get("today", 0))}")
 
 st.divider()
 
+# v2.14 compact weight-learning status.
+st.subheader("🧠 v2.14 自動調權狀態")
+wm1, wm2, wm3, wm4 = st.columns(4)
+wm1.metric("樣本數", int(v214_weight_profile.get("sample_size", 0)))
+wm2.metric("學習勝率", f"{float(v214_weight_profile.get('success_rate', 0)):.1f}%")
+wm3.metric("左側/資金權重", f"{float(v214_weight_profile.get('left_weight', 1)):.2f} / {float(v214_weight_profile.get('money_weight', 1)):.2f}")
+wm4.metric("前兆/風險權重", f"{float(v214_weight_profile.get('limit_weight', 1)):.2f} / {float(v214_weight_profile.get('risk_penalty', 1)):.2f}")
+st.caption(_safe_text(v214_weight_profile.get("confidence"), "") + "｜" + _safe_text(v214_weight_profile.get("note"), ""))
+st.warning("我不會把它寫成『無腦買入』按鈕。最高只會顯示 🟢 高信心小量，仍必須照防守停損執行；沒有任何盤中模型能保證漲停或保證獲利。")
+
 # 1) Primary current decision table.
-st.subheader("🧭 v2.12.1 交易員目前決策")
-st.caption("主表只保留會影響進場的欄位：訊號、生命週期、第一買點、現價、停損、下一步。看到 ✅ 才是可小量試單；⏳ 是到價但還要止跌確認。")
+st.subheader("🧭 v2.14 交易員目前決策")
+st.caption("主表只保留會影響進場的欄位。v2.14 新增『信心閘門』與『調權後分』；🟢 高信心小量仍不是無腦重倉，只是更嚴格的試單條件。")
 main_cols = _cols_exist(lifecycle_df, [
-    "代號", "名稱", "市場", "產業", "交易型態", "v212生命週期狀態", "v212目前決策", "我會不會買",
-    "第一買點", "盤中現價", "v212位置判斷", "防守停損", "右側加碼價", "追價上限",
-    "盤中漲跌幅", "刷新漲速%", "左側低吸分", "盤中資金分", "v29漲停前兆分", "v210決策分",
-    "v212下一步", "還缺什麼確認", "不能買原因", "資料來源", "AI來源", "報價時間"
+    "代號", "名稱", "市場", "產業", "交易型態", "v214信心閘門", "v212生命週期狀態", "v212目前決策", "我會不會買",
+    "第一買點", "盤中現價", "v214停損距離%", "v212位置判斷", "防守停損", "右側加碼價", "追價上限",
+    "盤中漲跌幅", "刷新漲速%", "v214調權後分", "左側低吸分", "盤中資金分", "v29漲停前兆分", "v210決策分",
+    "v214下一步", "v212下一步", "還缺什麼確認", "不能買原因", "資料來源", "AI來源", "報價時間"
 ])
 main_df = _safe_sort(filtered, ["v212優先級", "v212排序分", "即時強度分"], ascending=[True, False, False]).head(top_n)
 if main_df.empty:
     st.info("目前沒有符合篩選條件的股票。可以降低左側篩選的 AI / 即時強度門檻，或等待下一輪刷新。")
 else:
     try:
-        st.dataframe(main_df[main_cols].style.applymap(_v212_style_signal, subset=["v212生命週期狀態"]), use_container_width=True, hide_index=True)
+        st.dataframe(main_df[main_cols].style.applymap(_v212_style_signal, subset=["v214信心閘門", "v212生命週期狀態"]), use_container_width=True, hide_index=True)
     except Exception:
         st.dataframe(main_df[main_cols], use_container_width=True, hide_index=True)
 
@@ -3451,8 +3873,8 @@ focus_df = lifecycle_df[lifecycle_df["代號"].astype(str).str.zfill(4).isin(FOC
 focus_df["焦點排序"] = focus_df["代號"].map({"3441": 1, "2382": 2, "2313": 3}).fillna(9)
 focus_df = focus_df.sort_values("焦點排序")
 focus_cols = _cols_exist(focus_df, [
-    "代號", "名稱", "v212生命週期狀態", "v212目前決策", "第一買點", "盤中現價", "防守停損", "右側加碼價", "追價上限",
-    "v212位置判斷", "盤中漲跌幅", "刷新漲速%", "回檔幅度%", "左側低吸分", "盤中資金分", "v29漲停前兆分", "v212下一步", "還缺什麼確認", "報價時間"
+    "代號", "名稱", "v214信心閘門", "v212生命週期狀態", "v212目前決策", "第一買點", "盤中現價", "v214停損距離%", "防守停損", "右側加碼價", "追價上限",
+    "v212位置判斷", "盤中漲跌幅", "刷新漲速%", "回檔幅度%", "v214調權後分", "左側低吸分", "盤中資金分", "v29漲停前兆分", "v214下一步", "v212下一步", "還缺什麼確認", "報價時間"
 ])
 if focus_df.empty:
     st.warning("目前沒有抓到 3441 / 2382 / 2313 的報價。")
@@ -3472,6 +3894,20 @@ if life_df.empty:
     st.info("目前尚未累積生命週期追蹤資料。等待訊號出現後會開始記錄。")
 else:
     st.dataframe(life_df[life_cols], use_container_width=True, hide_index=True)
+
+st.subheader("🧾 v2.13 永久訊號紀錄")
+st.caption("這是本機 CSV 訊號日誌。Streamlit Cloud 重新部署可能清掉本機檔案；要真正跨部署永久保存，下一步需接 GitHub 寫回或資料庫。")
+journal_cols = _cols_exist(v213_signal_journal_df, [
+    "日期", "最新時間", "代號", "名稱", "股票型態", "目前狀態", "目前決策", "結果分類", "首次價格", "目前價格", "目前報酬%", "最高報酬%", "最大回撤%",
+    "左側低吸分", "盤中資金分", "漲停前兆分", "AI總分", "風險分", "狀態變更次數", "狀態歷程"
+])
+if v213_signal_journal_df.empty:
+    st.info("尚未累積 v2.13 訊號紀錄。")
+else:
+    show_journal = _safe_sort(v213_signal_journal_df, ["日期", "最新時間"], ascending=[False, False]).head(top_n * 2)
+    st.dataframe(show_journal[journal_cols], use_container_width=True, hide_index=True)
+    csv_bytes = v213_signal_journal_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+    st.download_button("下載 v2.13 永久訊號紀錄 CSV", csv_bytes, file_name=f"v213_signal_journal_{now_taipei().strftime('%Y%m%d')}.csv", mime="text/csv")
 
 # 4) Near limit / missed check only if relevant.
 if not v211_missed_limit_df.empty:
@@ -3513,4 +3949,4 @@ with st.expander("🧪 進階診斷 / 市場池 / 爆衝雷達 / 原始學習紀
         ])
         st.dataframe(lifecycle_df[all_cols], use_container_width=True, hide_index=True)
 
-st.caption("提醒：這是盤中快照與規則化風控系統，不是保證獲利或券商逐筆資料。v2.12 的目的，是把同一檔股票的訊號整理成單一生命週期狀態，避免同時出現可買/不買/錯過等矛盾訊號。")
+st.caption("提醒：這是盤中快照與規則化風控系統，不是保證獲利或券商逐筆資料。v2.13/2.14 的目的，是把訊號結果記錄下來並保守調權；最高信號仍只代表「小量試單 + 嚴格停損」，不是無腦重倉。")
