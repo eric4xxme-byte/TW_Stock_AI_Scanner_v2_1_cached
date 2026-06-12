@@ -83,7 +83,15 @@ def _to_float(value, default=np.nan):
         text = str(value).replace(",", "").strip()
         if text in {"", "-", "--", "nan", "None", "除權息"}:
             return default
-        return float(text)
+        try:
+            return float(text)
+        except Exception:
+            # Accept strings like "291～292", "約 291.5", "高", "中" without crashing.
+            m = re.search(r"-?\d+(?:\.\d+)?", text)
+            if m:
+                return float(m.group(0))
+            mapping = {"高": 75.0, "中": 50.0, "低": 25.0}
+            return mapping.get(text, default)
     except Exception:
         return default
 
@@ -93,6 +101,17 @@ def _clean_number(value: Any) -> float:
     if isinstance(v, float) and math.isnan(v):
         return 0.0
     return float(v)
+
+
+# v2.9.2 compatibility aliases.
+# Some earlier generated blocks referenced these names; keep them mapped to
+# the safe numeric parser so row.apply() never crashes on missing aliases.
+def _to_clean_number(value: Any) -> float:
+    return _clean_number(value)
+
+
+def _to__clean_number(value: Any) -> float:
+    return _clean_number(value)
 
 
 def _normalize_code(value: Any) -> str:
@@ -2208,7 +2227,7 @@ def clear_intraday_memory() -> None:
 
 # ---------- UI ----------
 
-st.title("⚡ 盤中即時看盤 v2.9.1 左側預判 AI 引擎｜穩定修正版")
+st.title("⚡ 盤中即時看盤 v2.9.2 左側預判 AI 引擎｜穩定防呆版")
 st.caption("把判斷核心改成：資金是否提前進來、回檔是否守住、停損距離是否夠短、是否真的可以左側小量試單。右側突破只當加碼點，不再當第一買點。")
 
 refresh_default = _get_query_int("refresh", 30, 15, 120, 15)
