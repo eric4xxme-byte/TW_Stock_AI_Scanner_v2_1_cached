@@ -386,32 +386,57 @@ def build_symbols(df: pd.DataFrame) -> List[str]:
 
 @st.cache_data(ttl=10, show_spinner=False)
 def fetch_twse_mis_quotes(symbols: List[str]) -> pd.DataFrame:
-    rows = []
+    """Fetch quotes from TWSE MIS with more defensive retries.
+
+    v2.12.1 fix:
+    - Seed cookies by visiting the MIS page first.
+    - Use smaller batches because large ex_ch requests sometimes return empty on Streamlit Cloud.
+    - Retry once with even smaller batches before giving up.
+    - Never crash the page when MIS temporarily returns malformed payloads.
+    """
+    dedup_symbols = list(dict.fromkeys([str(s).strip() for s in symbols if str(s).strip()]))
+    if not dedup_symbols:
+        return pd.DataFrame()
+
     headers = {
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
         "Referer": "https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw",
+        "Connection": "keep-alive",
     }
 
-    dedup_symbols = list(dict.fromkeys(symbols))
-    batch_size = 24
-
-    for i in range(0, len(dedup_symbols), batch_size):
-        batch = dedup_symbols[i : i + batch_size]
-        params = {
-            "ex_ch": "|".join(batch),
-            "json": "1",
-            "delay": "0",
-            "_": str(int(time.time() * 1000)),
-        }
+    def _request_rows(batch_size: int, pause: float) -> List[Dict[str, Any]]:
+        session = requests.Session()
+        session.headers.update(headers)
+        rows: List[Dict[str, Any]] = []
         try:
-            r = requests.get(QUOTE_URL, params=params, headers=headers, timeout=8)
-            r.encoding = "utf-8"
-            payload = r.json()
-            msg_array = payload.get("msgArray", []) or []
-            rows.extend(msg_array)
+            session.get("https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw", timeout=6)
         except Exception:
-            continue
-        time.sleep(0.08)
+            pass
+        for i in range(0, len(dedup_symbols), batch_size):
+            batch = dedup_symbols[i : i + batch_size]
+            params = {
+                "ex_ch": "|".join(batch),
+                "json": "1",
+                "delay": "0",
+                "_": str(int(time.time() * 1000)),
+            }
+            try:
+                r = session.get(QUOTE_URL, params=params, timeout=9)
+                r.encoding = "utf-8"
+                payload = r.json()
+                msg_array = payload.get("msgArray", []) if isinstance(payload, dict) else []
+                if isinstance(msg_array, list):
+                    rows.extend([x for x in msg_array if isinstance(x, dict)])
+            except Exception:
+                pass
+            time.sleep(pause)
+        return rows
+
+    rows = _request_rows(batch_size=18, pause=0.12)
+    if not rows:
+        rows = _request_rows(batch_size=8, pause=0.18)
 
     if not rows:
         return pd.DataFrame()
@@ -419,6 +444,8 @@ def fetch_twse_mis_quotes(symbols: List[str]) -> pd.DataFrame:
     out = []
     for q in rows:
         code = str(q.get("c", "")).zfill(4)
+        if not re.match(r"^\d{4}$", code):
+            continue
         name = q.get("n", "")
         ex = q.get("ex", "")
         market = "上市" if ex == "tse" else "上櫃" if ex == "otc" else ex
@@ -470,6 +497,7 @@ def fetch_twse_mis_quotes(symbols: List[str]) -> pd.DataFrame:
     if quotes.empty:
         return quotes
 
+    quotes["盤中現價"] = pd.to_numeric(quotes.get("盤中現價"), errors="coerce")
     quotes["has_price"] = quotes["盤中現價"].notna().astype(int)
     quotes = quotes.sort_values(["代號", "has_price"], ascending=[True, False])
     quotes = quotes.drop_duplicates("代號", keep="first").drop(columns=["has_price"])
@@ -3176,6 +3204,32 @@ def build_v212_lifecycle(live_df: pd.DataFrame, learning_log: pd.DataFrame) -> p
 def _cols_exist(df: pd.DataFrame, cols: List[str]) -> List[str]:
     return [c for c in cols if c in df.columns]
 
+def _ensure_columns(df: pd.DataFrame, defaults: Dict[str, Any]) -> pd.DataFrame:
+    """Add missing columns before display/sort so UI never crashes on sparse data."""
+    if df is None:
+        return pd.DataFrame(defaults)
+    df = df.copy()
+    for col, default in defaults.items():
+        if col not in df.columns:
+            df[col] = default
+    return df
+
+
+def _safe_sort(df: pd.DataFrame, by: List[str], ascending=True) -> pd.DataFrame:
+    """Sort only after missing sort columns are created with neutral defaults."""
+    if df is None or df.empty:
+        return df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    df = df.copy()
+    for col in by:
+        if col not in df.columns:
+            if "優先級" in col:
+                df[col] = 99
+            elif "時間" in col:
+                df[col] = ""
+            else:
+                df[col] = 0
+    return df.sort_values(by, ascending=ascending)
+
 
 def _v212_style_signal(v: Any) -> str:
     text = str(v)
@@ -3190,7 +3244,7 @@ def _v212_style_signal(v: Any) -> str:
     return ""
 
 
-st.title("🔄 盤中即時看盤 v2.12 訊號生命週期引擎｜精簡決策版")
+st.title("🔄 盤中即時看盤 v2.12.1 訊號生命週期引擎｜報價與欄位防呆版")
 st.caption("這版把舊頁面重複區塊收斂成：目前決策、生命週期、焦點股、進階診斷。主表只回答：現在會不會買、買點在哪、停損在哪、下一步等什麼。")
 
 refresh_default = _get_query_int("refresh", 30, 15, 120, 15)
@@ -3276,10 +3330,32 @@ with st.spinner("建立盤中掃描清單並抓取即時報價..."):
     symbols = build_symbols(universe_df)
     quotes_df = fetch_twse_mis_quotes(symbols)
 
+# v2.12.1: temporary quote outages should not make the whole page show 0/0.
+# Prefer fresh MIS quotes; otherwise reuse the last in-session quote snapshot, then fall back to data/intraday_snapshot.csv if present.
+quote_source_note = "MIS即時報價"
+if quotes_df.empty or "盤中現價" not in quotes_df.columns or pd.to_numeric(quotes_df.get("盤中現價"), errors="coerce").notna().sum() == 0:
+    fallback_df = st.session_state.get("v212_last_good_quotes_df")
+    if isinstance(fallback_df, pd.DataFrame) and not fallback_df.empty:
+        quotes_df = fallback_df.copy()
+        quote_source_note = "沿用上一輪成功報價"
+    else:
+        snap_path = DATA_DIR / "intraday_snapshot.csv"
+        if snap_path.exists():
+            try:
+                snap = pd.read_csv(snap_path)
+                if "代號" in snap.columns:
+                    snap["代號"] = snap["代號"].astype(str).str.replace(".0", "", regex=False).str.zfill(4)
+                    quotes_df = snap.copy()
+                    quote_source_note = "沿用 GitHub 盤中快照"
+            except Exception:
+                pass
+else:
+    st.session_state["v212_last_good_quotes_df"] = quotes_df.copy()
+
 merged = universe_df.copy()
 if quotes_df.empty:
     st.warning("目前沒有抓到盤中報價。可能是非交易時間、TWSE MIS 暫時無回應，或網路限制。")
-    for col in ["盤中現價", "盤中漲跌幅", "盤中成交量", "報價時間", "報價市場"]:
+    for col in ["盤中現價", "盤中漲跌幅", "盤中成交量", "報價時間", "報價市場", "昨收", "開盤", "最高", "最低"]:
         merged[col] = np.nan
 else:
     merged = merged.merge(quotes_df, on="代號", how="left")
@@ -3287,6 +3363,8 @@ else:
         merged["名稱"] = merged["即時名稱"].fillna(merged["名稱"])
     if "報價市場" in merged.columns:
         merged["市場"] = merged["報價市場"].fillna(merged["市場"])
+    if quote_source_note != "MIS即時報價":
+        st.info(f"本輪 MIS 即時報價沒有成功，已{quote_source_note}，避免決策表歸零；等下一輪即時報價恢復會自動更新。")
 
 # Core calculation chain retained, but UI no longer repeats every old section.
 live_df = compute_live_strength(merged, attack_threshold, watch_threshold, weak_drop, chase_pct)
@@ -3306,6 +3384,17 @@ v211_learning_log_df = update_v211_signal_learning(live_df)
 v211_missed_limit_df = build_v211_missed_limit_report(live_df, v211_learning_log_df)
 v211_summary = build_v211_learning_summary(v211_learning_log_df)
 lifecycle_df = build_v212_lifecycle(live_df, v211_learning_log_df)
+lifecycle_df = _ensure_columns(lifecycle_df, {
+    "v212優先級": 99,
+    "v212排序分": 0.0,
+    "即時強度分": 0.0,
+    "最新時間": "",
+    "學習狀態": "",
+    "v212生命週期狀態": "⚪ 候選觀察",
+    "v212目前決策": "等待",
+    "v212位置判斷": "未判斷",
+    "v212下一步": "等待下一輪刷新。",
+})
 
 if "手動加入" in lifecycle_df.columns:
     lifecycle_df["加入來源"] = np.where(lifecycle_df["手動加入"].astype(bool), "手動監控", "自動掃描")
@@ -3339,7 +3428,7 @@ m8.metric("學習追蹤筆數", int(v211_summary.get("total", 0)))
 st.divider()
 
 # 1) Primary current decision table.
-st.subheader("🧭 v2.12 交易員目前決策")
+st.subheader("🧭 v2.12.1 交易員目前決策")
 st.caption("主表只保留會影響進場的欄位：訊號、生命週期、第一買點、現價、停損、下一步。看到 ✅ 才是可小量試單；⏳ 是到價但還要止跌確認。")
 main_cols = _cols_exist(lifecycle_df, [
     "代號", "名稱", "市場", "產業", "交易型態", "v212生命週期狀態", "v212目前決策", "我會不會買",
@@ -3347,7 +3436,7 @@ main_cols = _cols_exist(lifecycle_df, [
     "盤中漲跌幅", "刷新漲速%", "左側低吸分", "盤中資金分", "v29漲停前兆分", "v210決策分",
     "v212下一步", "還缺什麼確認", "不能買原因", "資料來源", "AI來源", "報價時間"
 ])
-main_df = filtered.sort_values(["v212優先級", "v212排序分", "即時強度分"], ascending=[True, False, False]).head(top_n)
+main_df = _safe_sort(filtered, ["v212優先級", "v212排序分", "即時強度分"], ascending=[True, False, False]).head(top_n)
 if main_df.empty:
     st.info("目前沒有符合篩選條件的股票。可以降低左側篩選的 AI / 即時強度門檻，或等待下一輪刷新。")
 else:
@@ -3378,7 +3467,7 @@ life_cols = _cols_exist(lifecycle_df, [
     "學習狀態", "訊號歷程", "訊號變更次數", "錯誤歸因", "v212下一步", "最新時間"
 ])
 life_df = lifecycle_df[~lifecycle_df.get("學習狀態", pd.Series(index=lifecycle_df.index, dtype=str)).isna()].copy()
-life_df = life_df.sort_values(["v212優先級", "最新時間"], ascending=[True, False]).head(top_n)
+life_df = _safe_sort(life_df, ["v212優先級", "最新時間"], ascending=[True, False]).head(top_n)
 if life_df.empty:
     st.info("目前尚未累積生命週期追蹤資料。等待訊號出現後會開始記錄。")
 else:
@@ -3407,7 +3496,7 @@ with st.expander("🧪 進階診斷 / 市場池 / 爆衝雷達 / 原始學習紀
         market_cols = _cols_exist(lifecycle_df, [
             "代號", "名稱", "市場", "產業", "v212生命週期狀態", "盤中現價", "盤中漲跌幅", "刷新漲速%", "即時強度分", "AI總分", "風險分", "市場池排名", "資料來源", "AI來源", "報價時間"
         ])
-        st.dataframe(filtered.sort_values(["v212優先級", "即時強度分"], ascending=[True, False])[market_cols].head(top_n), use_container_width=True, hide_index=True)
+        st.dataframe(_safe_sort(filtered, ["v212優先級", "即時強度分"], ascending=[True, False])[market_cols].head(top_n), use_container_width=True, hide_index=True)
     with tabs[2]:
         if v211_learning_log_df.empty:
             st.info("尚無學習紀錄。")
