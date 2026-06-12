@@ -1,2 +1,3 @@
 ﻿updated_at,session_mode,market_env_score,market_label,night_risk_score,night_label,twii_pct,twoii_pct,nq_pct,sox_pct,breadth_up_ratio,breadth_avg_pct
 2026-06-12T17:59:10.006115+08:00,night_context,77.2,🟢 大盤偏多,33.1,🟢 夜盤偏多,2.3629032669238543,0.6461975197967882,0.5328400885804224,7.905452046629077,0.7667,-0.013
+2026-06-12T18:31:19.669935+08:00,night_context,87.2,🟢 大盤偏多,34.6,🟢 夜盤偏多,2.3629032669238543,0.6461975197967882,0.4344173970591979,7.905452046629077,0.7667,-0.013
