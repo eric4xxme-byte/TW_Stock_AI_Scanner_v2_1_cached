@@ -1,0 +1,10 @@
+{
+  "updated_at": "2026-06-12T09:58:31+08:00",
+  "mode": "intraday_snapshot",
+  "source": "TWSE MIS getStockInfo.jsp",
+  "candidate_count": 30,
+  "quote_count": 30,
+  "quote_success_count": 2,
+  "quote_failed_count": 0,
+  "note": "盤中快照只更新現價、漲跌幅與成交量；法人與融資融券仍沿用盤後資料。"
+}
