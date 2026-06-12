@@ -776,7 +776,7 @@ def append_manual_codes(df: pd.DataFrame, codes: List[str], manual_ai_score: int
 
 # ---------- UI ----------
 
-st.title("⚡ 盤中即時看盤 v2.5 市場池掃描")
+st.title("⚡ 盤中即時看盤 v2.5.1 市場池掃描")
 st.caption("盤後 AI 候選 + 盤中市場池掃描 + 前台即時報價 + 入場時機輔助判斷。市場池不是完整盤後AI，只是盤中動能擴大掃描。")
 
 refresh_default = _get_query_int("refresh", 30, 15, 120, 15)
@@ -811,7 +811,7 @@ with st.sidebar:
         "額外監控代碼",
         value=extra_codes_default,
         placeholder="例如：3441, 6285, 2313",
-        help="手動加入股一定會固定顯示。若它不在今日AI候選/市場池內，也會抓盤中報價。",
+        help="手動加入股一定會固定顯示。表格中的加入來源只顯示文字，不需要點選。",
     )
     manual_codes = parse_extra_codes(extra_codes_text)
     if manual_codes:
@@ -873,6 +873,11 @@ else:
 
 live_df = compute_live_strength(merged, attack_threshold, watch_threshold, weak_drop, chase_pct)
 live_df = add_entry_timing(live_df, chase_pct=chase_pct)
+# v2.5.1: Keep the internal boolean, but show a readable text column instead of a non-clickable checkbox.
+if "手動加入" in live_df.columns:
+    live_df["加入來源"] = np.where(live_df["手動加入"].astype(bool), "手動監控", "自動掃描")
+else:
+    live_df["加入來源"] = "自動掃描"
 filtered = live_df[(live_df["AI總分"] >= min_ai) & (live_df["即時強度分"] >= min_strength)].copy()
 
 quote_ok = int(live_df["盤中現價"].notna().sum())
@@ -922,9 +927,9 @@ st.divider()
 manual_live_df = live_df[live_df.get("手動加入", False).astype(bool)].copy()
 if manual_codes:
     st.subheader("手動監控股票即時狀態")
-    st.caption("這區固定顯示你左側輸入的股票；即使它沒有進入今日AI候選或市場池前段，也會顯示。")
+    st.caption("這區固定顯示你左側輸入的股票；即使它沒有進入今日AI候選或市場池前段，也會顯示。表格不需要勾選，加入來源會顯示為「手動監控」。")
     manual_cols = [
-        "代號", "名稱", "市場", "產業", "資料來源", "AI來源", "市場池排名", "盤中標籤", "盤中入場判斷", "入場型態",
+        "代號", "名稱", "市場", "產業", "資料來源", "AI來源", "加入來源", "市場池排名", "盤中標籤", "盤中入場判斷", "入場型態",
         "觸發價", "停損參考", "壓力參考", "AI總分", "風險分", "即時強度分",
         "盤中現價", "盤中漲跌幅", "盤中成交量", "報價時間", "即時判斷", "建議動作"
     ]
@@ -962,7 +967,7 @@ entry_df["入場排序"] = entry_df["盤中入場判斷"].map(entry_priority).fi
 entry_df = entry_df.sort_values(["入場排序", "即時強度分"], ascending=[True, False])
 
 common_cols = [
-    "代號", "名稱", "市場", "產業", "資料來源", "AI來源", "市場池排名", "手動加入", "盤中標籤", "盤中入場判斷", "入場型態",
+    "代號", "名稱", "市場", "產業", "資料來源", "AI來源", "加入來源", "市場池排名", "盤中標籤", "盤中入場判斷", "入場型態",
     "觸發價", "停損參考", "壓力參考", "AI總分", "風險分", "即時強度分",
     "盤中現價", "盤中漲跌幅", "盤中成交量", "報價時間", "即時判斷", "不追原因", "建議動作"
 ]
