@@ -27,7 +27,7 @@ META_FILE = DATA_DIR / "latest_meta.json"
 INTRADAY_FILE = DATA_DIR / "intraday_snapshot.csv"
 INTRADAY_META_FILE = DATA_DIR / "intraday_meta.json"
 
-st.set_page_config(page_title="台股 AI Scanner v2.4", page_icon="📈", layout="wide")
+st.set_page_config(page_title="台股 AI Scanner v2.4.2", page_icon="📈", layout="wide")
 
 
 @st.cache_data(ttl=60)
@@ -73,6 +73,81 @@ def format_pct(x):
         return f"{float(x):.2f}%"
     except Exception:
         return "-"
+
+
+def calculate_intraday_strength(rank_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    新增盤中強度分。
+    這個分數只用於盤中輔助排序，不覆蓋原本盤後 AI 總分。
+
+    權重：
+    - AI總分 50%
+    - 盤中漲跌幅分數 25%
+    - 盤中成交量相對分數 15%
+    - 風險分扣分 10%
+    """
+    if rank_df.empty:
+        return rank_df
+
+    df = rank_df.copy()
+
+    for col in ["AI總分", "風險分", "盤中漲跌幅", "盤中成交量"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if "盤中漲跌幅" not in df.columns:
+        df["盤中強度分"] = pd.NA
+        df["盤中判斷"] = "尚無盤中快照"
+        return df
+
+    has_quote = df["盤中漲跌幅"].notna()
+
+    # 漲跌幅分數：-5% 以下接近 0，0% 約 50，+10% 以上接近 100。
+    pct = df["盤中漲跌幅"].fillna(0)
+    pct_score = pct.apply(
+        lambda x: max(0, min(100, 50 + (x / 10 * 50))) if x >= 0
+        else max(0, min(100, 50 + (x / 5 * 50)))
+    )
+
+    # 成交量相對分數：只在本次候選股裡做百分位排名，避免絕對量不同市場不可比。
+    if "盤中成交量" in df.columns and df["盤中成交量"].notna().any():
+        vol = df["盤中成交量"].fillna(0)
+        if (vol > 0).sum() >= 2:
+            vol_score = vol.rank(pct=True) * 100
+        else:
+            vol_score = pd.Series(50, index=df.index)
+    else:
+        vol_score = pd.Series(50, index=df.index)
+
+    ai = df.get("AI總分", pd.Series(0, index=df.index)).fillna(0)
+    risk = df.get("風險分", pd.Series(0, index=df.index)).fillna(0)
+
+    strength = ai * 0.50 + pct_score * 0.25 + vol_score * 0.15 - risk * 0.10
+    strength = strength.clip(lower=0, upper=100).round(1)
+
+    df["盤中強度分"] = strength.where(has_quote, pd.NA)
+
+    def _judge(row: pd.Series) -> str:
+        if pd.isna(row.get("盤中漲跌幅", pd.NA)):
+            return "尚無盤中快照"
+        pct_val = float(row.get("盤中漲跌幅", 0) or 0)
+        strength_val = float(row.get("盤中強度分", 0) or 0)
+        ai_val = float(row.get("AI總分", 0) or 0)
+        risk_val = float(row.get("風險分", 0) or 0)
+        if pct_val >= 7 and risk_val >= 40:
+            return "急漲高風險：分數可參考，但不建議追高。"
+        if strength_val >= 75 and ai_val >= 65 and risk_val <= 40:
+            return "盤中強勢：AI分數與盤中動能同步，列入當日重點觀察。"
+        if strength_val >= 65 and pct_val > 0:
+            return "盤中偏強：可觀察是否放量站穩，不宜急追。"
+        if ai_val >= 70 and pct_val < 0:
+            return "AI分數高但盤中轉弱：等待支撐或尾盤確認。"
+        if pct_val <= -3:
+            return "盤中轉弱：先觀察，不急著進場。"
+        return "盤中中性：仍以盤後AI分數與風險控管為主。"
+
+    df["盤中判斷"] = df.apply(_judge, axis=1)
+    return df
 
 
 def judgement_text(row: pd.Series) -> str:
@@ -167,7 +242,7 @@ def merge_intraday(rank_df: pd.DataFrame, risk_df: pd.DataFrame, intraday_df: pd
 rank_df, risk_df, price_df, intraday_df, meta, intraday_meta = load_outputs()
 rank_df, risk_df = merge_intraday(rank_df, risk_df, intraday_df)
 
-st.title("📈 台股 AI Scanner v2.4 Cached + Intraday")
+st.title("📈 台股 AI Scanner v2.4.2 Cached + Intraday Strength")
 st.caption("盤後資料由 GitHub Actions 產生；盤中快照只更新現價、漲跌幅與成交量，不代表法人與融資同步更新。")
 
 st.sidebar.header("資料狀態")
@@ -207,6 +282,10 @@ for c in ["AI總分", "風險分", "技術分", "籌碼分", "盤中漲跌幅", 
     if c in risk_df.columns:
         risk_df[c] = pd.to_numeric(risk_df[c], errors="coerce")
 
+rank_df = calculate_intraday_strength(rank_df)
+if not risk_df.empty:
+    risk_df = calculate_intraday_strength(risk_df)
+
 filtered = rank_df[(rank_df["AI總分"] >= min_score) & (rank_df["風險分"] <= max_risk)].copy()
 if only_intraday and "盤中現價" in filtered.columns:
     filtered = filtered[filtered["盤中現價"].notna()].copy()
@@ -226,6 +305,12 @@ if "盤中漲跌幅" in rank_df.columns and rank_df["盤中漲跌幅"].notna().a
     q3.metric("盤中平均漲跌幅", format_pct(intraday_valid["盤中漲跌幅"].mean()))
     q4.metric("盤中上漲檔數", int((intraday_valid["盤中漲跌幅"] > 0).sum()))
 
+    if "盤中強度分" in intraday_valid.columns and intraday_valid["盤中強度分"].notna().any():
+        s1, s2, s3 = st.columns(3)
+        s1.metric("盤中最高強度分", round(float(intraday_valid["盤中強度分"].max()), 1))
+        s2.metric("盤中強勢檔數", int((intraday_valid["盤中強度分"] >= 65).sum()))
+        s3.metric("AI高分且盤中上漲", int(((intraday_valid["AI總分"] >= 65) & (intraday_valid["盤中漲跌幅"] > 0)).sum()))
+
 st.divider()
 st.subheader("今日 AI 前 5 名")
 top_df = filtered.head(5)
@@ -237,17 +322,30 @@ for col, (_, row) in zip(cols, top_df.iterrows()):
         st.metric("AI總分", row.get("AI總分", 0))
         if pd.notna(row.get("盤中現價", None)):
             st.write(f"盤中現價：{row.get('盤中現價')} ｜ 漲跌幅：{format_pct(row.get('盤中漲跌幅'))}")
+            if pd.notna(row.get("盤中強度分", None)):
+                st.write(f"盤中強度分：{row.get('盤中強度分')}")
         st.write(f"技術分：{row.get('技術分', 0)}")
         st.write(f"籌碼分：{row.get('籌碼分', 0)}")
         st.write(f"風險分：{row.get('風險分', 0)}")
         st.info(str(row.get("AI進場判斷", "")))
+
+if "盤中強度分" in rank_df.columns and rank_df["盤中強度分"].notna().any():
+    st.divider()
+    st.subheader("盤中 AI 強勢股")
+    st.caption("盤中強度分 = AI總分 + 盤中漲跌幅 + 盤中成交量相對排名 - 風險扣分。這是盤中輔助排序，不取代完整盤後AI分數。")
+    strength_cols = [
+        "代號", "名稱", "市場", "產業", "AI總分", "盤中強度分", "盤中現價", "盤中漲跌幅", "盤中成交量", "風險分", "盤中判斷"
+    ]
+    strength_cols = [c for c in strength_cols if c in rank_df.columns]
+    strength_rank = rank_df[rank_df["盤中強度分"].notna()].sort_values("盤中強度分", ascending=False)
+    st.dataframe(strength_rank[strength_cols].head(15), use_container_width=True, hide_index=True)
 
 if "盤中漲跌幅" in rank_df.columns and rank_df["盤中漲跌幅"].notna().any():
     st.divider()
     st.subheader("盤中快照排行")
     st.caption("只反映最近一次 intraday workflow 抓到的盤中價格，不會改變盤後 AI 評分。")
     intraday_show_cols = [
-        "代號", "名稱", "市場", "產業", "AI總分", "風險分", "盤中現價", "盤中漲跌", "盤中漲跌幅", "盤中成交量", "盤中時間", "盤中狀態"
+        "代號", "名稱", "市場", "產業", "AI總分", "盤中強度分", "風險分", "盤中現價", "盤中漲跌", "盤中漲跌幅", "盤中成交量", "盤中時間", "盤中狀態", "盤中判斷"
     ]
     intraday_show_cols = [c for c in intraday_show_cols if c in rank_df.columns]
     intraday_rank = rank_df[rank_df["盤中漲跌幅"].notna()].sort_values("盤中漲跌幅", ascending=False)
@@ -257,7 +355,7 @@ st.divider()
 st.subheader("完整 AI 排名表")
 show_cols = [
     "日期", "代號", "名稱", "市場", "產業", "收盤價", "盤中現價", "盤中漲跌幅", "盤中成交量",
-    "AI總分", "技術分", "籌碼分", "風險分", "量比",
+    "AI總分", "盤中強度分", "技術分", "籌碼分", "風險分", "量比",
     "法人單日買賣超", "法人近3日買賣超", "融資變化", "融券變化", "籌碼狀態", "AI進場判斷",
     "停損參考", "壓力參考",
 ]
@@ -272,7 +370,7 @@ if risk_df.empty:
 else:
     risk_show = [
         "日期", "代號", "名稱", "市場", "產業", "收盤價", "盤中現價", "盤中漲跌幅",
-        "AI總分", "技術分", "籌碼分", "風險分", "量比",
+        "AI總分", "盤中強度分", "技術分", "籌碼分", "風險分", "量比",
         "法人單日買賣超", "法人近3日買賣超", "融資變化", "籌碼狀態", "技術風險", "籌碼風險", "AI進場判斷",
     ]
     risk_show = [c for c in risk_show if c in risk_df.columns]
@@ -300,6 +398,9 @@ if pd.notna(row.get("盤中現價", None)):
     p2.metric("盤中漲跌幅", format_pct(row.get("盤中漲跌幅")))
     p3.metric("盤中成交量", format_int(row.get("盤中成交量")))
     p4.metric("盤中時間", row.get("盤中時間", "-"))
+    if pd.notna(row.get("盤中強度分", None)):
+        st.metric("盤中強度分", row.get("盤中強度分", "-"))
+        st.info(str(row.get("盤中判斷", "")))
 
 st.markdown(f"## {row.get('名稱', selected_id)} {selected_id}")
 st.write(f"**產業：** {row.get('產業', '未知')}")
