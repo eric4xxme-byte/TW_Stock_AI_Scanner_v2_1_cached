@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-TW Stock AI Scanner v2.15.4｜Background learning sync
+TW Stock AI Scanner v2.16｜Background learning sync with session split
 
 Purpose:
-- Run from GitHub Actions without opening Streamlit.
+- Run from GitHub Actions without opening Streamlit, with intraday/post-close/night-session split.
 - Build intraday market pool from saved AI candidates + TWSE/TPEx value leaders + focus codes.
 - Fetch TWSE MIS intraday quotes.
 - Update data/v215_verified_signal_journal.csv as a durable GitHub-side journal.
@@ -42,6 +42,7 @@ LATEST_RANK_FILE = DATA_DIR / "latest_rank.csv"
 INTRADAY_SNAPSHOT_FILE = DATA_DIR / "intraday_snapshot.csv"
 JOURNAL_FILE = DATA_DIR / "v215_verified_signal_journal.csv"
 META_FILE = DATA_DIR / "v215_background_sync_meta.json"
+POST_CLOSE_FILE = DATA_DIR / "v216_post_close_verification.json"
 
 TAIPEI = timezone(timedelta(hours=8))
 MIS_URLS = [
@@ -78,13 +79,28 @@ def now_tw() -> datetime:
     return datetime.now(TAIPEI)
 
 
+def v216_session_mode(dt: datetime) -> str:
+    """Return the Taiwan market session bucket used by v2.16."""
+    if dt.weekday() >= 5:
+        return "weekend"
+    minutes = dt.hour * 60 + dt.minute
+    if 8 * 60 + 45 <= minutes <= 13 * 60 + 35:
+        return "intraday"
+    if 13 * 60 + 36 <= minutes <= 16 * 60 + 30:
+        return "post_close_verify"
+    if minutes >= 16 * 60 + 31 or minutes <= 5 * 60 + 10:
+        return "night_context"
+    if 5 * 60 + 11 <= minutes < 8 * 60 + 45:
+        return "pre_open"
+    return "off_hours"
+
+
 def in_taiwan_market_window(dt: datetime) -> bool:
     if dt.weekday() >= 5:
         return False
-    # Run a bit before open and after close so verification can happen.
-    start = dt.replace(hour=8, minute=50, second=0, microsecond=0)
-    end = dt.replace(hour=14, minute=20, second=0, microsecond=0)
-    return start <= dt <= end
+    # v2.16: journal learning runs only intraday and limited post-close verification,
+    # not all night. Night context is handled by background_market_context.py.
+    return v216_session_mode(dt) in {"intraday", "post_close_verify"}
 
 
 def normalize_code(v: Any) -> str:
@@ -630,9 +646,10 @@ def save_meta(meta: Dict[str, Any]) -> None:
 
 def main() -> int:
     dt = now_tw()
+    mode = v216_session_mode(dt)
     force = os.getenv("FORCE_RUN", "").strip() == "1"
     if not force and not in_taiwan_market_window(dt):
-        meta = {"updated_at": dt.isoformat(), "status": "skipped", "reason": "outside Taiwan market learning window"}
+        meta = {"updated_at": dt.isoformat(), "status": "skipped", "session_mode": mode, "reason": "outside v2.16 intraday/post-close learning window"}
         save_meta(meta)
         print(json.dumps(meta, ensure_ascii=False))
         return 0
@@ -669,6 +686,7 @@ def main() -> int:
     meta = {
         "updated_at": dt.isoformat(),
         "status": "ok",
+        "session_mode": mode,
         "pool_count": len(pool),
         "quote_raw_count": len(quotes),
         "live_count": int(len(live)),
@@ -676,6 +694,11 @@ def main() -> int:
         "sync": sync_result,
     }
     save_meta(meta)
+    try:
+        if mode == "post_close_verify":
+            POST_CLOSE_FILE.write_text(json.dumps({"updated_at": dt.isoformat(), "status": "ok", "session_mode": mode, "journal_count": int(len(journal)), "sync": sync_result}, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
     print(json.dumps(meta, ensure_ascii=False, indent=2))
     # Return non-zero only if quotes/journal succeeded but sync failed? We keep 0 to avoid noisy Actions failures.
     return 0
