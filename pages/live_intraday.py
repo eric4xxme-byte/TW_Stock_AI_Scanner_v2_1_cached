@@ -1,5 +1,5 @@
 # pages/live_intraday.py
-# v2.8 Live Intraday Limit-Up Precursor + Re-attack Entry Engine
+# v2.8.1 Live Intraday Limit-Up Precursor + Three-Zone Entry Engine
 # Purpose:
 # - Keep v2.4.x live AI candidate monitoring.
 # - Add a safer "market pool scan" mode: TWSE + TPEx turnover pool + live quotes.
@@ -1169,6 +1169,136 @@ def add_limitup_reattack_engine(df: pd.DataFrame, chase_pct: float = 7.0) -> pd.
     return df
 
 
+
+# ---------- v2.8.1 Three-zone entry price engine ----------
+
+def _price_zone_text(lo: float, hi: float) -> str:
+    if math.isnan(lo) or lo <= 0:
+        return "-"
+    if math.isnan(hi) or hi <= 0:
+        return _fmt_price(lo)
+    if abs(hi - lo) < 1e-9:
+        return _fmt_price(lo)
+    return f"{_fmt_price(lo)}～{_fmt_price(hi)}"
+
+
+def add_v281_three_zone_entry(df: pd.DataFrame) -> pd.DataFrame:
+    """v2.8.1: avoid the 'wait for confirmation then buy too high' problem.
+
+    Instead of showing only one trigger price, each stock gets:
+    - 左側低吸區: near support, only if it is holding and stop is tight.
+    - 右側確認價: safer confirmation, but not a blind chase.
+    - 追價上限: above this price, the system should say 'too high, wait pullback'.
+    """
+    df = df.copy()
+
+    def calc(row):
+        px = _to_float(row.get("盤中現價"))
+        pct = float(row.get("盤中漲跌幅", 0) or 0)
+        speed = float(row.get("刷新漲速%", 0) or 0)
+        vol_score = float(row.get("盤中量能分", 0) or 0)
+        vol_jump = float(row.get("量能跳升分", 0) or 0)
+        risk = float(row.get("風險分", 0) or 0)
+        precursor = float(row.get("漲停前兆分", 0) or 0)
+        state = _safe_text(row.get("回檔再攻狀態"), "")
+
+        support = _parse_price_text(row.get("回測支撐價"))
+        trigger2 = _parse_price_text(row.get("二次攻擊觸發價"))
+        trigger1 = _parse_price_text(row.get("觸發價"))
+        stop = _parse_price_text(row.get("防守停損價"))
+        if math.isnan(trigger2):
+            trigger2 = trigger1
+
+        if math.isnan(px) or px <= 0:
+            return pd.Series({
+                "左側低吸區": "-",
+                "右側確認價": "-",
+                "追價上限": "-",
+                "入場價位策略": "無報價，不動作",
+                "買高警示": "無報價",
+                "三段式進場建議": "無報價",
+            })
+
+        # If support/trigger is not available, build conservative references from current price.
+        if math.isnan(support) or support <= 0:
+            support = _round_down_tick(px * 0.992)
+        if math.isnan(trigger2) or trigger2 <= 0:
+            trigger2 = _round_up_tick(px * 1.003)
+        if math.isnan(stop) or stop <= 0:
+            stop = _round_down_tick(support * 0.992)
+
+        t = _tick_size(px)
+        # Left-side zone should be below the confirmation trigger. For 291 support / 292 trigger,
+        # this usually becomes 291.0~291.5, which is the practical entry zone the user expects.
+        left_lo = _round_down_tick(support)
+        left_hi_raw = min(trigger2 - t, support * 1.004)
+        if left_hi_raw < left_lo:
+            left_hi_raw = left_lo
+        left_hi = _round_down_tick(left_hi_raw)
+
+        confirm = _round_up_tick(trigger2)
+        chase_cap_raw = max(confirm + t, confirm * 1.003)
+        chase_cap = _round_up_tick(chase_cap_raw)
+
+        in_left_zone = bool(px >= left_lo * 0.998 and px <= max(left_hi, left_lo) * 1.002)
+        below_support = bool(px < left_lo * 0.998)
+        above_confirm = bool(px >= confirm)
+        above_cap = bool(px > chase_cap)
+        has_volume = bool(vol_score >= 50 or vol_jump >= 45)
+        holding = bool(speed >= -0.25 and not below_support)
+        safe_risk = bool(risk < 42)
+        too_hot = bool(pct >= 8.5 or above_cap)
+
+        left_zone = _price_zone_text(left_lo, left_hi)
+        confirm_txt = _fmt_price(confirm)
+        cap_txt = _fmt_price(chase_cap)
+
+        if too_hot:
+            strategy = "🔴 已高於合理追價區，不追；等回測低吸區或尾盤確認"
+            warning = f"高於追價上限 {cap_txt}，容易買高。"
+            suggestion = f"低吸：{left_zone}；確認：站穩 {confirm_txt}；高於 {cap_txt} 不追。"
+        elif in_left_zone and holding and has_volume and safe_risk and precursor >= 45:
+            strategy = "✅ 左側低吸可小量試單"
+            warning = "不是追價，是靠近支撐的小量試單；跌破防守價要退出。"
+            suggestion = f"低吸：{left_zone} 小量；站穩 {confirm_txt} 才加強；跌破 {_fmt_price(stop)} 退出；高於 {cap_txt} 不追。"
+        elif above_confirm and holding and has_volume and safe_risk:
+            strategy = "✅ 右側確認可小量試單"
+            warning = f"已過確認價，不能追過 {cap_txt}。"
+            suggestion = f"確認：{confirm_txt} 附近小量；追價上限 {cap_txt}；跌破 {_fmt_price(stop)} 退出。"
+        elif below_support:
+            strategy = "🟡 跌破支撐，先等止跌"
+            warning = "支撐沒守住，不能因為便宜就接。"
+            suggestion = f"先等重新站回 {left_lo}，再看 {confirm_txt} 是否能站穩。"
+        else:
+            strategy = "🟢 等低吸或等確認，不要卡在中間追"
+            warning = "目前不是最佳買點；中間價容易上不上、下不下。"
+            suggestion = f"低吸：{left_zone}；確認：站穩 {confirm_txt}；高於 {cap_txt} 不追。"
+
+        # Make the old single text field less misleading.
+        if state in {"🟢 等二次攻擊觸發", "🟡 回檔較深，等止跌", "👀 早期雷達", "🚀 爆衝早期可盯"}:
+            old_style = suggestion
+        elif state == "✅ 二次攻擊可小量試單":
+            old_style = suggestion
+        elif state == "🔴 接近漲停不追":
+            old_style = f"不追；等回測 {left_zone}，或站穩 {confirm_txt} 但不得高於 {cap_txt}。"
+        else:
+            old_style = suggestion if precursor >= 40 else _safe_text(row.get("建議進場區間"), suggestion)
+
+        return pd.Series({
+            "左側低吸區": left_zone,
+            "右側確認價": confirm_txt,
+            "追價上限": cap_txt,
+            "入場價位策略": strategy,
+            "買高警示": warning,
+            "三段式進場建議": suggestion,
+            "建議進場區間": old_style,
+        })
+
+    out = df.apply(calc, axis=1)
+    for col in out.columns:
+        df[col] = out[col]
+    return df
+
 def apply_v28_entry_signal_overrides(df: pd.DataFrame) -> pd.DataFrame:
     """Make the v2.8 entry signal more direct for limit-up precursor / re-attack cases."""
     df = df.copy()
@@ -1673,7 +1803,7 @@ def update_surge_radar(live_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFram
 # ---------- UI ----------
 
 st.title("⚡ 盤中即時看盤 v2.8 漲停前兆 + 回檔再攻入場引擎")
-st.caption("先抓漲停前兆，再判斷回檔後是否可能二次攻擊，最後給明確入場訊號與觸發價。")
+st.caption("先抓漲停前兆，再判斷回檔後是否可能二次攻擊，最後給出低吸區 / 確認價 / 追價上限，避免等確認後才買高。")
 
 refresh_default = _get_query_int("refresh", 30, 15, 120, 15)
 top_n_default = _get_query_int("top_n", 15, 5, 50, 5)
@@ -1774,6 +1904,7 @@ live_df = add_entry_timing(live_df, chase_pct=chase_pct)
 live_df, surge_df, surge_has_prev = update_surge_radar(live_df)
 live_df = add_decision_dashboard(live_df)
 live_df = add_limitup_reattack_engine(live_df, chase_pct=chase_pct)
+live_df = add_v281_three_zone_entry(live_df)
 live_df = add_entry_signal_layer(live_df, chase_pct=chase_pct)
 live_df = apply_v28_entry_signal_overrides(live_df)
 # v2.5.1: Keep the internal boolean, but show a readable text column instead of a non-clickable checkbox.
@@ -1866,10 +1997,10 @@ st.caption("先看這區：只有 ✅ 可小量試單 才代表系統認為已�
 
 entry_signal_cols = [
     "代號", "名稱", "市場", "產業", "v28核心追蹤", "入場訊號", "可否入場", "入場訊號分", "入場確認",
-    "盤中現價", "觸發價", "二次攻擊觸發價", "回測支撐價", "防守停損價", "停損參考", "壓力參考",
+    "盤中現價", "左側低吸區", "右側確認價", "追價上限", "觸發價", "二次攻擊觸發價", "回測支撐價", "防守停損價", "停損參考", "壓力參考",
     "盤中漲跌幅", "刷新漲速%", "回檔幅度%", "日內高點漲幅%", "盤中成交量",
     "AI總分", "風險分", "即時強度分", "爆衝分", "漲停前兆分", "漲停前兆狀態", "再攻機率", "回檔再攻狀態", "漲停雷達", "漲停距離%",
-    "建議進場區間", "入場條件檢查", "建議下單方式", "資料來源", "AI來源", "報價時間"
+    "入場價位策略", "三段式進場建議", "買高警示", "建議進場區間", "入場條件檢查", "建議下單方式", "資料來源", "AI來源", "報價時間"
 ]
 entry_signal_cols = [c for c in entry_signal_cols if c in live_df.columns]
 entry_signal_df = live_df[live_df["入場訊號"].isin(["✅ 可小量試單", "🟢 觸發中，等站穩", "🟢 等突破觸發", "🟢 等二次攻擊觸發", "👀 早期雷達", "🟡 等回測確認"])].copy()
@@ -1893,7 +2024,7 @@ st.subheader("🚀 漲停前兆雷達")
 st.caption("v2.8：這區不靠盤後 AI 擋股票，優先看短線漲速、量能跳升、日內高點、距離漲停與回檔再攻條件。")
 precursor_cols = [
     "代號", "名稱", "市場", "產業", "v28核心追蹤", "漲停前兆分", "漲停前兆狀態", "再攻機率", "回檔再攻狀態",
-    "盤中現價", "二次攻擊觸發價", "回測支撐價", "防守停損價", "建議進場區間",
+    "盤中現價", "左側低吸區", "右側確認價", "追價上限", "二次攻擊觸發價", "回測支撐價", "防守停損價", "入場價位策略", "三段式進場建議", "建議進場區間",
     "盤中漲跌幅", "刷新漲速%", "回檔幅度%", "日內高點漲幅%", "盤中成交量", "量能跳升分",
     "入場訊號", "可否入場", "回檔再攻判斷", "AI總分", "風險分", "資料來源", "AI來源", "報價時間"
 ]
@@ -1906,12 +2037,12 @@ else:
     st.dataframe(precursor_df[precursor_cols].head(top_n), use_container_width=True, hide_index=True)
 
 st.subheader("🎯 重點股回檔再攻分析：聯一光 / 廣達 / 華通")
-st.caption("這區固定顯示 3441、2382、2313：用來回答『急拉回檔後，是否可能再爆衝、該等多少價位』。看到 ✅ 才是可小量試單；看到 🟢/👀 都只是等觸發。")
+st.caption("這區固定顯示 3441、2382、2313：用來回答『急拉回檔後，是否可能再爆衝、該在低吸區還是確認價進場』。看到 ✅ 才是可小量試單；看到 🟢/👀 都只是等條件。")
 focus_df = live_df[live_df["代號"].astype(str).str.zfill(4).isin(FOCUS_CODES)].copy()
 focus_df["焦點排序"] = focus_df["代號"].map({"3441": 1, "2382": 2, "2313": 3}).fillna(9)
 focus_df = focus_df.sort_values(["焦點排序"])
 focus_cols = [
-    "代號", "名稱", "入場訊號", "可否入場", "盤中現價", "二次攻擊觸發價", "回測支撐價", "防守停損價", "建議進場區間",
+    "代號", "名稱", "入場訊號", "可否入場", "盤中現價", "左側低吸區", "右側確認價", "追價上限", "二次攻擊觸發價", "回測支撐價", "防守停損價", "入場價位策略", "三段式進場建議", "建議進場區間",
     "回檔再攻狀態", "再攻機率", "漲停前兆分", "漲停前兆狀態", "盤中漲跌幅", "刷新漲速%", "回檔幅度%", "日內高點漲幅%",
     "AI總分", "風險分", "即時強度分", "回檔再攻判斷", "報價時間"
 ]
@@ -2020,7 +2151,7 @@ if tracked_codes:
     st.caption("這區固定顯示你左側輸入的股票，以及 v2.8 核心追蹤股 3441 / 2382 / 2313。表格不需要勾選。")
     manual_cols = [
         "代號", "名稱", "市場", "產業", "資料來源", "AI來源", "加入來源", "v28核心追蹤", "市場池排名", "入場訊號", "可否入場", "漲停前兆分", "回檔再攻狀態", "再攻機率", "盤中標籤", "爆衝警示", "刷新漲速%", "量能跳升分", "盤中入場判斷", "入場型態",
-        "觸發價", "二次攻擊觸發價", "回測支撐價", "防守停損價", "建議進場區間", "停損參考", "壓力參考", "AI總分", "風險分", "即時強度分",
+        "左側低吸區", "右側確認價", "追價上限", "觸發價", "二次攻擊觸發價", "回測支撐價", "防守停損價", "入場價位策略", "三段式進場建議", "建議進場區間", "停損參考", "壓力參考", "AI總分", "風險分", "即時強度分",
         "盤中現價", "盤中漲跌幅", "盤中成交量", "報價時間", "即時判斷", "建議動作", "回檔再攻判斷"
     ]
     manual_cols = [c for c in manual_cols if c in manual_live_df.columns]
@@ -2085,4 +2216,4 @@ st.dataframe(filtered.sort_values(["警示排序", "即時強度分"], ascending
 st.subheader("全部掃描池即時快照")
 st.dataframe(live_df[market_cols], use_container_width=True, hide_index=True)
 
-st.caption("提醒：這是網頁快照更新，不是券商逐筆成交資料。v2.8 的漲停前兆分與回檔再攻價位是規則化風控參考，不保證漲停；只有 ✅ 可小量試單 才代表條件觸發，且仍需嚴守防守停損。")
+st.caption("提醒：這是網頁快照更新，不是券商逐筆成交資料。v2.8.1 的漲停前兆分與三段式入場價是規則化風控參考，不保證漲停；只有 ✅ 可小量試單 才代表條件觸發，且仍需嚴守防守停損。")
