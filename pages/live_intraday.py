@@ -3835,6 +3835,57 @@ def _v215_save_verified_journal(df: pd.DataFrame) -> None:
         pass
 
 
+def _v215_load_verified_journal() -> pd.DataFrame:
+    """Load the background/previous verified journal before the Streamlit page writes runtime rows.
+
+    v2.16.3 fix: the page previously overwrote data/v215_verified_signal_journal.csv with
+    only the current session rows, so learning samples could drop from hundreds back to a few
+    and the learning win rate appeared as 0%. Keep the background journal and merge updates.
+    """
+    try:
+        if V215_VERIFIED_JOURNAL_PATH.exists():
+            df = pd.read_csv(V215_VERIFIED_JOURNAL_PATH, dtype={"代號": str})
+            if "代號" in df.columns:
+                df["代號"] = df["代號"].astype(str).str.replace(".0", "", regex=False).str.zfill(4)
+            return df
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+def _v215_merge_verified_journals(existing_df: pd.DataFrame, current_df: pd.DataFrame) -> pd.DataFrame:
+    """Upsert current verification rows into the existing/background journal by 驗證Key."""
+    try:
+        frames = []
+        if existing_df is not None and not existing_df.empty:
+            frames.append(existing_df.copy())
+        if current_df is not None and not current_df.empty:
+            frames.append(current_df.copy())
+        if not frames:
+            return pd.DataFrame()
+        out = pd.concat(frames, ignore_index=True, sort=False)
+        if "代號" in out.columns:
+            out["代號"] = out["代號"].astype(str).str.replace(".0", "", regex=False).str.zfill(4)
+        if "日期" not in out.columns:
+            out["日期"] = _v213_today()
+        if "驗證Key" not in out.columns:
+            out["驗證Key"] = [
+                _v215_row_key(d, c) for d, c in zip(out.get("日期", _v213_today()).astype(str), out.get("代號", "").astype(str))
+            ]
+        # Keep the latest row per key. Prefer rows with a newer 驗證時間 / 最新時間.
+        sort_cols = [c for c in ["驗證時間", "最新時間", "首次時間"] if c in out.columns]
+        if sort_cols:
+            out = _safe_sort(out, sort_cols, ascending=[True] * len(sort_cols))
+        out = out.drop_duplicates("驗證Key", keep="last")
+        out = _safe_sort(out, ["日期", "最新時間", "驗證時間", "代號"], ascending=[False, False, False, True])
+        return out
+    except Exception:
+        try:
+            return current_df if current_df is not None and not current_df.empty else existing_df
+        except Exception:
+            return pd.DataFrame()
+
+
 def build_v215_stats(verified_df: pd.DataFrame) -> Dict[str, Any]:
     out = {"samples": 0, "verified": 0, "win_rate": 0.0, "avg_ret": 0.0, "best_type": "樣本不足", "weak_type": "樣本不足", "near_limit": 0}
     try:
@@ -4186,6 +4237,8 @@ def render_v216_context(ctx: Dict[str, Any]) -> None:
 
     twii = idx.get("TWII") or {}
     twoii = idx.get("TWOII") or {}
+    txf = (ctx.get("taiwan_futures", {}) or {}).get("TXF") or night.get("TXF") or idx.get("TXF") or {}
+    mtx = (ctx.get("taiwan_futures", {}) or {}).get("MTX") or night.get("MTX") or idx.get("MTX") or {}
     nq = night.get("NQ=F") or {}
     es = night.get("ES=F") or {}
     sox = night.get("SOX") or {}
@@ -4195,15 +4248,21 @@ def render_v216_context(ctx: Dict[str, Any]) -> None:
 
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("加權指數", _v216_price_text(twii.get("price")), _v216_pct_text(twii.get("change_pct")))
-    k2.metric("櫃買指數", _v216_price_text(twoii.get("price")), _v216_pct_text(twoii.get("change_pct")))
-    k3.metric("NASDAQ 期貨", _v216_price_text(nq.get("price")), _v216_pct_text(nq.get("change_pct")))
-    k4.metric("S&P 500 期貨", _v216_price_text(es.get("price")), _v216_pct_text(es.get("change_pct")))
+    k2.metric("台指期近一", _v216_price_text(txf.get("price")), _v216_pct_text(txf.get("change_pct")))
+    k3.metric("櫃買指數", _v216_price_text(twoii.get("price")), _v216_pct_text(twoii.get("change_pct")))
+    k4.metric("NASDAQ 期貨", _v216_price_text(nq.get("price")), _v216_pct_text(nq.get("change_pct")))
 
     p1, p2, p3, p4 = st.columns(4)
-    p1.metric("費半指數", _v216_price_text(sox.get("price")), _v216_pct_text(sox.get("change_pct")))
-    p2.metric("美10年殖利率", _v216_price_text(tnx.get("price")), _v216_pct_text(tnx.get("change_pct")))
-    p3.metric("美元指數", _v216_price_text(dxy.get("price")), _v216_pct_text(dxy.get("change_pct")))
-    p4.metric("WTI 油價", _v216_price_text(oil.get("price")), _v216_pct_text(oil.get("change_pct")))
+    p1.metric("S&P 500 期貨", _v216_price_text(es.get("price")), _v216_pct_text(es.get("change_pct")))
+    p2.metric("費半指數", _v216_price_text(sox.get("price")), _v216_pct_text(sox.get("change_pct")))
+    p3.metric("美10年殖利率", _v216_price_text(tnx.get("price")), _v216_pct_text(tnx.get("change_pct")))
+    p4.metric("美元指數", _v216_price_text(dxy.get("price")), _v216_pct_text(dxy.get("change_pct")))
+
+    o1, o2, o3, o4 = st.columns(4)
+    o1.metric("WTI 油價", _v216_price_text(oil.get("price")), _v216_pct_text(oil.get("change_pct")))
+    o2.metric("小台近一", _v216_price_text(mtx.get("price")), _v216_pct_text(mtx.get("change_pct")))
+    o3.metric("台指期資料源", _safe_text(txf.get("source"), "-"))
+    o4.metric("台指期時間", _safe_text(txf.get("quote_time") or txf.get("regularMarketTime") or txf.get("updated_at"), "-"))
 
     if breadth.get("ok"):
         b1, b2, b3, b4 = st.columns(4)
@@ -4216,6 +4275,8 @@ def render_v216_context(ctx: Dict[str, Any]) -> None:
 
     detail_rows = [
         _v216_asset_row(twii, "加權指數"),
+        _v216_asset_row(txf, "台指期近一"),
+        _v216_asset_row(mtx, "小台近一"),
         _v216_asset_row(twoii, "櫃買指數"),
         _v216_asset_row(nq, "NASDAQ 100 期貨"),
         _v216_asset_row(es, "S&P 500 期貨"),
@@ -4237,8 +4298,8 @@ def render_v216_context(ctx: Dict[str, Any]) -> None:
 
 v216_context = load_v216_context()
 
-st.title("🌐 盤中即時看盤 v2.16.2 大盤 / 夜盤價格顯示版")
-st.caption("v2.16.2 新增：直接顯示加權、櫃買、NASDAQ期、S&P期、費半、美債、美元、油價的最新價格與漲跌幅；個股訊號仍會被大盤/夜盤環境保守修正。")
+st.title("🌐 盤中即時看盤 v2.16.3 台指期即時 + 學習勝率穩定版")
+st.caption("v2.16.3 新增：台指期近一 / 小台近一價格顯示；v2.15 驗證紀錄改成合併背景資料，不再被前台少量 runtime 資料覆蓋導致學習勝率歸零。")
 render_v216_context(v216_context)
 st.divider()
 
@@ -4435,7 +4496,9 @@ v214_weight_profile = build_v214_weight_profile(v213_signal_journal_df)
 lifecycle_df = apply_v214_auto_weights(lifecycle_df, v214_weight_profile)
 lifecycle_df = apply_v216_market_adjustment(lifecycle_df, v216_context)
 v213_summary = build_v213_journal_summary(v213_signal_journal_df)
-v215_verified_journal_df = build_v215_postclose_verification(v213_signal_journal_df, lifecycle_df)
+v215_current_verified_df = build_v215_postclose_verification(v213_signal_journal_df, lifecycle_df)
+v215_existing_verified_df = _v215_load_verified_journal()
+v215_verified_journal_df = _v215_merge_verified_journals(v215_existing_verified_df, v215_current_verified_df)
 _v215_save_verified_journal(v215_verified_journal_df)
 v215_stats = build_v215_stats(v215_verified_journal_df)
 
