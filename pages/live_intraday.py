@@ -1,5 +1,5 @@
 # pages/live_intraday.py
-# v2.4.3 Live Intraday Page
+# v2.4.4 Live Intraday Page with Alerts
 # Add this file under: pages/live_intraday.py
 
 from __future__ import annotations
@@ -212,7 +212,7 @@ def fetch_twse_mis_quotes(symbols: List[str]) -> pd.DataFrame:
     return quotes
 
 
-def compute_live_strength(df: pd.DataFrame) -> pd.DataFrame:
+def compute_live_strength(df: pd.DataFrame, attack_threshold=65, watch_threshold=55, weak_drop=-1.0, chase_pct=7.0) -> pd.DataFrame:
     df = df.copy()
     df["AI總分"] = pd.to_numeric(df["AI總分"], errors="coerce").fillna(0)
     df["風險分"] = pd.to_numeric(df["風險分"], errors="coerce").fillna(0)
@@ -235,25 +235,48 @@ def compute_live_strength(df: pd.DataFrame) -> pd.DataFrame:
         - df["風險分"] * 0.10
     ).round(1)
 
-    def judge(row):
-        if row["即時強度分"] >= 70 and row["盤中漲跌幅"] > 0:
-            return "盤中強勢：AI分數與盤中動能同步"
-        if row["AI總分"] >= 60 and row["盤中漲跌幅"] > 0:
-            return "盤中偏強：可觀察量能是否延續"
-        if row["盤中漲跌幅"] <= -3:
-            return "盤中轉弱：避免追高，先觀察支撐"
-        if row["風險分"] >= 40:
-            return "高風險：即使上漲也不宜追高"
-        return "中性：以盤後AI與風控為主"
+    def alert(row):
+        strength = float(row.get("即時強度分", 0) or 0)
+        ai = float(row.get("AI總分", 0) or 0)
+        risk = float(row.get("風險分", 0) or 0)
+        pct = float(row.get("盤中漲跌幅", 0) or 0)
+        vol_score = float(row.get("盤中量能分", 0) or 0)
 
-    df["即時判斷"] = df.apply(judge, axis=1)
-    return df.sort_values("即時強度分", ascending=False).reset_index(drop=True)
+        if pct >= chase_pct and risk >= 30:
+            return "不要追高", "漲幅過大且風險偏高，容易震盪或倒貨。"
+        if risk >= 40 and pct > 0:
+            return "高風險上漲", "有上漲但風險分高，只能觀察，不建議追。"
+        if ai >= 60 and pct <= weak_drop:
+            return "AI高分轉弱", "盤後AI分數高，但盤中轉弱，先等止跌。"
+        if strength >= attack_threshold and pct > 1.5 and vol_score >= 60 and risk < 40:
+            return "強勢進攻", "AI分數、盤中漲幅、量能同步偏強，可列入重點觀察。"
+        if strength >= watch_threshold and pct > 0 and risk < 40:
+            return "觀察偏強", "盤中偏強，可觀察量能是否延續。"
+        if pct <= -3:
+            return "盤中轉弱", "跌幅擴大，避免急著承接。"
+        return "中性", "以盤後AI分數與風控為主。"
+
+    alerts = df.apply(alert, axis=1)
+    df["盤中警示"] = [a[0] for a in alerts]
+    df["即時判斷"] = [a[1] for a in alerts]
+
+    priority = {
+        "強勢進攻": 1,
+        "觀察偏強": 2,
+        "AI高分轉弱": 3,
+        "不要追高": 4,
+        "高風險上漲": 5,
+        "盤中轉弱": 6,
+        "中性": 9,
+    }
+    df["警示排序"] = df["盤中警示"].map(priority).fillna(9)
+    return df.sort_values(["警示排序", "即時強度分"], ascending=[True, False]).reset_index(drop=True)
 
 
 # ---------- UI ----------
 
-st.title("⚡ 盤中即時看盤 v2.4.3")
-st.caption("這是前台即時刷新頁：讀取盤後 AI 排名，再即時抓候選股盤中報價。適合盤中輔助判斷，不是券商逐筆報價。")
+st.title("⚡ 盤中即時看盤 v2.4.4")
+st.caption("這是前台即時刷新頁：讀取盤後 AI 排名，再即時抓候選股盤中報價。v2.4.4 新增盤中警示條件。")
 
 with st.sidebar:
     st.header("即時設定")
@@ -261,6 +284,13 @@ with st.sidebar:
     top_n = st.slider("顯示前 N 檔", min_value=5, max_value=30, value=15, step=5)
     min_ai = st.slider("最低 AI 總分", 0, 100, 0, 5)
     min_strength = st.slider("最低即時強度分", 0, 100, 0, 5)
+
+    st.markdown("---")
+    st.subheader("警示條件")
+    attack_threshold = st.slider("強勢進攻門檻", 50, 85, 65, 5)
+    watch_threshold = st.slider("觀察偏強門檻", 40, 75, 55, 5)
+    weak_drop = st.slider("AI高分轉弱跌幅", -5.0, 0.0, -1.0, 0.5)
+    chase_pct = st.slider("不要追高漲幅", 3.0, 10.0, 7.0, 0.5)
 
     st.info("保持這個頁面開著，它會依設定重新整理並抓最新快照。")
 
@@ -290,13 +320,17 @@ else:
     merged["名稱"] = merged.get("即時名稱", pd.Series(index=merged.index)).fillna(merged["名稱"])
     merged["市場"] = merged.get("報價市場", pd.Series(index=merged.index)).fillna(merged["市場"])
 
-live_df = compute_live_strength(merged)
+live_df = compute_live_strength(merged, attack_threshold, watch_threshold, weak_drop, chase_pct)
 filtered = live_df[(live_df["AI總分"] >= min_ai) & (live_df["即時強度分"] >= min_strength)].copy()
 
 quote_ok = int(live_df["盤中現價"].notna().sum())
 up_count = int((live_df["盤中漲跌幅"] > 0).sum())
 best_pct = float(live_df["盤中漲跌幅"].max()) if len(live_df) else 0
 best_strength = float(live_df["即時強度分"].max()) if len(live_df) else 0
+attack_count = int((live_df["盤中警示"] == "強勢進攻").sum()) if "盤中警示" in live_df.columns else 0
+watch_count = int((live_df["盤中警示"] == "觀察偏強").sum()) if "盤中警示" in live_df.columns else 0
+weak_count = int((live_df["盤中警示"] == "AI高分轉弱").sum()) if "盤中警示" in live_df.columns else 0
+no_chase_count = int((live_df["盤中警示"].isin(["不要追高", "高風險上漲"])).sum()) if "盤中警示" in live_df.columns else 0
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("候選股票數", len(rank_df))
@@ -306,17 +340,23 @@ c4.metric("最高即時強度分", f"{best_strength:.1f}")
 
 c5, c6, c7, c8 = st.columns(4)
 c5.metric("盤中最強漲幅", f"{best_pct:.2f}%")
-c6.metric("最後刷新", datetime.now().strftime("%H:%M:%S"))
-c7.metric("自動刷新", f"{refresh_seconds} 秒")
-c8.metric("資料模式", "前台即時")
+c6.metric("強勢進攻", attack_count)
+c7.metric("AI高分轉弱", weak_count)
+c8.metric("不要追/高風險", no_chase_count)
+
+c9, c10, c11, c12 = st.columns(4)
+c9.metric("觀察偏強", watch_count)
+c10.metric("最後刷新", datetime.now().strftime("%H:%M:%S"))
+c11.metric("自動刷新", f"{refresh_seconds} 秒")
+c12.metric("資料模式", "前台即時")
 
 st.divider()
 
-st.subheader("盤中 AI 即時強勢股")
-st.caption("即時強度分 = AI總分 + 盤中漲跌幅 + 候選股內量能排名 - 風險扣分。")
+st.subheader("盤中警示清單")
+st.caption("優先看：強勢進攻、AI高分轉弱、不要追高。這是盤中輔助判斷，不等於下單建議。")
 
 show_cols = [
-    "代號", "名稱", "市場", "產業", "AI總分", "風險分", "即時強度分",
+    "代號", "名稱", "市場", "產業", "AI總分", "風險分", "即時強度分", "盤中警示",
     "盤中現價", "盤中漲跌幅", "盤中成交量", "報價時間", "即時判斷"
 ]
 show_cols = [c for c in show_cols if c in filtered.columns]
