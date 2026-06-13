@@ -98,22 +98,35 @@ def _to_float(value, default=np.nan):
         return default
 
 
-def _clean_number(value: Any) -> float:
-    v = _to_float(value, default=0.0)
-    if isinstance(v, float) and math.isnan(v):
-        return 0.0
-    return float(v)
+def _clean_number(value: Any, default: float = 0.0) -> float:
+    """Safe numeric parser used by all decision blocks.
+
+    v2.19 introduced calls like _clean_number(x, np.nan).  Earlier versions
+    accepted only one argument, which caused a runtime TypeError.  Keep the
+    optional default parameter so missing / text / interval values never crash
+    the page.
+    """
+    v = _to_float(value, default=default)
+    try:
+        if isinstance(v, float) and math.isnan(v):
+            return float(default)
+        return float(v)
+    except Exception:
+        try:
+            return float(default)
+        except Exception:
+            return 0.0
 
 
 # v2.9.2 compatibility aliases.
 # Some earlier generated blocks referenced these names; keep them mapped to
 # the safe numeric parser so row.apply() never crashes on missing aliases.
-def _to_clean_number(value: Any) -> float:
-    return _clean_number(value)
+def _to_clean_number(value: Any, default: float = 0.0) -> float:
+    return _clean_number(value, default)
 
 
-def _to__clean_number(value: Any) -> float:
-    return _clean_number(value)
+def _to__clean_number(value: Any, default: float = 0.0) -> float:
+    return _clean_number(value, default)
 
 
 def _normalize_code(value: Any) -> str:
@@ -4830,7 +4843,7 @@ v216_context = load_v216_context()
 
 tick_default = _get_query_int("tick", 5, 3, 30, 1)
 
-st.title("🚨 盤中即時看盤 v2.19 即時警示事件引擎｜右側精準進場版")
+st.title("🚨 盤中即時看盤 v2.19.1 即時警示事件引擎｜右側精準進場穩定版")
 st.caption("v2.19 新增：價格跳動後直接觸發到價、突破、右側站穩、跌破防守與爆衝警示；AI 決策區維持慢速重算。")
 render_v218_realtime_ticker_panel(v216_context, tick_seconds=tick_default)
 render_v216_context(v216_context)
