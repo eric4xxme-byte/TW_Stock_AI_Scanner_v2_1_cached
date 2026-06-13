@@ -4628,14 +4628,16 @@ def render_v220_realtime_ai_ticker_panel(live_df: pd.DataFrame, ctx: Dict[str, A
     payload = json.dumps(_v220_build_ticker_payload(live_df, ctx), ensure_ascii=False)
     html = f"""
 <div id=\"rt-root\" class=\"rt-root\">
-  <div class=\"rt-head\"><div><div class=\"rt-title\">⚡ v2.20 AI 即時行情跳動面板</div><div class=\"rt-sub\">台積電/廣達/華通 + AI 最看好清單；只跳數字，不重整整頁。</div></div><div class=\"rt-status\"><span id=\"rt-dot\" class=\"dot wait\"></span><span id=\"rt-status-text\">初始化</span></div></div>
+  <div class=\"rt-head\"><div><div class=\"rt-title\">⚡ v2.23.3 AI 即時行情跳動面板</div><div class=\"rt-sub\">台積電/廣達/華通 + AI 最看好清單；只跳數字，不重整整頁。</div></div><div class=\"rt-status\"><span id=\"rt-dot\" class=\"dot wait\"></span><span id=\"rt-status-text\">初始化</span></div></div>
   <div id=\"rt-grid\" class=\"rt-grid\"></div>
 </div>
 <style>
-.rt-root {{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans TC",Arial,sans-serif;border:1px solid #e6e8ef;border-radius:16px;padding:14px 16px;margin:8px 0 18px 0;background:linear-gradient(180deg,#fff,#fbfcff);box-shadow:0 1px 3px rgba(15,23,42,.05)}}
-.rt-head {{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:12px}} .rt-title{{font-size:20px;font-weight:850;color:#111827}} .rt-sub{{font-size:13px;color:#6b7280;margin-top:3px}} .rt-status{{font-size:13px;color:#4b5563;white-space:nowrap;padding-top:4px}}
+.rt-root {{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans TC",Arial,sans-serif;border:1px solid #e6e8ef;border-radius:16px;padding:14px 16px;margin:8px 0 18px 0;background:linear-gradient(180deg,#fff,#fbfcff);box-shadow:0 1px 3px rgba(15,23,42,.05);box-sizing:border-box;max-width:100%;overflow:visible}}
+.rt-head {{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:12px;flex-wrap:wrap}} .rt-title{{font-size:20px;font-weight:850;color:#111827}} .rt-sub{{font-size:13px;color:#6b7280;margin-top:3px;line-height:1.45}} .rt-status{{font-size:13px;color:#4b5563;white-space:nowrap;padding-top:4px}}
 .dot{{display:inline-block;width:9px;height:9px;border-radius:99px;margin-right:6px;background:#94a3b8}} .dot.ok{{background:#22c55e;box-shadow:0 0 0 4px rgba(34,197,94,.12)}} .dot.warn{{background:#f59e0b;box-shadow:0 0 0 4px rgba(245,158,11,.12)}} .dot.wait{{background:#94a3b8}}
-.rt-grid{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}} .card{{border:1px solid #edf0f5;border-radius:14px;padding:12px;background:#fff;min-height:104px}} .name{{font-size:13px;color:#475569;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}} .price{{font-size:28px;line-height:1.15;font-weight:850;letter-spacing:-.02em;color:#111827;margin-top:6px}} .pct{{display:inline-flex;align-items:center;margin-top:8px;font-size:13px;font-weight:700;border-radius:999px;padding:3px 8px;background:#f1f5f9;color:#64748b}} .up .pct{{background:#dcfce7;color:#15803d}} .down .pct{{background:#fee2e2;color:#dc2626}} .flat .pct{{background:#f1f5f9;color:#64748b}} .src{{font-size:11px;color:#94a3b8;margin-top:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}} .flash{{animation:flash .35s ease-in-out}} @keyframes flash{{0%{{background:#fef9c3}}100%{{background:#fff}}}} @media(max-width:900px){{.rt-grid{{grid-template-columns:repeat(2,minmax(0,1fr))}}.price{{font-size:24px}}}}
+.rt-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;width:100%;box-sizing:border-box}} .card{{border:1px solid #edf0f5;border-radius:14px;padding:12px;background:#fff;min-height:104px;box-sizing:border-box;min-width:0}} .name{{font-size:13px;color:#475569;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}} .price{{font-size:28px;line-height:1.15;font-weight:850;letter-spacing:-.02em;color:#111827;margin-top:6px;word-break:break-word}} .pct{{display:inline-flex;align-items:center;margin-top:8px;font-size:13px;font-weight:700;border-radius:999px;padding:3px 8px;background:#f1f5f9;color:#64748b}} .up .pct{{background:#dcfce7;color:#15803d}} .down .pct{{background:#fee2e2;color:#dc2626}} .flat .pct{{background:#f1f5f9;color:#64748b}} .src{{font-size:11px;color:#94a3b8;margin-top:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}} .flash{{animation:flash .35s ease-in-out}} @keyframes flash{{0%{{background:#fef9c3}}100%{{background:#fff}}}}
+@media(max-width:900px){{.rt-root{{padding:12px}}.rt-grid{{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}}.card{{min-height:94px;padding:10px}}.price{{font-size:24px}}.rt-title{{font-size:18px}}.rt-sub{{font-size:12px}}}}
+@media(max-width:430px){{.rt-grid{{grid-template-columns:1fr}}.card{{min-height:88px}}.price{{font-size:23px}}.rt-status{{font-size:12px}}}}
 </style>
 <script>
 (function(){{
@@ -4654,7 +4656,7 @@ def render_v220_realtime_ai_ticker_panel(live_df: pd.DataFrame, ctx: Dict[str, A
 }})();
 </script>
 """
-    components.html(html, height=520, scrolling=False)
+    components.html(html, height=860, scrolling=True)
 
 
 def render_v220_multifactor_cockpit(df: pd.DataFrame, top_n: int = 15) -> None:
@@ -6017,7 +6019,7 @@ def save_v231_limitup_feature_samples(df: pd.DataFrame, max_rows: int = 5000) ->
 
 
 def render_v231_data_quality_and_limitup_collector(df: pd.DataFrame, ctx: Dict[str, Any], sample_rows: Optional[pd.DataFrame] = None) -> None:
-    st.subheader("🧪 v2.23.1 資料品質 + 漲停前兆欄位蒐集")
+    st.subheader("🧪 v2.23.3 手機版即時盤修正 + 漲停前兆欄位蒐集")
     st.caption("這一版先收集 v2.24 需要的真實樣本；這裡不是正式買賣訊號，不會取代 v2.23 最終決策。")
     if df is None or df.empty:
         st.info("目前沒有資料可以檢查。")
@@ -6064,7 +6066,7 @@ v216_context = load_v216_context()
 
 tick_default = _get_query_int("tick", 5, 3, 30, 1)
 
-st.title("🧪 盤中即時看盤 v2.23.1 資料品質 + 漲停前兆欄位蒐集")
+st.title("📱 盤中即時看盤 v2.23.3 手機版即時盤修正｜資料品質 + 漲停前兆蒐集")
 st.caption("v2.23.1 重點：保留 v2.23 最終進場決策，並開始蒐集漲停前 5～15 分鐘預警模型需要的真實欄位與資料品質指標。")
 # v2.20: realtime ticker panel is rendered after live_df is built, so stock prices can use backend MIS quotes first.
 render_v216_context(v216_context)
