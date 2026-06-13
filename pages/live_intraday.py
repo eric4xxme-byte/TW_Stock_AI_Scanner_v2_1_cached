@@ -4424,7 +4424,7 @@ def render_v218_realtime_ticker_panel(ctx: Dict[str, Any], tick_seconds: int = 5
 <div id=\"rt-root\" class=\"rt-root\">
   <div class=\"rt-head\">
     <div>
-      <div class=\"rt-title\">⚡ v2.18 即時行情跳動面板</div>
+      <div class=\"rt-title\">⚡ v2.19 即時行情跳動面板</div>
       <div class=\"rt-sub\">只更新數字，不重整 Streamlit 整頁；AI 決策仍由下方主系統週期性重算。</div>
     </div>
     <div class=\"rt-status\"><span id=\"rt-dot\" class=\"dot wait\"></span><span id=\"rt-status-text\">初始化</span></div>
@@ -4581,12 +4581,257 @@ def render_v218_realtime_ticker_panel(ctx: Dict[str, Any], tick_seconds: int = 5
 """
     components.html(html, height=372, scrolling=False)
 
+
+# -----------------------------
+# v2.19 realtime alert event engine + right-side precision entry
+# -----------------------------
+def _v219_zone_numbers(text_value: Any) -> Tuple[float, float]:
+    s = _safe_text(text_value, "")
+    nums = re.findall(r"\d+(?:\.\d+)?", s)
+    if not nums:
+        return np.nan, np.nan
+    vals = [_clean_number(x, np.nan) for x in nums]
+    vals = [v for v in vals if not _is_nan(v)]
+    if not vals:
+        return np.nan, np.nan
+    if len(vals) == 1:
+        return float(vals[0]), float(vals[0])
+    return float(min(vals[:2])), float(max(vals[:2]))
+
+
+def add_v219_right_entry_signal(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    labels, reasons = [], []
+    for _, row in out.iterrows():
+        px = _clean_number(row.get("盤中現價"), np.nan)
+        add = _clean_number(row.get("右側加碼價"), np.nan)
+        cap = _clean_number(row.get("追價上限"), np.nan)
+        stop = _clean_number(row.get("防守停損"), np.nan)
+        score = _clean_number(row.get("v214調權後分"), _clean_number(row.get("v210決策分"), 0))
+        fund = _clean_number(row.get("盤中資金分"), 0)
+        left = _clean_number(row.get("左側低吸分"), 0)
+        risk = _clean_number(row.get("風險分"), 99)
+        pct = _clean_number(row.get("盤中漲跌幅"), 0)
+        if _is_nan(px) or px <= 0:
+            labels.append("⚪ 等報價")
+            reasons.append("目前沒有有效即時價，不能判斷右側進場。")
+            continue
+        if not _is_nan(stop) and stop > 0 and px <= stop:
+            labels.append("⚫ 跌破防守")
+            reasons.append(f"現價已低於防守停損 {_fmt_price(stop)}，右側訊號取消。")
+            continue
+        if _is_nan(add) or add <= 0:
+            labels.append("⚪ 無右側價")
+            reasons.append("缺少右側加碼價，先不給右側進場訊號。")
+            continue
+        if px < add:
+            labels.append("⏳ 等右側觸發")
+            reasons.append(f"還沒站上右側觸發 {_fmt_price(add)}。")
+            continue
+        if not _is_nan(cap) and cap > 0 and px > cap:
+            labels.append("🔴 超過追價上限")
+            reasons.append(f"現價已高於追價上限 {_fmt_price(cap)}，空手不追。")
+            continue
+        if risk >= 55:
+            labels.append("🟡 觸發但風險高")
+            reasons.append("價格進入右側區，但風險分偏高，只能等站穩或放棄。")
+            continue
+        if pct >= 8.5:
+            labels.append("🔴 近漲停不追")
+            reasons.append("漲幅已接近漲停區，右側第一買點已過。")
+            continue
+        if score >= 62 and fund >= 45 and (left >= 45 or pct >= 1.0):
+            labels.append("🟢 右側觸發，等站穩")
+            reasons.append(f"已碰右側 {_fmt_price(add)}，需連續站穩且量能跟上；高於 {_fmt_price(cap)} 不追。")
+        else:
+            labels.append("👀 右側觸發觀察")
+            reasons.append("價格已觸發，但分數/資金/結構尚未同時到位。")
+    out["v219右側精準進場"] = labels
+    out["v219右側判斷原因"] = reasons
+    return out
+
+
+def _v219_targets_from_lifecycle(df: pd.DataFrame, top_n: int = 24) -> Dict[str, Any]:
+    if df is None or df.empty:
+        return {"items": [], "generatedAt": now_taipei().isoformat()}
+    work = df.copy()
+    if "代號" not in work.columns:
+        return {"items": [], "generatedAt": now_taipei().isoformat()}
+    work["代號"] = work["代號"].astype(str).str.replace(".0", "", regex=False).str.zfill(4)
+    score_col = "v212排序分" if "v212排序分" in work.columns else "即時強度分"
+    work = _ensure_columns(work, {score_col: 0.0, "v212優先級": 99, "即時強度分": 0.0})
+    focus = work[work["代號"].isin(FOCUS_CODES)].copy()
+    ranked = _safe_sort(work, ["v212優先級", score_col, "即時強度分"], ascending=[True, False, False]).head(max(10, int(top_n)))
+    use = pd.concat([focus, ranked], ignore_index=True).drop_duplicates("代號", keep="first").head(max(6, int(top_n)))
+    items = []
+    for _, row in use.iterrows():
+        code = _safe_text(row.get("代號"), "").zfill(4)
+        name = _safe_text(row.get("名稱"), LOCAL_STOCK_INFO.get(code, (code, "", ""))[0])
+        add = _clean_number(row.get("右側加碼價"), np.nan)
+        cap = _clean_number(row.get("追價上限"), np.nan)
+        stop = _clean_number(row.get("防守停損"), np.nan)
+        px = _clean_number(row.get("盤中現價"), np.nan)
+        left_lo, left_hi = _v219_zone_numbers(row.get("左側試單區", row.get("左側低吸區", row.get("第一買點", ""))))
+        items.append({
+            "code": code,
+            "name": name,
+            "symbol": f"{code}.TW",
+            "current": None if _is_nan(px) else float(px),
+            "rightAdd": None if _is_nan(add) else float(add),
+            "chaseCap": None if _is_nan(cap) else float(cap),
+            "stop": None if _is_nan(stop) else float(stop),
+            "leftLo": None if _is_nan(left_lo) else float(left_lo),
+            "leftHi": None if _is_nan(left_hi) else float(left_hi),
+            "signal": _safe_text(row.get("v219右側精準進場", row.get("v216調整後決策", row.get("v212生命週期狀態", ""))), ""),
+            "decisionScore": _clean_number(row.get("v214調權後分"), _clean_number(row.get("v210決策分"), 0)),
+            "moneyScore": _clean_number(row.get("盤中資金分"), 0),
+            "riskScore": _clean_number(row.get("風險分"), 99),
+        })
+    return {"items": items, "generatedAt": now_taipei().isoformat()}
+
+
+def render_v219_realtime_alert_panel(lifecycle_df: pd.DataFrame, tick_seconds: int = 5, max_targets: int = 24) -> None:
+    tick_seconds = int(max(3, min(30, tick_seconds or 5)))
+    payload = json.dumps(_v219_targets_from_lifecycle(lifecycle_df, top_n=max_targets), ensure_ascii=False)
+    html = f'''
+<div id="rt-alert-root" class="alert-root">
+  <div class="alert-head">
+    <div>
+      <div class="alert-title">🚨 v2.19 即時警示事件引擎｜右側精準進場</div>
+      <div class="alert-sub">只更新警示與價格，不整頁重整。右側進場必須同時符合：突破、站穩、量能、未超追價上限。</div>
+    </div>
+    <div class="alert-status" id="alert-status">初始化</div>
+  </div>
+  <div class="alert-summary" id="alert-summary"></div>
+  <div class="alert-list" id="alert-list"></div>
+</div>
+<style>
+  .alert-root {{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans TC",Arial,sans-serif; border:1px solid #e5e7eb; border-radius:16px; padding:14px 16px; margin:8px 0 18px 0; background:#fff; box-shadow:0 1px 4px rgba(15,23,42,.06);}}
+  .alert-head {{display:flex; justify-content:space-between; gap:12px; align-items:flex-start; margin-bottom:10px;}}
+  .alert-title {{font-size:20px; font-weight:850; color:#111827;}}
+  .alert-sub {{font-size:13px; color:#64748b; margin-top:3px;}}
+  .alert-status {{font-size:13px; color:#64748b; white-space:nowrap; padding-top:3px;}}
+  .alert-summary {{display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px;}}
+  .pill {{border-radius:999px; padding:5px 10px; font-size:12px; font-weight:800; background:#f1f5f9; color:#334155;}}
+  .alert-list {{display:grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap:10px;}}
+  .alert-card {{border:1px solid #edf2f7; border-radius:14px; padding:12px; background:#f8fafc;}}
+  .alert-card.buy {{background:#ecfdf5; border-color:#bbf7d0;}}
+  .alert-card.trigger {{background:#eff6ff; border-color:#bfdbfe;}}
+  .alert-card.warn {{background:#fffbeb; border-color:#fde68a;}}
+  .alert-card.danger {{background:#fff1f2; border-color:#fecdd3;}}
+  .alert-name {{font-size:14px; font-weight:850; color:#0f172a; display:flex; justify-content:space-between; gap:8px;}}
+  .alert-price {{font-size:25px; font-weight:900; letter-spacing:-.02em; margin-top:4px; color:#111827;}}
+  .alert-reason {{font-size:12px; color:#475569; margin-top:5px; line-height:1.45;}}
+  .flash-alert {{animation: flashAlert .45s ease-in-out;}}
+  @keyframes flashAlert {{0% {{filter:brightness(1.08); transform:translateY(-1px);}} 100% {{filter:brightness(1); transform:translateY(0);}}}}
+  @media (max-width:900px) {{.alert-list {{grid-template-columns:1fr;}}}}
+</style>
+<script>
+(function() {{
+  const PAYLOAD = {payload};
+  const POLL_MS = {tick_seconds} * 1000;
+  const items = PAYLOAD.items || [];
+  const history = new Map();
+  const list = document.getElementById('alert-list');
+  const status = document.getElementById('alert-status');
+  const summary = document.getElementById('alert-summary');
+  function n(v) {{ const x = Number(v); return Number.isFinite(x) ? x : null; }}
+  function fmt(v) {{ const x=n(v); return x===null ? '-' : x.toLocaleString(undefined, {{maximumFractionDigits:2}}); }}
+  function pct(a,b) {{ a=n(a); b=n(b); if(a===null||b===null||b<=0) return null; return (a-b)/b*100; }}
+  function pushHist(code, price, volume) {{
+    if(!history.has(code)) history.set(code, []);
+    const arr = history.get(code);
+    const now = Date.now();
+    if(n(price)!==null && price>0) arr.push({{t:now, p:Number(price), v:n(volume)}});
+    while(arr.length>60 || (arr.length && now-arr[0].t>10*60*1000)) arr.shift();
+    return arr;
+  }}
+  function prior(arr, sec) {{
+    if(!arr || !arr.length) return null;
+    const target = Date.now() - sec*1000;
+    let best = arr[0];
+    for(const x of arr) {{ if(x.t <= target) best = x; else break; }}
+    return best;
+  }}
+  async function fetchChart(symbol) {{
+    try {{
+      const url = 'https://query1.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(symbol) + '?interval=1m&range=1d&_=' + Date.now();
+      const r = await fetch(url, {{cache:'no-store'}});
+      if(!r.ok) return null;
+      const j = await r.json();
+      const result = j && j.chart && j.chart.result && j.chart.result[0];
+      if(!result) return null;
+      const meta = result.meta || {{}};
+      const q = (result.indicators && result.indicators.quote && result.indicators.quote[0]) || {{}};
+      const closes = (q.close || []).filter(x => x !== null && Number.isFinite(Number(x))).map(Number);
+      const vols = (q.volume || []).filter(x => x !== null && Number.isFinite(Number(x))).map(Number);
+      const price = Number(meta.regularMarketPrice || closes[closes.length-1] || meta.previousClose);
+      const prev = Number(meta.previousClose || meta.chartPreviousClose);
+      if(!Number.isFinite(price) || price<=0) return null;
+      return {{price, prev, pct: Number.isFinite(prev)&&prev>0 ? (price-prev)/prev*100 : null, volume: vols.length ? vols[vols.length-1] : null, closes, vols}};
+    }} catch(e) {{ return null; }}
+  }}
+  function evaluate(item, data) {{
+    const code = String(item.code);
+    const price = n(data.price);
+    const add = n(item.rightAdd), cap=n(item.chaseCap), stop=n(item.stop), lo=n(item.leftLo), hi=n(item.leftHi);
+    const arr = pushHist(code, price, data.volume);
+    const p60 = prior(arr,60), p180 = prior(arr,180);
+    const spd60 = p60 ? pct(price,p60.p) : null;
+    const spd180 = p180 ? pct(price,p180.p) : null;
+    const lastVol = n(data.volume);
+    const vols = (data.vols || []).slice(-8).filter(x => Number.isFinite(Number(x))).map(Number);
+    const avgVol = vols.length ? vols.reduce((a,b)=>a+b,0)/vols.length : null;
+    const volOk = (lastVol!==null && avgVol!==null && avgVol>0) ? lastVol >= avgVol*1.08 : false;
+    const aboveAdd = add!==null && price!==null && price >= add;
+    const standing = aboveAdd && p60 && p60.p >= add*0.998;
+    const notTooHigh = cap===null || price <= cap;
+    const belowStop = stop!==null && price!==null && price <= stop;
+    const inLeft = lo!==null && hi!==null && price!==null && price >= lo*0.998 && price <= hi*1.002;
+    const surge = (spd60!==null && spd60>=1.8) || (spd180!==null && spd180>=3.0);
+    const slip = (add!==null && price!==null) ? (price-add)/add*100 : null;
+    let level='neutral', msg='觀察', reason='等待下一個有效事件。';
+    if(belowStop) {{ level='danger'; msg='⚫ 跌破防守'; reason='現價已跌破防守停損，右側/左側訊號取消。'; }}
+    else if(add!==null && price!==null && aboveAdd && standing && notTooHigh && (volOk || (spd60!==null && spd60>0.35)) && (slip===null || slip<=0.9)) {{ level='buy'; msg='✅ 右側確認可小量'; reason='已突破右側價且至少一輪站穩，量能/速度有跟上，且未超追價上限。'; }}
+    else if(add!==null && price!==null && aboveAdd && notTooHigh) {{ level='trigger'; msg='🟢 右側觸發中'; reason='價格碰到右側觸發價，但還要等站穩與量能確認。'; }}
+    else if(cap!==null && price!==null && price>cap) {{ level='danger'; msg='🔴 超過追價上限'; reason='價格已高於追價上限，空手不追。'; }}
+    else if(surge) {{ level='warn'; msg='🚀 短線爆衝'; reason='短線漲速明顯放大，注意是否變成假突破或二次攻擊。'; }}
+    else if(inLeft) {{ level='warn'; msg='✅ 到左側區'; reason='價格到左側試單區；仍需看是否止跌、停損距離是否短。'; }}
+    else if(add!==null && price!==null && price<add) {{ level='neutral'; msg='⏳ 等右側價'; reason='尚未站上右側觸發價。'; }}
+    return {{level,msg,reason,price,chg:data.pct,spd60,volOk,add,cap,stop}};
+  }}
+  function render(results) {{
+    const important = results.filter(r => ['buy','trigger','warn','danger'].includes(r.level));
+    const sorted = important.sort((a,b) => ({{buy:0,trigger:1,danger:2,warn:3}}[a.level]??9)-({{buy:0,trigger:1,danger:2,warn:3}}[b.level]??9)).slice(0,10);
+    const counts = {{buy:results.filter(r=>r.level==='buy').length, trigger:results.filter(r=>r.level==='trigger').length, warn:results.filter(r=>r.level==='warn').length, danger:results.filter(r=>r.level==='danger').length}};
+    summary.innerHTML = `<span class="pill">✅ 右側可小量 ${{counts.buy}}</span><span class="pill">🟢 觸發中 ${{counts.trigger}}</span><span class="pill">🚀/到價 ${{counts.warn}}</span><span class="pill">⚫ 風險 ${{counts.danger}}</span>`;
+    if(!sorted.length) {{ list.innerHTML = '<div class="alert-card"><div class="alert-name">目前沒有重大即時事件</div><div class="alert-reason">等待右側觸發、左側到價、爆衝或跌破防守。</div></div>'; return; }}
+    list.innerHTML = sorted.map(r => `<div class="alert-card ${{r.level}} flash-alert"><div class="alert-name"><span>${{r.name}} ${{r.code}}</span><span>${{r.msg}}</span></div><div class="alert-price">${{fmt(r.price)}}</div><div class="alert-reason">右側 ${{fmt(r.add)}}｜上限 ${{fmt(r.cap)}}｜停損 ${{fmt(r.stop)}}｜1分速 ${{r.spd60==null?'-':r.spd60.toFixed(2)+'%'}}｜${{r.reason}}</div></div>`).join('');
+  }}
+  async function tick() {{
+    const results = [];
+    for(const item of items) {{
+      const data = await fetchChart(item.symbol);
+      if(data) results.push(Object.assign({{code:item.code,name:item.name}}, evaluate(item, data)));
+    }}
+    render(results);
+    status.textContent = '更新 ' + new Date().toLocaleTimeString('zh-TW', {{hour12:false}}) + '｜追蹤 ' + items.length + ' 檔';
+  }}
+  tick(); setInterval(tick, POLL_MS);
+}})();
+</script>
+'''
+    components.html(html, height=330, scrolling=False)
+
+
 v216_context = load_v216_context()
 
 tick_default = _get_query_int("tick", 5, 3, 30, 1)
 
-st.title("⚡ 盤中即時看盤 v2.18 即時行情跳動面板｜不整頁刷新版")
-st.caption("v2.18 新增：上方行情面板由前端 JavaScript 直接更新數字；AI 決策區可慢速重算，不必整頁一直刷新。")
+st.title("🚨 盤中即時看盤 v2.19 即時警示事件引擎｜右側精準進場版")
+st.caption("v2.19 新增：價格跳動後直接觸發到價、突破、右側站穩、跌破防守與爆衝警示；AI 決策區維持慢速重算。")
 render_v218_realtime_ticker_panel(v216_context, tick_seconds=tick_default)
 render_v216_context(v216_context)
 st.divider()
@@ -4789,6 +5034,7 @@ v213_signal_journal_df = update_v213_signal_journal(lifecycle_df)
 v214_weight_profile = build_v214_weight_profile(v213_signal_journal_df)
 lifecycle_df = apply_v214_auto_weights(lifecycle_df, v214_weight_profile)
 lifecycle_df = apply_v216_market_adjustment(lifecycle_df, v216_context)
+lifecycle_df = add_v219_right_entry_signal(lifecycle_df)
 v213_summary = build_v213_journal_summary(v213_signal_journal_df)
 v215_current_verified_df = build_v215_postclose_verification(v213_signal_journal_df, lifecycle_df)
 v215_existing_verified_df = _v215_load_verified_journal()
@@ -4834,6 +5080,8 @@ m7.metric("爆衝雷達", surge_count)
 m8.metric("學習紀錄 / 驗證", f"{int(v213_summary.get("total", 0))} / {int(v215_stats.get("verified", 0))}")
 
 st.divider()
+
+render_v219_realtime_alert_panel(lifecycle_df, tick_seconds=live_tick_seconds if "live_tick_seconds" in globals() else tick_default, max_targets=max(top_n, 24) if "top_n" in globals() else 24)
 
 st.subheader("🧬 v2.15.6 真永久學習資料庫 + 盤後驗證器｜學習勝率修正版")
 st.caption("目前會先把驗證後訊號寫到 data/v215_verified_signal_journal.csv；若設定 Google Sheet Webhook，可手動或自動同步到 Google Sheet。v2.15.6 起，學習勝率以盤後驗證結果為主，避免顯示 0% 的舊版誤導。")
@@ -4902,7 +5150,7 @@ else:
 st.subheader("🧭 v2.16 交易員目前決策｜含大盤/夜盤修正")
 st.caption("主表只保留會影響進場的欄位。v2.16 會依大盤環境分與夜盤風險分，將可試單訊號保守降級或維持。")
 main_cols = _cols_exist(lifecycle_df, [
-    "代號", "名稱", "市場", "產業", "交易型態", "v216調整後決策", "v216環境修正", "v216大盤環境", "v216夜盤風險", "v214信心閘門", "v212生命週期狀態", "v212目前決策", "我會不會買",
+    "代號", "名稱", "市場", "產業", "交易型態", "v219右側精準進場", "v219右側判斷原因", "v216調整後決策", "v216環境修正", "v216大盤環境", "v216夜盤風險", "v214信心閘門", "v212生命週期狀態", "v212目前決策", "我會不會買",
     "第一買點", "盤中現價", "v214停損距離%", "v212位置判斷", "防守停損", "右側加碼價", "追價上限",
     "盤中漲跌幅", "刷新漲速%", "v214調權後分", "左側低吸分", "盤中資金分", "v29漲停前兆分", "v210決策分",
     "v214下一步", "v212下一步", "還缺什麼確認", "不能買原因", "資料來源", "AI來源", "報價時間"
@@ -4912,7 +5160,7 @@ if main_df.empty:
     st.info("目前沒有符合篩選條件的股票。可以降低左側篩選的 AI / 即時強度門檻，或等待下一輪刷新。")
 else:
     try:
-        st.dataframe(main_df[main_cols].style.applymap(_v212_style_signal, subset=["v216調整後決策", "v214信心閘門", "v212生命週期狀態"]), use_container_width=True, hide_index=True)
+        st.dataframe(main_df[main_cols].style.applymap(_v212_style_signal, subset=["v219右側精準進場", "v216調整後決策", "v214信心閘門", "v212生命週期狀態"]), use_container_width=True, hide_index=True)
     except Exception:
         st.dataframe(main_df[main_cols], use_container_width=True, hide_index=True)
 
@@ -4922,7 +5170,7 @@ focus_df = lifecycle_df[lifecycle_df["代號"].astype(str).str.zfill(4).isin(FOC
 focus_df["焦點排序"] = focus_df["代號"].map({"3441": 1, "2382": 2, "2313": 3}).fillna(9)
 focus_df = focus_df.sort_values("焦點排序")
 focus_cols = _cols_exist(focus_df, [
-    "代號", "名稱", "v216調整後決策", "v216環境修正", "v214信心閘門", "v212生命週期狀態", "v212目前決策", "第一買點", "盤中現價", "v214停損距離%", "防守停損", "右側加碼價", "追價上限",
+    "代號", "名稱", "v219右側精準進場", "v219右側判斷原因", "v216調整後決策", "v216環境修正", "v214信心閘門", "v212生命週期狀態", "v212目前決策", "第一買點", "盤中現價", "v214停損距離%", "防守停損", "右側加碼價", "追價上限",
     "v212位置判斷", "盤中漲跌幅", "刷新漲速%", "回檔幅度%", "v214調權後分", "左側低吸分", "盤中資金分", "v29漲停前兆分", "v214下一步", "v212下一步", "還缺什麼確認", "報價時間"
 ])
 if focus_df.empty:
@@ -4999,4 +5247,4 @@ with st.expander("🧪 進階診斷 / 市場池 / 爆衝雷達 / 原始學習紀
         ])
         st.dataframe(lifecycle_df[all_cols], use_container_width=True, hide_index=True)
 
-st.caption("提醒：這是盤中快照與規則化風控系統，不是保證獲利或券商逐筆資料。v2.15 的目的，是把訊號結果保存並驗證，讓後續調權有根據；最高信號仍只代表「小量試單 + 嚴格停損」，不是無腦重倉。")
+st.caption("提醒：v2.19 的前端警示是即時事件層；這仍是盤中快照與規則化風控系統，不是保證獲利或券商逐筆資料。v2.15 的目的，是把訊號結果保存並驗證，讓後續調權有根據；最高信號仍只代表「小量試單 + 嚴格停損」，不是無腦重倉。")
