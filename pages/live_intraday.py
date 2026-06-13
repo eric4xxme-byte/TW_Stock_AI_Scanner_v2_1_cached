@@ -4406,6 +4406,258 @@ def render_v216_context(ctx: Dict[str, Any]) -> None:
 
 
 
+
+
+# -----------------------------
+# v2.20 AI-selected realtime ticker + multi-factor decision layer
+# -----------------------------
+def _v220_pick_numeric(row: pd.Series, names: List[str], default: float = 0.0) -> float:
+    for n in names:
+        if n in row.index:
+            v = _clean_number(row.get(n), np.nan)
+            if not _is_nan(v):
+                return float(v)
+    return float(default)
+
+
+def _v220_market_bias(ctx: Dict[str, Any]) -> float:
+    ctx = ctx or {}
+    market_score = _clean_number(ctx.get("market_env_score"), 50)
+    night_risk = _clean_number(ctx.get("night_risk_score"), 50)
+    if _is_nan(market_score):
+        market_score = 50
+    if _is_nan(night_risk):
+        night_risk = 50
+    # market high is good; night risk high is bad
+    return max(-15.0, min(15.0, (float(market_score) - 50.0) * 0.25 - (float(night_risk) - 50.0) * 0.18))
+
+
+def add_v220_multifactor_decision(df: pd.DataFrame, ctx: Dict[str, Any]) -> pd.DataFrame:
+    """Add a compact trader-like multi-factor decision layer.
+
+    This is intentionally defensive: it only uses columns that already exist and
+    falls back safely when a column is missing.  It does not claim to read paid
+    real-time news.  The news/thematic score is a proxy from sector, AI/semicon
+    exposure and market context until a real news API is wired in.
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    market_bias = _v220_market_bias(ctx)
+
+    tech_scores = []
+    fund_scores = []
+    news_scores = []
+    risk_levels = []
+    risk_scores = []
+    final_scores = []
+    final_signals = []
+    reasons = []
+    confirm_needed = []
+
+    for _, row in out.iterrows():
+        code = str(row.get("代號", "")).zfill(4)
+        name = str(row.get("名稱", ""))
+        industry = str(row.get("產業", ""))
+        px = _v220_pick_numeric(row, ["盤中現價", "目前價格", "現價"], 0)
+        pct = _v220_pick_numeric(row, ["盤中漲跌幅", "漲跌幅"], 0)
+        vol = _v220_pick_numeric(row, ["盤中成交量", "成交量"], 0)
+        ai = _v220_pick_numeric(row, ["v214調權後分", "AI總分", "盤後AI分", "市場池估分"], 50)
+        strength = _v220_pick_numeric(row, ["即時強度分", "盤中強度分", "v29即時入場分"], 50)
+        risk = _v220_pick_numeric(row, ["風險分", "v214風險分"], 30)
+        left_score = _v220_pick_numeric(row, ["左側低吸分", "v29左側低吸分"], 50)
+        surge = _v220_pick_numeric(row, ["v29漲停前兆分", "漲停前兆分", "爆衝分"], 50)
+        right_text = str(row.get("v219右側精準進場", row.get("右側進場訊號", "")) or "")
+
+        # Technical: price action, strength, right trigger, surge, but punish overheated gaps.
+        tech = 0.36 * strength + 0.24 * surge + 0.18 * max(0, min(100, 50 + pct * 5)) + 0.22 * left_score
+        if "右側確認" in right_text or "可小量" in right_text:
+            tech += 8
+        if "跌破" in right_text or "防守" in right_text:
+            tech -= 18
+        if pct >= 8:
+            tech -= 12
+        tech = max(0, min(100, tech))
+
+        # Capital/chip proxy: existing AI/chip score, volume, market-pool score.
+        vol_score = 50
+        if vol > 0:
+            vol_score = min(100, 45 + min(35, (vol ** 0.5) / 8))
+        fund = 0.48 * ai + 0.22 * strength + 0.20 * vol_score + 0.10 * max(0, min(100, 50 + pct * 4))
+        if code in {"2330", "2382", "2313"}:
+            fund += 4
+        fund = max(0, min(100, fund))
+
+        # News/theme proxy until a proper news API is connected.
+        news = 50 + market_bias
+        if any(k in (industry + name) for k in ["半導體", "電子", "電腦", "AI", "伺服器", "PCB", "光電"]):
+            news += 8
+        if code in {"2330", "2382", "2313", "2379", "3661", "3441"}:
+            news += 6
+        if pct >= 6:
+            news += 5  # market is pricing a theme, but risk layer handles overheat
+        news = max(0, min(100, news))
+
+        # Risk score: higher is riskier.  Uses stock risk + overheating + market/night.
+        env_risk = max(0, -market_bias) * 1.2
+        rscore = 0.55 * risk + 0.20 * max(0, pct * 8) + 0.15 * max(0, 55 - left_score) + env_risk
+        if pct >= 9:
+            rscore += 18
+        if "跌破" in right_text:
+            rscore += 25
+        rscore = max(0, min(100, rscore))
+        if rscore >= 80:
+            rlevel = "極高"
+        elif rscore >= 60:
+            rlevel = "高"
+        elif rscore >= 38:
+            rlevel = "中"
+        else:
+            rlevel = "低"
+
+        final = 0.30 * tech + 0.28 * fund + 0.16 * news + 0.16 * strength + 0.10 * surge - 0.35 * rscore
+        final = max(0, min(100, final))
+
+        reason_parts = []
+        need_parts = []
+        if tech >= 70:
+            reason_parts.append("技術轉強")
+        else:
+            need_parts.append("技術站穩")
+        if fund >= 68:
+            reason_parts.append("資金/籌碼偏強")
+        else:
+            need_parts.append("量能/資金延續")
+        if news >= 65:
+            reason_parts.append("題材環境加分")
+        if rlevel in {"高", "極高"}:
+            need_parts.append("風險降溫")
+        if market_bias < -5:
+            need_parts.append("大盤/夜盤改善")
+
+        if final >= 72 and rscore < 45 and ("可小量" in right_text or strength >= 66):
+            sig = "✅ 高信心右側小量"
+        elif final >= 64 and rscore < 58:
+            sig = "🟢 右側觸發，等站穩"
+        elif final >= 56 and rscore < 70:
+            sig = "🟡 技術到位，等資金/時事確認"
+        elif rscore >= 75:
+            sig = "🔴 高風險，不追"
+        else:
+            sig = "⚪ 觀察"
+
+        tech_scores.append(round(tech, 1))
+        fund_scores.append(round(fund, 1))
+        news_scores.append(round(news, 1))
+        risk_scores.append(round(rscore, 1))
+        risk_levels.append(rlevel)
+        final_scores.append(round(final, 1))
+        final_signals.append(sig)
+        reasons.append("、".join(reason_parts) if reason_parts else "條件未完整")
+        confirm_needed.append("、".join(need_parts) if need_parts else "只差右側站穩 / 停損執行")
+
+    out["v220技術分"] = tech_scores
+    out["v220籌碼資金分"] = fund_scores
+    out["v220時事題材分"] = news_scores
+    out["v220風險分層"] = risk_levels
+    out["v220風險估計分"] = risk_scores
+    out["v220最終智能分"] = final_scores
+    out["v220最終進場訊號"] = final_signals
+    out["v220加分原因"] = reasons
+    out["v220還缺確認"] = confirm_needed
+    return out
+
+
+def _v220_build_ticker_payload(live_df: pd.DataFrame, ctx: Dict[str, Any], max_stocks: int = 8) -> Dict[str, Any]:
+    base = _v218_frontend_initial_market(ctx)
+    items = base.get("items", {}) or {}
+    order = ["wtx", "twii", "twoii", "nq", "es", "sox"]
+    df = live_df.copy() if isinstance(live_df, pd.DataFrame) else pd.DataFrame()
+    if not df.empty:
+        df["代號"] = df["代號"].astype(str).str.zfill(4)
+        sort_cols = [c for c in ["v220最終智能分", "v214調權後分", "即時強度分", "AI總分"] if c in df.columns]
+        if sort_cols:
+            df = df.sort_values(sort_cols, ascending=[False] * len(sort_cols))
+        core = ["2330", "2382", "2313"]
+        ai_top = [c for c in df["代號"].tolist() if c not in core]
+        selected = _unique_keep_order(core + ai_top)[:max_stocks]
+        for code in selected:
+            rowdf = df[df["代號"] == code]
+            if rowdf.empty:
+                nm = LOCAL_STOCK_INFO.get(code, (code, "", "上市"))[0]
+                mkt = LOCAL_STOCK_INFO.get(code, (code, "", "上市"))[2]
+                price = pct = None
+            else:
+                row = rowdf.iloc[0]
+                nm = str(row.get("名稱") or LOCAL_STOCK_INFO.get(code, (code, "", "上市"))[0])
+                mkt = str(row.get("市場") or LOCAL_STOCK_INFO.get(code, (code, "", "上市"))[2])
+                price = _clean_number(row.get("盤中現價"), np.nan)
+                pct = _clean_number(row.get("盤中漲跌幅"), np.nan)
+                if _is_nan(price): price = None
+                if _is_nan(pct): pct = None
+            market_key = "otc" if ("櫃" in str(mkt)) else "tse"
+            items[code] = {
+                "label": f"{nm} {code}",
+                "price": price,
+                "pct": pct,
+                "source": "MIS backend + 前端MIS",
+                "time": "",
+                "code": code,
+                "market": market_key,
+                "yahooSymbols": [f"{code}.TW"],
+            }
+            order.append(code)
+    base["items"] = items
+    base["order"] = order
+    return base
+
+
+def render_v220_realtime_ai_ticker_panel(live_df: pd.DataFrame, ctx: Dict[str, Any], tick_seconds: int = 5) -> None:
+    tick_seconds = int(max(3, min(30, tick_seconds or 5)))
+    payload = json.dumps(_v220_build_ticker_payload(live_df, ctx), ensure_ascii=False)
+    html = f"""
+<div id=\"rt-root\" class=\"rt-root\">
+  <div class=\"rt-head\"><div><div class=\"rt-title\">⚡ v2.20 AI 即時行情跳動面板</div><div class=\"rt-sub\">台積電/廣達/華通 + AI 最看好清單；只跳數字，不重整整頁。</div></div><div class=\"rt-status\"><span id=\"rt-dot\" class=\"dot wait\"></span><span id=\"rt-status-text\">初始化</span></div></div>
+  <div id=\"rt-grid\" class=\"rt-grid\"></div>
+</div>
+<style>
+.rt-root {{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans TC",Arial,sans-serif;border:1px solid #e6e8ef;border-radius:16px;padding:14px 16px;margin:8px 0 18px 0;background:linear-gradient(180deg,#fff,#fbfcff);box-shadow:0 1px 3px rgba(15,23,42,.05)}}
+.rt-head {{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:12px}} .rt-title{{font-size:20px;font-weight:850;color:#111827}} .rt-sub{{font-size:13px;color:#6b7280;margin-top:3px}} .rt-status{{font-size:13px;color:#4b5563;white-space:nowrap;padding-top:4px}}
+.dot{{display:inline-block;width:9px;height:9px;border-radius:99px;margin-right:6px;background:#94a3b8}} .dot.ok{{background:#22c55e;box-shadow:0 0 0 4px rgba(34,197,94,.12)}} .dot.warn{{background:#f59e0b;box-shadow:0 0 0 4px rgba(245,158,11,.12)}} .dot.wait{{background:#94a3b8}}
+.rt-grid{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}} .card{{border:1px solid #edf0f5;border-radius:14px;padding:12px;background:#fff;min-height:104px}} .name{{font-size:13px;color:#475569;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}} .price{{font-size:28px;line-height:1.15;font-weight:850;letter-spacing:-.02em;color:#111827;margin-top:6px}} .pct{{display:inline-flex;align-items:center;margin-top:8px;font-size:13px;font-weight:700;border-radius:999px;padding:3px 8px;background:#f1f5f9;color:#64748b}} .up .pct{{background:#dcfce7;color:#15803d}} .down .pct{{background:#fee2e2;color:#dc2626}} .flat .pct{{background:#f1f5f9;color:#64748b}} .src{{font-size:11px;color:#94a3b8;margin-top:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}} .flash{{animation:flash .35s ease-in-out}} @keyframes flash{{0%{{background:#fef9c3}}100%{{background:#fff}}}} @media(max-width:900px){{.rt-grid{{grid-template-columns:repeat(2,minmax(0,1fr))}}.price{{font-size:24px}}}}
+</style>
+<script>
+(function(){{
+ const CONFIG={payload}; const POLL_MS={tick_seconds}*1000; const state=JSON.parse(JSON.stringify(CONFIG.items||{{}})); const order=CONFIG.order||Object.keys(state); const grid=document.getElementById('rt-grid'); const dot=document.getElementById('rt-dot'); const statusText=document.getElementById('rt-status-text');
+ function fmtPrice(v){{ if(v===null||v===undefined||isNaN(Number(v)))return '-'; return Number(v).toLocaleString(undefined,{{maximumFractionDigits:2}}); }}
+ function fmtPct(v){{ if(v===null||v===undefined||isNaN(Number(v)))return '-'; const n=Number(v); return (n>0?'+':'')+n.toFixed(2)+'%'; }}
+ function clsPct(v){{ const n=Number(v); if(!isFinite(n))return 'flat'; return n>0?'up':(n<0?'down':'flat'); }}
+ function setStatus(k,m){{ dot.className='dot '+k; statusText.textContent=m; }}
+ function initCards(){{ grid.innerHTML=''; order.forEach(id=>{{ const it=state[id]||{{label:id}}; const card=document.createElement('div'); card.className='card '+clsPct(it.pct); card.id='rt-card-'+id; card.innerHTML=`<div class="name">${{it.label||id}}</div><div class="price" id="rt-price-${{id}}">${{fmtPrice(it.price)}}</div><div class="pct" id="rt-pct-${{id}}">${{fmtPct(it.pct)}}</div><div class="src" id="rt-src-${{id}}">${{it.source||'等待更新'}}</div>`; grid.appendChild(card); }}); }}
+ function updateCard(id,next){{ if(!next)return; const prev=state[id]||{{}}; const oldPrice=Number(prev.price); state[id]=Object.assign({{}},prev,next); const it=state[id]; const pe=document.getElementById('rt-price-'+id), pct=document.getElementById('rt-pct-'+id), src=document.getElementById('rt-src-'+id), card=document.getElementById('rt-card-'+id); if(!pe||!card)return; pe.textContent=fmtPrice(it.price); pct.textContent=fmtPct(it.pct); src.textContent=(it.source||'')+(it.time?'｜'+String(it.time).slice(0,16):''); card.className='card '+clsPct(it.pct); if(isFinite(oldPrice)&&isFinite(Number(it.price))&&oldPrice!==Number(it.price)){{ card.classList.remove('flash'); void card.offsetWidth; card.classList.add('flash'); }} }}
+ async function fetchGithubContext(){{ try{{ const r=await fetch(CONFIG.githubRaw+'?_='+Date.now(),{{cache:'no-store'}}); if(!r.ok)return null; return await r.json(); }}catch(e){{return null;}} }}
+ function updateFromContext(ctx){{ if(!ctx)return 0; let c=0; const idx=ctx.indices||{{}}, night=ctx.night_proxies||{{}}, fut=ctx.taiwan_futures||{{}}; function upd(id,obj){{ obj=obj||{{}}; const p=Number(obj.price), q=Number(obj.change_pct); if(isFinite(p)&&p>0){{ updateCard(id,{{price:p,pct:isFinite(q)?q:null,source:obj.source||'GitHub背景',time:obj.time||obj.updated_at||ctx.updated_at||''}}); c++; }} }} upd('twii',idx.TWII); upd('twoii',idx.TWOII); upd('wtx',(fut.TXF||night.TXF||idx.TXF)); upd('nq',night['NQ=F']); upd('es',night['ES=F']); upd('sox',night.SOX); return c; }}
+ async function fetchTWSEMIS(){{ const stocks=order.filter(id=>state[id]&&state[id].code); if(!stocks.length)return 0; const ex=stocks.map(id=>((state[id].market==='otc')?'otc_':'tse_')+state[id].code+'.tw').join('|'); try{{ const url='https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch='+encodeURIComponent(ex)+'&_='+Date.now(); const r=await fetch(url,{{cache:'no-store'}}); if(!r.ok)return 0; const j=await r.json(); let c=0; (j.msgArray||[]).forEach(m=>{{ const code=String(m.c||'').padStart(4,'0'); const z=Number(m.z||m.a||m.b); const y=Number(m.y); if(isFinite(z)&&z>0){{ const pct=(isFinite(y)&&y>0)?((z-y)/y*100):null; updateCard(code,{{price:z,pct:pct,source:'TWSE MIS 前端',time:m.t||new Date().toLocaleTimeString('zh-TW',{{hour12:false}})}}); c++; }} }}); return c; }}catch(e){{return 0;}} }}
+ async function tick(){{ let ok=0; ok+=updateFromContext(await fetchGithubContext()); ok+=await fetchTWSEMIS(); if(ok>0)setStatus('ok','即時更新 '+new Date().toLocaleTimeString('zh-TW',{{hour12:false}})); else setStatus('warn','外部報價暫未回應，沿用背景/MIS後端值'); }}
+ initCards(); tick(); setInterval(tick,POLL_MS);
+}})();
+</script>
+"""
+    components.html(html, height=520, scrolling=False)
+
+
+def render_v220_multifactor_cockpit(df: pd.DataFrame, top_n: int = 15) -> None:
+    if df is None or df.empty:
+        return
+    cols = [c for c in ["代號", "名稱", "v220最終進場訊號", "v220最終智能分", "v220技術分", "v220籌碼資金分", "v220時事題材分", "v220風險分層", "v220風險估計分", "盤中現價", "盤中漲跌幅", "v219右側精準進場", "左側試單價", "右側加碼價", "防守停損", "v220加分原因", "v220還缺確認"] if c in df.columns]
+    show = df.copy()
+    sort_cols = [c for c in ["v220最終智能分", "v220技術分", "v220籌碼資金分"] if c in show.columns]
+    if sort_cols:
+        show = show.sort_values(sort_cols, ascending=[False]*len(sort_cols))
+    st.subheader("🧠 v2.20 多因子智能決策中控台")
+    st.caption("整合技術分析、籌碼資金、題材/即時時事代理、大盤夜盤環境與風險分層；目前未接正式新聞 API，時事分先用題材/產業/美盤 proxy，接新聞源後可再升級。")
+    st.dataframe(show[cols].head(int(top_n)), use_container_width=True, hide_index=True)
+
 # -----------------------------
 # v2.18 front-end realtime quote panel
 # -----------------------------
@@ -4866,9 +5118,9 @@ v216_context = load_v216_context()
 
 tick_default = _get_query_int("tick", 5, 3, 30, 1)
 
-st.title("🚨 盤中即時看盤 v2.19.2 即時警示事件引擎｜右側進場防呆版")
-st.caption("v2.19.2 修正：補上右側進場判斷缺少的 _is_nan 防呆，價格缺值或文字不會再讓整頁當機。")
-render_v218_realtime_ticker_panel(v216_context, tick_seconds=tick_default)
+st.title("🧠 盤中即時看盤 v2.20 多因子智能決策引擎｜AI即時選股 + 右側精準")
+st.caption("v2.20 修正：即時行情不再只固定廣達/華通；改成台積電、廣達、華通 + AI系統最看好清單，並整合技術、籌碼資金、時事題材、大盤夜盤與風險分層。")
+# v2.20: realtime ticker panel is rendered after live_df is built, so stock prices can use backend MIS quotes first.
 render_v216_context(v216_context)
 st.divider()
 
@@ -5047,6 +5299,12 @@ live_df = apply_v28_entry_signal_overrides(live_df)
 live_df, intraday_memory_df = update_intraday_memory_features(live_df)
 live_df = add_v29_left_predictive_ai(live_df, chase_pct=chase_pct)
 live_df = add_v210_trader_decision(live_df, chase_pct=chase_pct)
+live_df = add_v220_multifactor_decision(live_df, v216_context)
+
+# v2.20 realtime AI-selected ticker is rendered after MIS quote merge so 廣達/華通/台積電 have backend prices first.
+render_v220_realtime_ai_ticker_panel(live_df, v216_context, tick_seconds=live_tick_seconds)
+render_v220_multifactor_cockpit(live_df, top_n=top_n)
+st.divider()
 
 # v2.11 stable learning + v2.12 lifecycle state machine.
 v211_learning_log_df = update_v211_signal_learning(live_df)
