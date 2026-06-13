@@ -4272,7 +4272,7 @@ def _v216_asset_row(obj: Dict[str, Any], fallback_label: str) -> Dict[str, Any]:
         "漲跌幅": _v216_pct_text(obj.get("change_pct")) if valid else "-",
         "昨收/前收": _v216_price_text(obj.get("previous_close")) if valid else "-",
         "來源": str(obj.get("source") or "-"),
-        "狀態": "✅ 有效" if valid else "⚠️ 未取得有效價",
+        "狀態": ("📌 收盤/結算價" if (valid and str(obj.get("price_type", "")) in {"last_close", "settlement_close"}) else ("🕒 快取價" if (valid and bool(obj.get("cached"))) else ("✅ 有效" if valid else "⚠️ 未取得有效價"))),
     }
 
 
@@ -4318,8 +4318,13 @@ def render_v216_context(ctx: Dict[str, Any]) -> None:
     k3.metric("櫃買指數", _v216_metric_price(twoii, "櫃買指數"), _v216_metric_pct(twoii, "櫃買指數"))
     k4.metric("NASDAQ 期貨", _v216_metric_price(nq, "NASDAQ 期貨"), _v216_metric_pct(nq, "NASDAQ 期貨"))
 
-    if not _v216_valid_market_price(txf, "台指期近月"):
-        st.warning("台指期近月目前沒有取得有效即時價，系統不會再用 0.00 當成台指價。大盤環境暫以加權、櫃買、NASDAQ/S&P 期貨、費半與市場廣度輔助判斷。")
+    if _v216_valid_market_price(txf, "台指期近月") and str((txf or {}).get("price_type", "")) in {"last_close", "settlement_close"}:
+        date_txt = _safe_text((txf or {}).get("date"), "最近交易日")
+        st.info(f"台指期近月目前顯示的是 {date_txt} 的『收盤 / 結算價』，不是即時成交價；休市或週末會用這個作為市場背景參考，不會當成盤中新訊號。")
+    elif _v216_valid_market_price(txf, "台指期近月") and bool((txf or {}).get("cached")):
+        st.warning("台指期近月目前顯示的是『最後有效快取價』，不是即時成交價。休市 / 週末 / 資料源暫時失敗時會這樣顯示，系統會降低台指權重，不會把它當成全新即時訊號。")
+    elif not _v216_valid_market_price(txf, "台指期近月"):
+        st.warning("台指期近月目前沒有取得有效即時價或收盤價，系統不會再用 0.00 當成台指價。大盤環境暫以加權、櫃買、NASDAQ/S&P 期貨、費半與市場廣度輔助判斷。")
 
     # 3) Secondary macro line, compact.
     m1, m2, m3, m4 = st.columns(4)
@@ -4365,8 +4370,8 @@ def render_v216_context(ctx: Dict[str, Any]) -> None:
 
 v216_context = load_v216_context()
 
-st.title("🌐 盤中即時看盤 v2.16.5 市場環境中控台｜台指近月版")
-st.caption("v2.16.5 修正：台指改抓「台指期近月」，優先使用 FinMind 台股期貨即時資訊；若抓不到不再顯示 0.00。")
+st.title("🌐 盤中即時看盤 v2.16.7 市場環境中控台｜台指近月收盤價版")
+st.caption("v2.16.7 修正：台指期近月即時抓不到時，改顯示最近交易日的收盤 / 結算價；不再用 0.00 或空白誤導。")
 render_v216_context(v216_context)
 st.divider()
 
