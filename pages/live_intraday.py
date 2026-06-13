@@ -4324,7 +4324,7 @@ def render_v216_context(ctx: Dict[str, Any]) -> None:
     elif _v216_valid_market_price(txf, "台指期近月") and bool((txf or {}).get("cached")):
         st.warning("台指期近月目前顯示的是『最後有效快取價』，不是即時成交價。休市 / 週末 / 資料源暫時失敗時會這樣顯示，系統會降低台指權重，不會把它當成全新即時訊號。")
     elif not _v216_valid_market_price(txf, "台指期近月"):
-        st.warning("台指期近月目前沒有取得有效即時價或收盤價。請先跑 v2.16.8 背景任務；系統不會再用 0.00 當成台指價。")
+        st.warning("台指期近月目前沒有取得有效即時價或收盤價。請先跑 v2.16.9 背景任務；系統不會再用 0.00 當成台指價。")
 
     # 3) Secondary macro line, compact.
     m1, m2, m3, m4 = st.columns(4)
@@ -4370,8 +4370,8 @@ def render_v216_context(ctx: Dict[str, Any]) -> None:
 
 v216_context = load_v216_context()
 
-st.title("🌐 盤中即時看盤 v2.16.8 市場環境中控台｜台指近月強化版")
-st.caption("v2.16.8 修正：台指期近月改用 Yahoo 近一列強化解析 + FinMind TX 官方日資料備援；假日仍顯示最近收盤/結算，不再空白。")
+st.title("🌐 盤中即時看盤 v2.16.9 市場環境中控台｜WTX&台指近一修正版")
+st.caption("v2.16.9 修正：台指期近月固定使用 Yahoo 股市台指期近一 WTX& 專頁作為第一來源，避免誤抓加權指數。")
 render_v216_context(v216_context)
 st.divider()
 
