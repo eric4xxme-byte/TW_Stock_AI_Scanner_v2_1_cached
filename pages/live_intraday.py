@@ -3560,6 +3560,14 @@ def update_v213_signal_journal(lifecycle_df: pd.DataFrame) -> pd.DataFrame:
             "風險分": round(_clean_number(row.get("風險分")), 2),
             "盤中漲跌幅": round(_clean_number(row.get("盤中漲跌幅")), 3),
             "刷新漲速%": round(_clean_number(row.get("刷新漲速%")), 3),
+            "v231資料品質分": round(_clean_number(row.get("v231資料品質分")), 2),
+            "v231漲停前兆候選": row.get("v231漲停前兆候選", ""),
+            "v231漲停前兆蒐集分": round(_clean_number(row.get("v231漲停前兆蒐集分")), 2),
+            "v231漲停距離%": round(_clean_number(row.get("v231漲停距離%"), np.nan), 3) if not _is_nan(row.get("v231漲停距離%")) else "",
+            "v231短線漲速分": round(_clean_number(row.get("v231短線漲速分")), 2),
+            "v231量能跳升分": round(_clean_number(row.get("v231量能跳升分")), 2),
+            "v231二次攻擊分": round(_clean_number(row.get("v231二次攻擊分")), 2),
+            "v231前兆蒐集原因": row.get("v231前兆蒐集原因", ""),
             "狀態歷程": hist[-900:],
             "狀態變更次數": change_count,
             "最新時間": now_s,
@@ -5821,12 +5829,243 @@ def render_v223_focus(df: pd.DataFrame, top_n: int = 12) -> None:
     st.dataframe(picked[cols], use_container_width=True, hide_index=True)
 
 
+
+# -----------------------------------------------------------------------------
+# v2.23.1 Data Quality + Limit-up Precursor Feature Collection
+# -----------------------------------------------------------------------------
+V231_LIMITUP_FEATURE_PATH = DATA_DIR / "v231_limitup_precursor_features.csv"
+
+
+def _v231_clip(value: float, low: float = 0.0, high: float = 100.0) -> float:
+    try:
+        if _is_nan(value):
+            return low
+        return max(low, min(high, float(value)))
+    except Exception:
+        return low
+
+
+def _v231_limit_up_distance(px: float, prev_close: float) -> float:
+    """Distance from current price to Taiwan 10% limit-up, in percent.
+
+    This is a collection/diagnostic feature for v2.24 training.  It is not a buy
+    signal by itself.
+    """
+    try:
+        if px <= 0 or prev_close <= 0:
+            return np.nan
+        limit_px = prev_close * 1.10
+        return round((limit_px - px) / px * 100.0, 3)
+    except Exception:
+        return np.nan
+
+
+def add_v231_limitup_collection_features(df: pd.DataFrame, ctx: Dict[str, Any]) -> pd.DataFrame:
+    """v2.23.1: collect the exact fields needed to train v2.24 later.
+
+    The purpose is not to create a stronger buy signal today.  The purpose is to
+    log clean, comparable features for several trading days, especially cases
+    that later went near limit-up, failed, or were missed.
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    rows = []
+    market_score, night_risk, market_label = _v223_market_state(ctx if isinstance(ctx, dict) else {})
+
+    for _, row in out.iterrows():
+        px = _clean_number(row.get("盤中現價"), np.nan)
+        pct = _clean_number(row.get("盤中漲跌幅"), 0.0)
+        prev_close = _clean_number(row.get("昨收"), np.nan)
+        high = _clean_number(row.get("最高"), np.nan)
+        low = _clean_number(row.get("最低"), np.nan)
+        vol = _clean_number(row.get("盤中成交量"), 0.0)
+        speed_now = _clean_number(row.get("刷新漲速%"), 0.0)
+        speed_1 = _clean_number(row.get("1分漲速%"), speed_now)
+        speed_3 = _clean_number(row.get("3分漲速%"), 0.0)
+        speed_5 = _clean_number(row.get("5分漲速%"), 0.0)
+        vol_jump = _clean_number(row.get("量能跳升分"), 0.0)
+        money_score = _clean_number(row.get("盤中資金分"), 0.0)
+        left_score = _clean_number(row.get("左側低吸分"), 0.0)
+        v29_limit = _clean_number(row.get("v29漲停前兆分") or row.get("漲停前兆分"), 0.0)
+        strength = _clean_number(row.get("即時強度分"), 0.0)
+        risk = _clean_number(row.get("風險分"), 0.0)
+        ai = _clean_number(row.get("AI總分"), 0.0)
+        rank = _clean_number(row.get("市場池排名"), np.nan)
+        pullback = _clean_number(row.get("記憶回檔幅度%"), np.nan)
+
+        limit_dist = _v231_limit_up_distance(px, prev_close)
+        day_range = ((high - low) / prev_close * 100.0) if (not _is_nan(high) and not _is_nan(low) and prev_close > 0) else np.nan
+        breakout_intraday_high = bool(px > 0 and high > 0 and px >= high * 0.998)
+        near_limit = bool((pct >= 8.5) or (not _is_nan(limit_dist) and limit_dist <= 1.5))
+
+        speed_score = _v231_clip(max(speed_now, speed_1) * 18 + max(speed_3, 0) * 9 + max(speed_5, 0) * 5 + max(pct, 0) * 3)
+        volume_score = _v231_clip(vol_jump * 0.75 + (15 if vol > 0 else 0) + min(max(vol, 0) / 50000, 20))
+        reattack_score = 0.0
+        if not _is_nan(pullback):
+            if -3.5 <= pullback <= -0.2 and speed_now >= -0.2:
+                reattack_score += 35
+            if speed_now > 0:
+                reattack_score += 20
+            if money_score >= 55:
+                reattack_score += 20
+            if left_score >= 55:
+                reattack_score += 15
+        if str(row.get("回檔再攻狀態", "")).strip() not in {"", "⚪ 無明確再攻", "⚪ 無報價"}:
+            reattack_score += 10
+        reattack_score = _v231_clip(reattack_score)
+
+        heat_score = _v231_clip(
+            v29_limit * 0.30 + speed_score * 0.25 + volume_score * 0.20 + reattack_score * 0.15 + max(market_score - 50, 0) * 0.10
+        )
+        data_quality_items = [
+            1 if px > 0 else 0,
+            1 if prev_close > 0 else 0,
+            1 if "1分漲速%" in row.index else 0,
+            1 if "3分漲速%" in row.index else 0,
+            1 if "盤中資金分" in row.index else 0,
+            1 if "v223最終訊號" in row.index else 0,
+            1 if isinstance(ctx, dict) and bool(ctx) else 0,
+        ]
+        data_quality = round(sum(data_quality_items) / max(len(data_quality_items), 1) * 100, 1)
+
+        reasons = []
+        if near_limit:
+            reasons.append("接近漲停/高溫樣本")
+        if speed_score >= 60:
+            reasons.append("短線漲速升溫")
+        if volume_score >= 55:
+            reasons.append("量能跳升")
+        if reattack_score >= 55:
+            reasons.append("回檔二次攻擊特徵")
+        if breakout_intraday_high:
+            reasons.append("貼近日內高點")
+        if market_score >= 65:
+            reasons.append("大盤環境支持")
+        if not reasons:
+            reasons.append("一般樣本，供日後對照")
+
+        if heat_score >= 75 or near_limit:
+            candidate = "🔥 高溫樣本｜優先追蹤"
+        elif heat_score >= 60:
+            candidate = "🚀 漲停前兆候選"
+        elif heat_score >= 45:
+            candidate = "👀 前兆觀察"
+        else:
+            candidate = "⚪ 一般對照"
+
+        rows.append({
+            "v231資料品質分": data_quality,
+            "v231漲停前兆候選": candidate,
+            "v231漲停前兆蒐集分": round(heat_score, 2),
+            "v231漲停距離%": round(limit_dist, 3) if not _is_nan(limit_dist) else np.nan,
+            "v231短線漲速分": round(speed_score, 2),
+            "v231量能跳升分": round(volume_score, 2),
+            "v231二次攻擊分": round(reattack_score, 2),
+            "v231日內振幅%": round(day_range, 3) if not _is_nan(day_range) else np.nan,
+            "v231貼近日內高": "是" if breakout_intraday_high else "否",
+            "v231市場背景分": round(market_score, 2),
+            "v231夜盤風險分": round(night_risk, 2),
+            "v231市場標籤": market_label,
+            "v231前兆蒐集原因": "、".join(reasons),
+            "v231後續驗證目標": "5~15分鐘內是否續攻/接近漲停/衝高回落",
+            "v231市場池排名": round(rank, 0) if not _is_nan(rank) else np.nan,
+            "v231AI總分": round(ai, 2),
+            "v231風險分": round(risk, 2),
+        })
+    feat = pd.DataFrame(rows, index=out.index)
+    for c in feat.columns:
+        out[c] = feat[c]
+    return out
+
+
+def save_v231_limitup_feature_samples(df: pd.DataFrame, max_rows: int = 5000) -> pd.DataFrame:
+    """Save a compact local feature sample for inspection.
+
+    The main long-term learning still comes from v2.15 Google Sheet/background
+    sync.  This CSV is an additional diagnostic file for v2.24 design.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+    now = now_taipei()
+    cols = [
+        "代號", "名稱", "市場", "產業", "盤中現價", "盤中漲跌幅", "昨收", "最高", "最低", "盤中成交量", "報價時間",
+        "v223最終訊號", "v223最終分", "v223風險層級", "v223買賣結論",
+        "v231資料品質分", "v231漲停前兆候選", "v231漲停前兆蒐集分", "v231漲停距離%", "v231短線漲速分", "v231量能跳升分", "v231二次攻擊分", "v231日內振幅%", "v231貼近日內高", "v231市場背景分", "v231夜盤風險分", "v231前兆蒐集原因", "v231後續驗證目標",
+        "1分漲速%", "3分漲速%", "5分漲速%", "刷新漲速%", "盤中資金分", "左側低吸分", "v29漲停前兆分", "AI總分", "風險分",
+    ]
+    rows = df[_cols_exist(df, cols)].copy()
+    if rows.empty:
+        return rows
+    rows.insert(0, "樣本日期", now.strftime("%Y-%m-%d"))
+    rows.insert(1, "樣本時間", now.strftime("%H:%M:%S"))
+    rows.insert(2, "樣本Key", rows["樣本日期"].astype(str) + "_" + rows["樣本時間"].astype(str) + "_" + rows.get("代號", "").astype(str).str.zfill(4))
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        if V231_LIMITUP_FEATURE_PATH.exists():
+            old = pd.read_csv(V231_LIMITUP_FEATURE_PATH)
+            all_rows = pd.concat([old, rows], ignore_index=True)
+            if "樣本Key" in all_rows.columns:
+                all_rows = all_rows.drop_duplicates(subset=["樣本Key"], keep="last")
+            all_rows = all_rows.tail(max_rows).copy()
+        else:
+            all_rows = rows.tail(max_rows).copy()
+        all_rows.to_csv(V231_LIMITUP_FEATURE_PATH, index=False, encoding="utf-8-sig")
+        return rows
+    except Exception:
+        return rows
+
+
+def render_v231_data_quality_and_limitup_collector(df: pd.DataFrame, ctx: Dict[str, Any], sample_rows: Optional[pd.DataFrame] = None) -> None:
+    st.subheader("🧪 v2.23.1 資料品質 + 漲停前兆欄位蒐集")
+    st.caption("這一版先收集 v2.24 需要的真實樣本；這裡不是正式買賣訊號，不會取代 v2.23 最終決策。")
+    if df is None or df.empty:
+        st.info("目前沒有資料可以檢查。")
+        return
+    total = len(df)
+    px_ok = int(pd.to_numeric(df.get("盤中現價", pd.Series(dtype=float)), errors="coerce").fillna(0).gt(0).sum())
+    q_cov = px_ok / max(total, 1) * 100
+    speed_cols = [c for c in ["1分漲速%", "3分漲速%", "5分漲速%", "刷新漲速%"] if c in df.columns]
+    if speed_cols:
+        speed_cov = float(pd.concat([pd.to_numeric(df[c], errors="coerce") for c in speed_cols], axis=1).notna().any(axis=1).mean() * 100)
+    else:
+        speed_cov = 0.0
+    event_cov = float(df.get("v221最新事件", pd.Series([""] * total)).astype(str).str.len().gt(3).mean() * 100) if total else 0.0
+    market_ok = bool(isinstance(ctx, dict) and ctx)
+    hot_n = int(df.get("v231漲停前兆候選", pd.Series(dtype=str)).astype(str).str.contains("高溫|前兆", regex=True).sum()) if "v231漲停前兆候選" in df.columns else 0
+    quality_avg = float(pd.to_numeric(df.get("v231資料品質分", pd.Series(dtype=float)), errors="coerce").fillna(0).mean()) if total else 0.0
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("報價覆蓋率", f"{q_cov:.1f}%")
+    c2.metric("記憶/漲速覆蓋", f"{speed_cov:.1f}%")
+    c3.metric("新聞欄位覆蓋", f"{event_cov:.1f}%")
+    c4.metric("前兆/高溫樣本", hot_n)
+    c5.metric("平均資料品質", f"{quality_avg:.1f}")
+    if not market_ok:
+        st.warning("大盤/夜盤背景檔目前沒有讀到；v2.24 樣本仍會保存，但市場環境欄位會不足。")
+    if q_cov < 70:
+        st.warning("報價覆蓋率偏低，今天的樣本不適合直接拿來調權重。")
+    elif quality_avg < 60:
+        st.warning("資料品質偏低，建議先檢查報價、記憶層、新聞欄位是否正常。")
+    else:
+        st.success("資料品質足以開始蒐集 v2.24 漲停前兆樣本。")
+
+    work = df.copy()
+    if "v231漲停前兆蒐集分" in work.columns:
+        work = _safe_sort(work, ["v231漲停前兆蒐集分", "v223最終分", "即時強度分"], ascending=[False, False, False])
+    cols = _cols_exist(work, [
+        "代號", "名稱", "盤中現價", "盤中漲跌幅", "v231漲停前兆候選", "v231漲停前兆蒐集分", "v231漲停距離%", "v231短線漲速分", "v231量能跳升分", "v231二次攻擊分", "v231前兆蒐集原因", "v223最終訊號", "v223風險層級", "v223買賣結論"
+    ])
+    if cols:
+        st.dataframe(work[cols].head(15), use_container_width=True, hide_index=True)
+    if sample_rows is not None and not sample_rows.empty:
+        st.caption(f"已寫入本輪前兆樣本 {len(sample_rows)} 筆到 `{V231_LIMITUP_FEATURE_PATH}`。長期學習仍以 Google Sheet / 背景同步為主。")
+
 v216_context = load_v216_context()
 
 tick_default = _get_query_int("tick", 5, 3, 30, 1)
 
-st.title("🧭 盤中即時看盤 v2.23 核心重構｜決策一致性引擎")
-st.caption("v2.23 重點：把技術、籌碼資金、事件可信度、大盤夜盤與風險否決整合成一個最終訊號，避免同一檔股票出現多個互相矛盾判斷。")
+st.title("🧪 盤中即時看盤 v2.23.1 資料品質 + 漲停前兆欄位蒐集")
+st.caption("v2.23.1 重點：保留 v2.23 最終進場決策，並開始蒐集漲停前 5～15 分鐘預警模型需要的真實欄位與資料品質指標。")
 # v2.20: realtime ticker panel is rendered after live_df is built, so stock prices can use backend MIS quotes first.
 render_v216_context(v216_context)
 st.divider()
@@ -6011,11 +6250,14 @@ v221_news_context = build_v221_news_context(live_df)
 live_df = add_v221_news_event_decision(live_df, v221_news_context)
 live_df = add_v222_event_quality_decision(live_df, v221_news_context)
 live_df = add_v223_consistency_decision(live_df, v216_context)
+live_df = add_v231_limitup_collection_features(live_df, v216_context)
+v231_current_samples_df = save_v231_limitup_feature_samples(live_df)
 
 # v2.23 realtime AI-selected ticker is rendered after MIS quote merge so 廣達/華通/台積電 have backend prices first.
 render_v220_realtime_ai_ticker_panel(live_df, v216_context, tick_seconds=live_tick_seconds)
 render_v223_consistency_cockpit(live_df, v216_context, top_n=top_n)
 render_v223_focus(live_df, top_n=max(top_n, 12))
+render_v231_data_quality_and_limitup_collector(live_df, v216_context, v231_current_samples_df)
 with st.expander("🧪 事件 / 多因子原始分數", expanded=False):
     render_v222_event_quality_cockpit(live_df, v221_news_context, top_n=top_n)
     render_v220_multifactor_cockpit(live_df, top_n=top_n)
@@ -6045,6 +6287,7 @@ lifecycle_df = apply_v214_auto_weights(lifecycle_df, v214_weight_profile)
 lifecycle_df = apply_v216_market_adjustment(lifecycle_df, v216_context)
 lifecycle_df = add_v219_right_entry_signal(lifecycle_df)
 lifecycle_df = add_v223_consistency_decision(lifecycle_df, v216_context)
+lifecycle_df = add_v231_limitup_collection_features(lifecycle_df, v216_context)
 v213_summary = build_v213_journal_summary(v213_signal_journal_df)
 v215_current_verified_df = build_v215_postclose_verification(v213_signal_journal_df, lifecycle_df)
 v215_existing_verified_df = _v215_load_verified_journal()
