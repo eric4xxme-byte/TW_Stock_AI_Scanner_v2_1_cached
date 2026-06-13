@@ -1,4 +1,4 @@
-name: v2.16.1 Market Context + Background Learning Sync
+name: v2.16.5 Market Context + Background Learning Sync
 
 on:
   workflow_dispatch:
@@ -52,12 +52,15 @@ jobs:
           git pull --rebase --autostash origin main
 
       - name: Build v2.16 market / night context
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
         run: |
           python background_market_context.py
 
       - name: Run v2.16 background learning sync
         env:
           GSHEET_WEBHOOK_URL: ${{ secrets.GSHEET_WEBHOOK_URL }}
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
           BACKGROUND_POOL_LIMIT: '180'
           BACKGROUND_SYNC_LIMIT: '120'
           BACKGROUND_BATCH_SIZE: '20'
