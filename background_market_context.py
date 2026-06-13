@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-TW Stock AI Scanner v2.16.7｜Market / night-session context builder
+TW Stock AI Scanner v2.16.8｜Market / night-session context builder
 
 Purpose:
 - Run from GitHub Actions without opening Streamlit.
@@ -466,35 +466,88 @@ def fetch_tw_yahoo_futures() -> Dict[str, Any]:
         if text:
             flat = re.sub(r"<[^>]+>", " ", text)
             flat = re.sub(r"\s+", " ", flat)
-            contracts = [
-                ("TXF", "台指期近月", r"台指期(?:近一|近月)\s*WTX[^0-9-]*([0-9,]+(?:\.[0-9]+)?)\s*([0-9,]+(?:\.[0-9]+)?)\s*([0-9,]+(?:\.[0-9]+)?)\s*([+-]?[0-9,]+(?:\.[0-9]+)?)\s*([+-]?[0-9]+(?:\.[0-9]+)?)%"),
-                ("MTX", "小台近月", r"小台(?:指)?(?:近一|近月)\s*[^0-9-]*([0-9,]+(?:\.[0-9]+)?)\s*([0-9,]+(?:\.[0-9]+)?)\s*([0-9,]+(?:\.[0-9]+)?)\s*([+-]?[0-9,]+(?:\.[0-9]+)?)\s*([+-]?[0-9]+(?:\.[0-9]+)?)%"),
+            def parse_yahoo_contract(key: str, label: str, name_patterns: List[str], symbol_hint: str) -> Optional[Dict[str, Any]]:
+                """Robustly parse Yahoo Taiwan futures rows.
+
+                Yahoo's HTML changes frequently. The stable information is the
+                row text around labels such as 台指期近一 / WTX&. In that row the
+                common order is: bid, ask, last, change, change_pct, volume,
+                open, high, low, spread, reference, open_interest, time. This
+                parser is deliberately tolerant and falls back to bid/ask
+                midpoint if a traded last price is not present.
+                """
+                starts = []
+                for pat in name_patterns + [symbol_hint]:
+                    if not pat:
+                        continue
+                    i = flat.find(pat)
+                    if i >= 0:
+                        starts.append(i)
+                if not starts:
+                    return None
+                start = min(starts)
+                window = flat[start:start + 1800]
+                # Keep percentages as separate tokens; normal numbers are prices/volumes.
+                tokens = re.findall(r"[+-]?\d{1,3}(?:,\d{3})*(?:\.\d+)?%?|[+-]?\d+(?:\.\d+)?%?", window)
+                nums = []
+                pcts = []
+                for t in tokens:
+                    if t.endswith('%'):
+                        val = clean_num(t[:-1])
+                        if val is not None:
+                            pcts.append(val)
+                    else:
+                        val = clean_num(t)
+                        if val is not None:
+                            nums.append(val)
+                # Remove clearly impossible small values before the first price cluster.
+                price_like = [x for x in nums if valid_taifex_price(x)]
+                if not price_like:
+                    return None
+                bid = ask = None
+                price_f = None
+                change_f = None
+                pct_f = pcts[0] if pcts else None
+                # Normal Yahoo row: bid, ask, last, change, ...
+                if len(price_like) >= 3:
+                    bid, ask, price_f = price_like[0], price_like[1], price_like[2]
+                elif len(price_like) == 2:
+                    bid, ask = price_like[0], price_like[1]
+                    price_f = round((bid + ask) / 2, 2)
+                else:
+                    price_f = price_like[0]
+                # Find the first plausible non-price signed/short number after the price cluster as change.
+                short_nums = [x for x in nums if abs(x) < 2000]
+                if short_nums:
+                    # Avoid choosing pct-like values if a pct token already exists; first valid is usually change.
+                    change_f = short_nums[0]
+                prev = price_f - change_f if price_f is not None and change_f is not None else None
+                return {
+                    "ok": valid_taifex_price(price_f),
+                    "symbol": symbol_hint,
+                    "label": label,
+                    "price": price_f if valid_taifex_price(price_f) else None,
+                    "previous_close": prev if valid_taifex_price(price_f) else None,
+                    "change": change_f if valid_taifex_price(price_f) else None,
+                    "change_pct": pct_f if valid_taifex_price(price_f) else None,
+                    "bid": bid,
+                    "ask": ask,
+                    "source": "Yahoo Taiwan futures page robust fallback",
+                    "updated_at": now_tw().strftime("%Y-%m-%d %H:%M:%S"),
+                    "parse_window": window[:260],
+                }
+
+            yahoo_contracts = [
+                ("TXF", "台指期近月", ["台指期近一", "台指期近月", "臺指期近一", "臺指期近月"], "WTX&"),
+                ("MTX", "小台近月", ["小台指近一", "小台近一", "小臺指近一", "小臺近一"], "MTX&"),
             ]
-            for key, label, pattern in contracts:
+            for key, label, names, symbol_hint in yahoo_contracts:
                 if result.get(key, {}).get("ok"):
                     continue
-                m = re.search(pattern, flat)
-                if m:
-                    bid, ask, price, change, pct = m.groups()[:5]
-                    price_f = clean_num(price)
-                    change_f = clean_num(change)
-                    pct_f = clean_num(pct)
-                    prev = price_f - change_f if price_f is not None and change_f is not None else None
-                    parsed_quote = {
-                        "ok": valid_taifex_price(price_f),
-                        "symbol": "WTX&" if key == "TXF" else "MTX&",
-                        "label": label,
-                        "price": price_f if valid_taifex_price(price_f) else None,
-                        "previous_close": prev if valid_taifex_price(price_f) else None,
-                        "change": change_f if valid_taifex_price(price_f) else None,
-                        "change_pct": pct_f if valid_taifex_price(price_f) else None,
-                        "bid": clean_num(bid),
-                        "ask": clean_num(ask),
-                        "source": "Yahoo Taiwan futures page fallback",
-                        "updated_at": now_tw().strftime("%Y-%m-%d %H:%M:%S"),
-                    }
-                    if not valid_taifex_price(price_f):
-                        parsed_quote.update({"error": f"invalid parsed futures price: {price_f}"})
+                parsed_quote = parse_yahoo_contract(key, label, names, symbol_hint)
+                if parsed_quote:
+                    if not parsed_quote.get("ok"):
+                        parsed_quote.update({"error": f"invalid parsed futures price: {parsed_quote.get('price')}"})
                     result[key].update(parsed_quote)
     except Exception as exc:
         if not result["TXF"].get("ok"):
@@ -504,17 +557,32 @@ def fetch_tw_yahoo_futures() -> Dict[str, Any]:
     # On weekends and holidays TXF has no live trade, but it still has the most
     # recent official close / settlement. Use that before falling back to local cache.
     if not result["TXF"].get("ok"):
-        txf_close = fetch_finmind_futures_daily_close("TXF", "台指期近月")
-        if txf_close.get("ok"):
-            result["TXF"] = txf_close
-        else:
-            result["TXF"].update({"daily_close_error": txf_close.get("error")})
+        # FinMind daily futures historically uses TX for TAIEX futures, while
+        # some realtime feeds use TXF/TXFR1. Try TX first for official last
+        # close / settlement, then TXF as a compatibility fallback.
+        last_err = None
+        for code in ["TX", "TXF"]:
+            txf_close = fetch_finmind_futures_daily_close(code, "台指期近月")
+            if txf_close.get("ok"):
+                txf_close["symbol"] = txf_close.get("symbol") or code
+                txf_close["requested_data_id"] = code
+                result["TXF"] = txf_close
+                break
+            last_err = txf_close.get("error")
+        if not result["TXF"].get("ok"):
+            result["TXF"].update({"daily_close_error": last_err})
     if not result["MTX"].get("ok"):
-        mtx_close = fetch_finmind_futures_daily_close("MTX", "小台近月")
-        if mtx_close.get("ok"):
-            result["MTX"] = mtx_close
-        else:
-            result["MTX"].update({"daily_close_error": mtx_close.get("error")})
+        last_err = None
+        for code in ["MTX", "MXF", "MX"]:
+            mtx_close = fetch_finmind_futures_daily_close(code, "小台近月")
+            if mtx_close.get("ok"):
+                mtx_close["symbol"] = mtx_close.get("symbol") or code
+                mtx_close["requested_data_id"] = code
+                result["MTX"] = mtx_close
+                break
+            last_err = mtx_close.get("error")
+        if not result["MTX"].get("ok"):
+            result["MTX"].update({"daily_close_error": last_err})
 
     # 4) Last local cache fallback if even official daily close is unavailable.
     # This is marked as cached so the UI can distinguish it from live / official close.
