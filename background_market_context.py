@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-TW Stock AI Scanner v2.16.8｜Market / night-session context builder
+TW Stock AI Scanner v2.16.9｜Market / night-session context builder
 
 Purpose:
 - Run from GitHub Actions without opening Streamlit.
@@ -89,7 +89,7 @@ def valid_taifex_price(value: Any) -> bool:
     not treat fake quotes as real futures prices.
     """
     v = safe_float(value, None)
-    return bool(v is not None and v >= 1000)
+    return bool(v is not None and 5000 <= v <= 80000)
 
 
 def invalidate_taifex_quote(obj: Dict[str, Any], reason: str) -> Dict[str, Any]:
@@ -409,6 +409,78 @@ def fetch_finmind_futures_daily_close(data_id: str, label: str, days: int = 45) 
         return {"ok": False, "symbol": data_id, "label": label, "source": "FinMind TaiwanFuturesDaily last close", "error": str(exc)}
 
 
+
+
+def fetch_yahoo_wtx_direct() -> Dict[str, Any]:
+    """Fetch 台指期近一 directly from Yahoo's dedicated WTX& page.
+
+    The earlier overview-page parser could accidentally pick the cash TAIEX
+    value (加權指數). This direct parser only reads the dedicated
+    https://tw.stock.yahoo.com/future/WTX%26 page and explicitly searches the
+    台指期近一 / WTX& block for 成交、漲跌、漲幅、昨收.
+    """
+    url = "https://tw.stock.yahoo.com/future/WTX%26"
+    try:
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=15)
+        if not (r.ok and r.text):
+            return {"ok": False, "error": f"Yahoo WTX direct HTTP {getattr(r, 'status_code', 'NA')}", "source": "Yahoo WTX& direct"}
+        flat = re.sub(r"<[^>]+>", " ", r.text)
+        flat = re.sub(r"\s+", " ", flat)
+        # Restrict parsing to the WTX& dedicated quote block. The page also
+        # contains a comparison table with the cash index; do not use that table
+        # as the primary price source.
+        idxs = [i for i in [flat.find("# 台指期近一"), flat.find("WTX&"), flat.find("台指期近一")] if i >= 0]
+        start = min(idxs) if idxs else 0
+        window = flat[start:start + 2600]
+
+        def first_num_after(label: str) -> Optional[float]:
+            m = re.search(re.escape(label) + r"\s*([+-]?\d{1,3}(?:,\d{3})*(?:\.\d+)?|[+-]?\d+(?:\.\d+)?)", window)
+            return safe_float(m.group(1), None) if m else None
+
+        # Best source: detail field named 成交. Fallback: hero price immediately
+        # after WTX& / 台指期近一.
+        price_f = first_num_after("成交")
+        if not valid_taifex_price(price_f):
+            m = re.search(r"WTX&\s+([0-9]{1,3}(?:,[0-9]{3})*(?:\.\d+)?)", window)
+            price_f = safe_float(m.group(1), None) if m else None
+        if not valid_taifex_price(price_f):
+            return {"ok": False, "error": "Yahoo WTX direct found no valid 成交 price", "source": "Yahoo WTX& direct", "parse_window": window[:300]}
+
+        change_f = first_num_after("漲跌")
+        pct_f = first_num_after("漲幅")
+        prev_f = first_num_after("昨收")
+        bid_f = first_num_after("買價")
+        ask_f = first_num_after("賣價")
+        open_f = first_num_after("開盤")
+        high_f = first_num_after("最高")
+        low_f = first_num_after("最低")
+        volume_f = first_num_after("總量")
+        updated = None
+        mtime = re.search(r"(\d{4}/\d{1,2}/\d{1,2}\s+\d{1,2}:\d{2})\s+更新", window)
+        if mtime:
+            updated = mtime.group(1).replace("/", "-")
+        return {
+            "ok": True,
+            "symbol": "WTX&",
+            "label": "台指期近月",
+            "price": price_f,
+            "previous_close": prev_f if valid_taifex_price(prev_f) else (price_f - change_f if change_f is not None else None),
+            "change": change_f,
+            "change_pct": pct_f,
+            "bid": bid_f,
+            "ask": ask_f,
+            "open": open_f,
+            "high": high_f,
+            "low": low_f,
+            "volume": volume_f,
+            "source": "Yahoo WTX& direct page",
+            "source_url": url,
+            "updated_at": updated or now_tw().strftime("%Y-%m-%d %H:%M:%S"),
+            "price_type": "live_or_last_close",
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "source": "Yahoo WTX& direct"}
+
 def fetch_tw_yahoo_futures() -> Dict[str, Any]:
     """Fetch Taiwan index futures near-month quote.
 
@@ -418,16 +490,26 @@ def fetch_tw_yahoo_futures() -> Dict[str, Any]:
     quote invalid instead of showing fake 0.00.
     """
     result = {
-        "TXF": {"symbol": "TXF", "label": "台指期近月", "ok": False, "source": "FinMind taiwan_futures_snapshot"},
+        "TXF": {"symbol": "WTX&", "label": "台指期近月", "ok": False, "source": "Yahoo WTX& direct page"},
         "MTX": {"symbol": "MTX", "label": "小台近月", "ok": False, "source": "FinMind taiwan_futures_snapshot"},
     }
 
-    # 1) Primary: FinMind futures snapshot. This is the intended near-month feed.
-    txf_fm = fetch_finmind_near_month_futures("TXF", "台指期近月")
-    if txf_fm.get("ok"):
-        result["TXF"].update(txf_fm)
+    # 1) Primary: Yahoo's dedicated WTX& page. This is exactly the 台指期近月
+    # source requested by the user: https://tw.stock.yahoo.com/future/WTX&
+    # It prevents accidentally using the cash weighted index as 台指期.
+    txf_wtx = fetch_yahoo_wtx_direct()
+    if txf_wtx.get("ok"):
+        result["TXF"].update(txf_wtx)
     else:
-        result["TXF"].update({"finmind_error": txf_fm.get("error"), "source": txf_fm.get("source")})
+        result["TXF"].update({"wtx_direct_error": txf_wtx.get("error"), "source": txf_wtx.get("source", "Yahoo WTX& direct page")})
+
+    # 2) Secondary: FinMind futures snapshot, only if Yahoo WTX& direct page did
+    # not return a valid near-month quote.
+    txf_fm = fetch_finmind_near_month_futures("TXF", "台指期近月")
+    if (not result["TXF"].get("ok")) and txf_fm.get("ok"):
+        result["TXF"].update(txf_fm)
+    elif not txf_fm.get("ok"):
+        result["TXF"].update({"finmind_error": txf_fm.get("error")})
 
     # Small TAIEX futures if available. If unavailable, leave it blank; TXF is the key signal.
     mtx_fm = fetch_finmind_near_month_futures("MTX", "小台近月")
@@ -446,6 +528,7 @@ def fetch_tw_yahoo_futures() -> Dict[str, Any]:
         return result
 
     urls = [
+        "https://tw.stock.yahoo.com/future/WTX%26",
         "https://tw.stock.yahoo.com/future",
         "https://tw.stock.yahoo.com/future/futures.html",
     ]
