@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-TW Stock AI Scanner v2.16.4｜Market / night-session context builder
+TW Stock AI Scanner v2.16.5｜Market / night-session context builder
 
 Purpose:
 - Run from GitHub Actions without opening Streamlit.
@@ -149,19 +149,165 @@ def fetch_yahoo(symbol: str, label: str, interval: str = "1m", range_: str = "1d
         return {"symbol": symbol, "label": label, "ok": False, "error": str(exc), "source": "Yahoo chart"}
 
 
-def fetch_tw_yahoo_futures() -> Dict[str, Any]:
-    """Fetch Taiwan futures from Yahoo Taiwan futures page.
 
-    The Yahoo Finance global chart symbol for Taiwan futures is not stable for
-    near-month/night-session quotes. Yahoo Taiwan futures page usually exposes
-    WTX& (台指期近一) and related contracts in page text. This parser is deliberately
-    defensive: if the page layout changes, it falls back to IX0126.TW so the
-    dashboard does not break.
+def _quote_from_finmind_row(row: Dict[str, Any], label: str, source_note: str) -> Dict[str, Any]:
+    price = safe_float(row.get("close"), None)
+    change = safe_float(row.get("change_price"), None)
+    pct = safe_float(row.get("change_rate"), None)
+    prev = None
+    if price is not None and change is not None:
+        prev = price - change
+    symbol = str(row.get("futures_id") or row.get("symbol") or "").strip()
+    if not valid_taifex_price(price):
+        return {
+            "ok": False,
+            "symbol": symbol or "TXF",
+            "label": label,
+            "price": None,
+            "previous_close": None,
+            "change": None,
+            "change_pct": None,
+            "source": source_note,
+            "error": f"invalid FinMind futures price: {price}",
+        }
+    return {
+        "ok": True,
+        "symbol": symbol or label,
+        "label": label,
+        "price": price,
+        "previous_close": prev,
+        "change": change,
+        "change_pct": pct,
+        "open": safe_float(row.get("open"), None),
+        "high": safe_float(row.get("high"), None),
+        "low": safe_float(row.get("low"), None),
+        "average_price": safe_float(row.get("average_price"), None),
+        "buy_price": safe_float(row.get("buy_price"), None),
+        "sell_price": safe_float(row.get("sell_price"), None),
+        "total_volume": safe_float(row.get("total_volume"), None),
+        "volume": safe_float(row.get("volume"), None),
+        "date": row.get("date"),
+        "source": source_note,
+        "updated_at": now_tw().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def _select_finmind_near_month(rows: List[Dict[str, Any]], prefix: str) -> Optional[Dict[str, Any]]:
+    """Select the nearest-month futures quote from FinMind snapshot rows.
+
+    FinMind's futures snapshot usually includes a continuous/near-month row such
+    as TXFR1. Prefer that. If it is absent, choose the valid quote with the
+    largest total volume as a practical fallback.
+    """
+    if not rows:
+        return None
+    valid = []
+    for r in rows:
+        fid = str(r.get("futures_id") or r.get("symbol") or "").upper().strip()
+        price = safe_float(r.get("close"), None)
+        if not fid.startswith(prefix.upper()):
+            continue
+        if not valid_taifex_price(price):
+            continue
+        total_volume = safe_float(r.get("total_volume"), 0) or 0
+        dt_txt = str(r.get("date") or "")
+        score = 0
+        # Continuous near month rows commonly end in R1, e.g. TXFR1.
+        if fid == f"{prefix.upper()}R1":
+            score += 1_000_000_000
+        elif fid.endswith("R1"):
+            score += 900_000_000
+        # Prefer active contracts if no explicit R1 row exists.
+        score += int(total_volume)
+        valid.append((score, dt_txt, r))
+    if not valid:
+        return None
+    valid.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return valid[0][2]
+
+
+def fetch_finmind_near_month_futures(data_id: str, label: str) -> Dict[str, Any]:
+    token = os.environ.get("FINMIND_TOKEN", "").strip()
+    url = "https://api.finmindtrade.com/api/v4/taiwan_futures_snapshot"
+    params = {"data_id": data_id}
+    headers = {"User-Agent": UA}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=12)
+        payload = r.json() if r.text else {}
+        if not r.ok:
+            return {
+                "ok": False,
+                "symbol": data_id,
+                "label": label,
+                "source": "FinMind taiwan_futures_snapshot",
+                "error": f"HTTP {r.status_code}: {str(payload)[:180]}",
+            }
+        rows = payload.get("data") or []
+        if isinstance(rows, dict):
+            rows = [rows]
+        if not isinstance(rows, list):
+            rows = []
+        chosen = _select_finmind_near_month(rows, data_id)
+        if not chosen:
+            return {
+                "ok": False,
+                "symbol": data_id,
+                "label": label,
+                "source": "FinMind taiwan_futures_snapshot",
+                "error": f"no valid near-month quote rows for {data_id}; rows={len(rows)}",
+            }
+        out = _quote_from_finmind_row(chosen, label, "FinMind taiwan_futures_snapshot near-month")
+        out["selection_rule"] = "prefer futures_id ending R1, else highest total_volume"
+        out["requested_data_id"] = data_id
+        return out
+    except Exception as exc:
+        return {
+            "ok": False,
+            "symbol": data_id,
+            "label": label,
+            "source": "FinMind taiwan_futures_snapshot",
+            "error": str(exc),
+        }
+
+
+def fetch_tw_yahoo_futures() -> Dict[str, Any]:
+    """Fetch Taiwan index futures near-month quote.
+
+    Primary source: FinMind taiwan_futures_snapshot data_id=TXF, selecting the
+    near-month / continuous front-month row such as TXFR1.
+    Fallback source: Yahoo Taiwan futures page. If all sources fail, keep the
+    quote invalid instead of showing fake 0.00.
     """
     result = {
-        "TXF": {"symbol": "WTX&", "label": "台指期近一", "ok": False, "source": "Yahoo Taiwan futures"},
-        "MTX": {"symbol": "MTX&", "label": "小台近一", "ok": False, "source": "Yahoo Taiwan futures"},
+        "TXF": {"symbol": "TXF", "label": "台指期近月", "ok": False, "source": "FinMind taiwan_futures_snapshot"},
+        "MTX": {"symbol": "MTX", "label": "小台近月", "ok": False, "source": "FinMind taiwan_futures_snapshot"},
     }
+
+    # 1) Primary: FinMind futures snapshot. This is the intended near-month feed.
+    txf_fm = fetch_finmind_near_month_futures("TXF", "台指期近月")
+    if txf_fm.get("ok"):
+        result["TXF"].update(txf_fm)
+    else:
+        result["TXF"].update({"finmind_error": txf_fm.get("error"), "source": txf_fm.get("source")})
+
+    # Small TAIEX futures if available. If unavailable, leave it blank; TXF is the key signal.
+    mtx_fm = fetch_finmind_near_month_futures("MTX", "小台近月")
+    if mtx_fm.get("ok"):
+        result["MTX"].update(mtx_fm)
+    else:
+        # Some data vendors expose micro futures as TMF; try it as a secondary display only.
+        tmf_fm = fetch_finmind_near_month_futures("TMF", "微型台指近月")
+        if tmf_fm.get("ok"):
+            result["MTX"].update(tmf_fm)
+        else:
+            result["MTX"].update({"finmind_error": mtx_fm.get("error"), "tmf_error": tmf_fm.get("error")})
+
+    # 2) Fallback: Yahoo Taiwan futures page, useful when FinMind token/sponsor is unavailable.
+    if result["TXF"].get("ok") and result["MTX"].get("ok"):
+        return result
+
     urls = [
         "https://tw.stock.yahoo.com/future",
         "https://tw.stock.yahoo.com/future/futures.html",
@@ -181,14 +327,15 @@ def fetch_tw_yahoo_futures() -> Dict[str, Any]:
             except Exception:
                 continue
         if text:
-            # Remove tags enough for regex scanning while preserving order.
             flat = re.sub(r"<[^>]+>", " ", text)
             flat = re.sub(r"\s+", " ", flat)
             contracts = [
-                ("TXF", "台指期近一", r"台指期近一\s*WTX[^0-9-]*([0-9,]+(?:\.[0-9]+)?)\s*([0-9,]+(?:\.[0-9]+)?)\s*([0-9,]+(?:\.[0-9]+)?)\s*([+-]?[0-9,]+(?:\.[0-9]+)?)\s*([+-]?[0-9]+(?:\.[0-9]+)?)%"),
-                ("MTX", "小台近一", r"小台(?:指)?近一\s*[^0-9-]*([0-9,]+(?:\.[0-9]+)?)\s*([0-9,]+(?:\.[0-9]+)?)\s*([0-9,]+(?:\.[0-9]+)?)\s*([+-]?[0-9,]+(?:\.[0-9]+)?)\s*([+-]?[0-9]+(?:\.[0-9]+)?)%"),
+                ("TXF", "台指期近月", r"台指期(?:近一|近月)\s*WTX[^0-9-]*([0-9,]+(?:\.[0-9]+)?)\s*([0-9,]+(?:\.[0-9]+)?)\s*([0-9,]+(?:\.[0-9]+)?)\s*([+-]?[0-9,]+(?:\.[0-9]+)?)\s*([+-]?[0-9]+(?:\.[0-9]+)?)%"),
+                ("MTX", "小台近月", r"小台(?:指)?(?:近一|近月)\s*[^0-9-]*([0-9,]+(?:\.[0-9]+)?)\s*([0-9,]+(?:\.[0-9]+)?)\s*([0-9,]+(?:\.[0-9]+)?)\s*([+-]?[0-9,]+(?:\.[0-9]+)?)\s*([+-]?[0-9]+(?:\.[0-9]+)?)%"),
             ]
             for key, label, pattern in contracts:
+                if result.get(key, {}).get("ok"):
+                    continue
                 m = re.search(pattern, flat)
                 if m:
                     bid, ask, price, change, pct = m.groups()[:5]
@@ -198,30 +345,27 @@ def fetch_tw_yahoo_futures() -> Dict[str, Any]:
                     prev = price_f - change_f if price_f is not None and change_f is not None else None
                     parsed_quote = {
                         "ok": valid_taifex_price(price_f),
+                        "symbol": "WTX&" if key == "TXF" else "MTX&",
+                        "label": label,
                         "price": price_f if valid_taifex_price(price_f) else None,
                         "previous_close": prev if valid_taifex_price(price_f) else None,
                         "change": change_f if valid_taifex_price(price_f) else None,
                         "change_pct": pct_f if valid_taifex_price(price_f) else None,
                         "bid": clean_num(bid),
                         "ask": clean_num(ask),
-                        "source": "Yahoo Taiwan futures page",
+                        "source": "Yahoo Taiwan futures page fallback",
                         "updated_at": now_tw().strftime("%Y-%m-%d %H:%M:%S"),
                     }
                     if not valid_taifex_price(price_f):
                         parsed_quote.update({"error": f"invalid parsed futures price: {price_f}"})
                     result[key].update(parsed_quote)
-        # Backup: TIP TAIFEX index. This is not the near-month tradable contract, but better than blank.
-        if not result["TXF"].get("ok"):
-            backup = fetch_yahoo("IX0126.TW", "TIP TAIFEX TAIEX Futures Index", interval="1m", range_="1d")
-            if backup.get("ok") and valid_taifex_price(backup.get("price")):
-                result["TXF"].update(backup)
-                result["TXF"].update({"symbol": "IX0126.TW", "label": "台指期參考指數", "source": "Yahoo chart backup: IX0126.TW"})
-            else:
-                result["TXF"] = invalidate_taifex_quote(result.get("TXF", {}), "no valid TXF quote from Yahoo Taiwan page or backup")
     except Exception as exc:
-        result["TXF"].update({"ok": False, "error": str(exc)})
-    return result
+        if not result["TXF"].get("ok"):
+            result["TXF"].update({"ok": False, "error": str(exc)})
 
+    if not result["TXF"].get("ok"):
+        result["TXF"] = invalidate_taifex_quote(result.get("TXF", {}), result.get("TXF", {}).get("finmind_error") or "no valid TXF near-month quote")
+    return result
 
 def market_breadth_from_files() -> Dict[str, Any]:
     df = read_csv_safe(INTRADAY_SNAPSHOT_FILE)
@@ -377,6 +521,8 @@ def append_history(ctx: Dict[str, Any]) -> None:
         "night_label": ctx.get("night_label"),
         "twii_pct": (ctx.get("indices", {}).get("TWII", {}) or {}).get("change_pct"),
         "twoii_pct": (ctx.get("indices", {}).get("TWOII", {}) or {}).get("change_pct"),
+        "txf_price": (ctx.get("taiwan_futures", {}).get("TXF", {}) or {}).get("price"),
+        "txf_pct": (ctx.get("taiwan_futures", {}).get("TXF", {}) or {}).get("change_pct"),
         "nq_pct": (ctx.get("night_proxies", {}).get("NQ=F", {}) or {}).get("change_pct"),
         "sox_pct": (ctx.get("night_proxies", {}).get("SOX", {}) or {}).get("change_pct"),
         "breadth_up_ratio": (ctx.get("breadth", {}) or {}).get("up_ratio"),
