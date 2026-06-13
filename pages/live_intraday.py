@@ -4368,14 +4368,231 @@ def render_v216_context(ctx: Dict[str, Any]) -> None:
         st.caption("台指期若顯示『未取得有效價』，代表 Yahoo 近一列 / FinMind 即時與官方日資料都沒有回傳可用近月期貨價格；系統不會用 0 或錯誤值參與決策。")
 
 
+
+
+# -----------------------------
+# v2.18 front-end realtime quote panel
+# -----------------------------
+def _v218_frontend_initial_market(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    ctx = ctx or {}
+    idx = ctx.get("indices", {}) or {}
+    night = ctx.get("night_proxies", {}) or {}
+    fut = ctx.get("taiwan_futures", {}) or {}
+
+    def pack(obj: Dict[str, Any], label: str, yahoo_symbols: List[str]) -> Dict[str, Any]:
+        obj = obj or {}
+        price = obj.get("price")
+        pct = obj.get("change_pct")
+        return {
+            "label": label,
+            "price": None if not _v216_valid_market_price(obj, label) else _clean_number(price),
+            "pct": None if not _v216_valid_market_price(obj, label) else _clean_number(pct),
+            "source": str(obj.get("source") or "背景"),
+            "time": str(obj.get("time") or obj.get("updated_at") or ctx.get("updated_at") or ""),
+            "yahooSymbols": yahoo_symbols,
+        }
+
+    twii = idx.get("TWII") or {}
+    twoii = idx.get("TWOII") or {}
+    txf = (fut.get("TXF") or night.get("TXF") or idx.get("TXF") or {})
+    nq = night.get("NQ=F") or {}
+    es = night.get("ES=F") or {}
+    sox = night.get("SOX") or {}
+
+    return {
+        "items": {
+            "wtx": pack(txf, "台指期近月 WTX&", ["WTX%26", "WTX%26.TW"]),
+            "twii": pack(twii, "加權指數", ["^TWII"]),
+            "twoii": pack(twoii, "櫃買指數", ["^TWOII"]),
+            "nq": pack(nq, "NASDAQ 期貨", ["NQ=F"]),
+            "es": pack(es, "S&P 500 期貨", ["ES=F"]),
+            "sox": pack(sox, "費半", ["^SOX"]),
+            "2382": {"label": "廣達 2382", "price": None, "pct": None, "source": "Yahoo chart", "time": "", "yahooSymbols": ["2382.TW"]},
+            "2313": {"label": "華通 2313", "price": None, "pct": None, "source": "Yahoo chart", "time": "", "yahooSymbols": ["2313.TW"]},
+            "3441": {"label": "聯一光 3441", "price": None, "pct": None, "source": "Yahoo chart", "time": "", "yahooSymbols": ["3441.TW"]},
+        },
+        "githubRaw": "https://raw.githubusercontent.com/eric4xxme-byte/TW_Stock_AI_Scanner_v2_1_cached/main/data/v216_market_context.json",
+    }
+
+
+def render_v218_realtime_ticker_panel(ctx: Dict[str, Any], tick_seconds: int = 5) -> None:
+    """Render a browser-side quote panel that updates DOM numbers only."""
+    tick_seconds = int(max(3, min(30, tick_seconds or 5)))
+    initial = _v218_frontend_initial_market(ctx)
+    payload = json.dumps(initial, ensure_ascii=False)
+    html = f"""
+<div id=\"rt-root\" class=\"rt-root\">
+  <div class=\"rt-head\">
+    <div>
+      <div class=\"rt-title\">⚡ v2.18 即時行情跳動面板</div>
+      <div class=\"rt-sub\">只更新數字，不重整 Streamlit 整頁；AI 決策仍由下方主系統週期性重算。</div>
+    </div>
+    <div class=\"rt-status\"><span id=\"rt-dot\" class=\"dot wait\"></span><span id=\"rt-status-text\">初始化</span></div>
+  </div>
+  <div id=\"rt-grid\" class=\"rt-grid\"></div>
+</div>
+<style>
+  .rt-root {{font-family: -apple-system,BlinkMacSystemFont,\"Segoe UI\",\"Noto Sans TC\",Arial,sans-serif; border:1px solid #e6e8ef; border-radius:16px; padding:14px 16px; margin:8px 0 18px 0; background:linear-gradient(180deg,#ffffff,#fbfcff); box-shadow:0 1px 3px rgba(15,23,42,.05);}}
+  .rt-head {{display:flex; justify-content:space-between; gap:12px; align-items:flex-start; margin-bottom:12px;}}
+  .rt-title {{font-size:20px; font-weight:800; color:#111827;}}
+  .rt-sub {{font-size:13px; color:#6b7280; margin-top:3px;}}
+  .rt-status {{font-size:13px; color:#4b5563; white-space:nowrap; padding-top:4px;}}
+  .dot {{display:inline-block; width:9px; height:9px; border-radius:99px; margin-right:6px; background:#94a3b8;}}
+  .dot.ok {{background:#22c55e; box-shadow:0 0 0 4px rgba(34,197,94,.12);}}
+  .dot.warn {{background:#f59e0b; box-shadow:0 0 0 4px rgba(245,158,11,.12);}}
+  .dot.wait {{background:#94a3b8;}}
+  .rt-grid {{display:grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap:10px;}}
+  .card {{border:1px solid #edf0f5; border-radius:14px; padding:12px; background:#fff; min-height:104px;}}
+  .name {{font-size:13px; color:#475569; font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}}
+  .price {{font-size:28px; line-height:1.15; font-weight:850; letter-spacing:-.02em; color:#111827; margin-top:6px;}}
+  .pct {{display:inline-flex; align-items:center; margin-top:8px; font-size:13px; font-weight:700; border-radius:999px; padding:3px 8px; background:#f1f5f9; color:#64748b;}}
+  .up .pct {{background:#dcfce7; color:#15803d;}}
+  .down .pct {{background:#fee2e2; color:#dc2626;}}
+  .flat .pct {{background:#f1f5f9; color:#64748b;}}
+  .src {{font-size:11px; color:#94a3b8; margin-top:8px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}}
+  .flash {{animation: flash .35s ease-in-out;}}
+  @keyframes flash {{0% {{background:#fef9c3;}} 100% {{background:#fff;}}}}
+  @media (max-width: 900px) {{.rt-grid {{grid-template-columns: repeat(2,minmax(0,1fr));}} .price {{font-size:24px;}}}}
+</style>
+<script>
+(function() {{
+  const CONFIG = {payload};
+  const POLL_MS = {tick_seconds} * 1000;
+  const order = ['wtx','twii','twoii','nq','es','sox','2382','2313','3441'];
+  const state = JSON.parse(JSON.stringify(CONFIG.items || {{}}));
+  const grid = document.getElementById('rt-grid');
+  const dot = document.getElementById('rt-dot');
+  const statusText = document.getElementById('rt-status-text');
+  function fmtPrice(v) {{
+    if (v === null || v === undefined || isNaN(Number(v))) return '-';
+    const n = Number(v);
+    return n.toLocaleString(undefined, {{maximumFractionDigits: 2}});
+  }}
+  function fmtPct(v) {{
+    if (v === null || v === undefined || isNaN(Number(v))) return '-';
+    const n = Number(v);
+    const sign = n > 0 ? '+' : '';
+    return sign + n.toFixed(2) + '%';
+  }}
+  function clsPct(v) {{
+    const n = Number(v);
+    if (!isFinite(n)) return 'flat';
+    if (n > 0) return 'up';
+    if (n < 0) return 'down';
+    return 'flat';
+  }}
+  function initCards() {{
+    grid.innerHTML = '';
+    order.forEach(id => {{
+      const it = state[id] || {{label:id}};
+      const card = document.createElement('div');
+      card.className = 'card ' + clsPct(it.pct);
+      card.id = 'rt-card-' + id;
+      card.innerHTML = `<div class=\"name\">${{it.label || id}}</div>
+        <div class=\"price\" id=\"rt-price-${{id}}\">${{fmtPrice(it.price)}}</div>
+        <div class=\"pct\" id=\"rt-pct-${{id}}\">${{fmtPct(it.pct)}}</div>
+        <div class=\"src\" id=\"rt-src-${{id}}\">${{it.source || '等待更新'}}</div>`;
+      grid.appendChild(card);
+    }});
+  }}
+  function setStatus(kind, msg) {{ dot.className = 'dot ' + kind; statusText.textContent = msg; }}
+  function updateCard(id, next) {{
+    if (!next) return;
+    const prev = state[id] || {{}};
+    const oldPrice = Number(prev.price);
+    state[id] = Object.assign({{}}, prev, next);
+    const it = state[id];
+    const priceEl = document.getElementById('rt-price-' + id);
+    const pctEl = document.getElementById('rt-pct-' + id);
+    const srcEl = document.getElementById('rt-src-' + id);
+    const card = document.getElementById('rt-card-' + id);
+    if (!priceEl || !card) return;
+    priceEl.textContent = fmtPrice(it.price);
+    pctEl.textContent = fmtPct(it.pct);
+    srcEl.textContent = (it.source || '') + (it.time ? '｜' + String(it.time).slice(0,16) : '');
+    card.className = 'card ' + clsPct(it.pct);
+    if (isFinite(oldPrice) && isFinite(Number(it.price)) && oldPrice !== Number(it.price)) {{
+      card.classList.remove('flash'); void card.offsetWidth; card.classList.add('flash');
+    }}
+  }}
+  async function fetchYahooChart(symbols) {{
+    for (const sym of symbols || []) {{
+      try {{
+        const url = 'https://query1.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(sym) + '?interval=1m&range=1d&_=' + Date.now();
+        const r = await fetch(url, {{cache:'no-store'}});
+        if (!r.ok) continue;
+        const j = await r.json();
+        const result = j && j.chart && j.chart.result && j.chart.result[0];
+        if (!result) continue;
+        const meta = result.meta || {{}};
+        const price = Number(meta.regularMarketPrice || meta.previousClose || meta.chartPreviousClose);
+        const prev = Number(meta.previousClose || meta.chartPreviousClose);
+        if (!isFinite(price) || price <= 0) continue;
+        let pct = null;
+        if (isFinite(prev) && prev > 0) pct = ((price - prev) / prev) * 100;
+        return {{price, pct, source:'Yahoo chart ' + sym, time:new Date().toLocaleTimeString('zh-TW', {{hour12:false}})}};
+      }} catch(e) {{}}
+    }}
+    return null;
+  }}
+  async function fetchGithubContext() {{
+    try {{
+      const r = await fetch(CONFIG.githubRaw + '?_=' + Date.now(), {{cache:'no-store'}});
+      if (!r.ok) return null;
+      return await r.json();
+    }} catch(e) {{ return null; }}
+  }}
+  function updateFromContext(ctx) {{
+    if (!ctx) return 0;
+    let count = 0;
+    const idx = ctx.indices || {{}};
+    const night = ctx.night_proxies || {{}};
+    const fut = ctx.taiwan_futures || {{}};
+    function upd(id, obj) {{
+      obj = obj || {{}};
+      const p = Number(obj.price), pct = Number(obj.change_pct);
+      if (isFinite(p) && p > 0) {{ updateCard(id, {{price:p, pct:isFinite(pct)?pct:null, source:obj.source || 'GitHub 背景', time:obj.time || obj.updated_at || ctx.updated_at || ''}}); count++; }}
+    }}
+    upd('twii', idx.TWII);
+    upd('twoii', idx.TWOII);
+    upd('wtx', (fut.TXF || night.TXF || idx.TXF));
+    upd('nq', night['NQ=F']);
+    upd('es', night['ES=F']);
+    upd('sox', night.SOX);
+    return count;
+  }}
+  async function tick() {{
+    let ok = 0;
+    const ctx = await fetchGithubContext();
+    ok += updateFromContext(ctx);
+    await Promise.all(order.map(async id => {{
+      const it = state[id] || {{}};
+      const y = await fetchYahooChart(it.yahooSymbols || []);
+      if (y) {{ updateCard(id, y); ok++; }}
+    }}));
+    if (ok > 0) setStatus('ok', '即時更新 ' + new Date().toLocaleTimeString('zh-TW', {{hour12:false}}));
+    else setStatus('warn', '外部報價暫時未回應，沿用背景值');
+  }}
+  initCards();
+  tick();
+  setInterval(tick, POLL_MS);
+}})();
+</script>
+"""
+    components.html(html, height=372, scrolling=False)
+
 v216_context = load_v216_context()
 
-st.title("🌐 盤中即時看盤 v2.16.9 市場環境中控台｜WTX&台指近一修正版")
-st.caption("v2.16.9 修正：台指期近月固定使用 Yahoo 股市台指期近一 WTX& 專頁作為第一來源，避免誤抓加權指數。")
+tick_default = _get_query_int("tick", 5, 3, 30, 1)
+
+st.title("⚡ 盤中即時看盤 v2.18 即時行情跳動面板｜不整頁刷新版")
+st.caption("v2.18 新增：上方行情面板由前端 JavaScript 直接更新數字；AI 決策區可慢速重算，不必整頁一直刷新。")
+render_v218_realtime_ticker_panel(v216_context, tick_seconds=tick_default)
 render_v216_context(v216_context)
 st.divider()
 
-refresh_default = _get_query_int("refresh", 30, 15, 120, 15)
+refresh_default = _get_query_int("refresh", 60, 15, 300, 15)
+ai_rerun_default = _get_query_value("ai_rerun", "0") == "1"
 top_n_default = _get_query_int("top_n", 15, 5, 50, 5)
 min_ai_default = _get_query_int("min_ai", 0, 0, 100, 5)
 min_strength_default = _get_query_int("min_strength", 0, 0, 100, 5)
@@ -4397,7 +4614,9 @@ with st.sidebar:
         index=1 if mode_default == "盤中市場池掃描" else 0,
     )
     pool_size = st.slider("市場池檔數", min_value=30, max_value=600, value=pool_default, step=10, disabled=(scan_mode != "盤中市場池掃描"))
-    refresh_seconds = st.slider("自動刷新秒數", min_value=15, max_value=120, value=refresh_default, step=15)
+    live_tick_seconds = st.slider("即時數字跳動秒數", min_value=3, max_value=30, value=tick_default, step=1, help="只更新上方即時行情面板，不會重整整頁。")
+    ai_rerun_enabled = st.toggle("AI 決策自動整頁重算", value=ai_rerun_default, help="關閉時，只有上方即時行情面板跳動；AI 決策需手動重新整理或開啟此選項。")
+    refresh_seconds = st.slider("AI 決策重算秒數", min_value=15, max_value=300, value=refresh_default, step=15, disabled=not ai_rerun_enabled)
     top_n = st.slider("主表顯示前 N 檔", min_value=5, max_value=50, value=top_n_default, step=5)
     min_ai = st.slider("最低 AI / 市場池分", 0, 100, min_ai_default, 5)
     min_strength = st.slider("最低即時強度分", 0, 100, min_strength_default, 5)
@@ -4456,7 +4675,7 @@ with st.sidebar:
     if str(v215_webhook_url or "").strip() or v215_enable_gsheet or v215_auto_sync:
         save_v215_gsheet_config(v215_webhook_url, v215_enable_gsheet, v215_auto_sync)
 
-    st.caption(f"刷新頻率：約每 {refresh_seconds} 秒；自動同步：{'已開啟' if v215_auto_sync and v215_enable_gsheet else '未開啟'}")
+    st.caption(f"即時行情：約每 {live_tick_seconds} 秒只跳數字；AI整頁重算：{(str(refresh_seconds) + ' 秒') if ai_rerun_enabled else '關閉'}；自動同步：{'已開啟' if v215_auto_sync and v215_enable_gsheet else '未開啟'}")
     _sync_status_sidebar = latest_v215_sync_status()
     st.caption(f"最後同步：{_sync_status_sidebar.get('time', '-')}｜{_sync_status_sidebar.get('status', '-') }｜{_sync_status_sidebar.get('rows', 0)} 筆")
     if st.button("儲存 Google Sheet 設定", type="secondary", key="v215_save_gsheet_config_btn"):
@@ -4471,6 +4690,8 @@ _set_query_if_changed({
     "mode": scan_mode,
     "pool_size": pool_size,
     "refresh": refresh_seconds,
+    "tick": live_tick_seconds,
+    "ai_rerun": "1" if ai_rerun_enabled else "0",
     "top_n": top_n,
     "min_ai": min_ai,
     "min_strength": min_strength,
@@ -4481,14 +4702,15 @@ _set_query_if_changed({
     "extra_codes": extra_codes_text.strip(),
 })
 
-components.html(
-    f"""
-    <script>
-      setTimeout(function() {{ window.parent.location.reload(); }}, {int(refresh_seconds) * 1000});
-    </script>
-    """,
-    height=0,
-)
+if ai_rerun_enabled:
+    components.html(
+        f"""
+        <script>
+          setTimeout(function() {{ window.parent.location.reload(); }}, {int(refresh_seconds) * 1000});
+        </script>
+        """,
+        height=0,
+    )
 
 rank_df = load_rank()
 with st.spinner("建立盤中掃描清單並抓取即時報價..."):
