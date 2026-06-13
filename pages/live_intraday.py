@@ -4324,7 +4324,7 @@ def render_v216_context(ctx: Dict[str, Any]) -> None:
     elif _v216_valid_market_price(txf, "台指期近月") and bool((txf or {}).get("cached")):
         st.warning("台指期近月目前顯示的是『最後有效快取價』，不是即時成交價。休市 / 週末 / 資料源暫時失敗時會這樣顯示，系統會降低台指權重，不會把它當成全新即時訊號。")
     elif not _v216_valid_market_price(txf, "台指期近月"):
-        st.warning("台指期近月目前沒有取得有效即時價或收盤價，系統不會再用 0.00 當成台指價。大盤環境暫以加權、櫃買、NASDAQ/S&P 期貨、費半與市場廣度輔助判斷。")
+        st.warning("台指期近月目前沒有取得有效即時價或收盤價。請先跑 v2.16.8 背景任務；系統不會再用 0.00 當成台指價。")
 
     # 3) Secondary macro line, compact.
     m1, m2, m3, m4 = st.columns(4)
@@ -4365,13 +4365,13 @@ def render_v216_context(ctx: Dict[str, Any]) -> None:
     ]
     with st.expander("完整大盤 / 夜盤價格明細", expanded=False):
         st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
-        st.caption("台指期若顯示『未取得有效價』，代表 FinMind / 備援來源暫時沒有回傳可用近月期貨價格；系統不會用 0 或錯誤值參與決策。")
+        st.caption("台指期若顯示『未取得有效價』，代表 Yahoo 近一列 / FinMind 即時與官方日資料都沒有回傳可用近月期貨價格；系統不會用 0 或錯誤值參與決策。")
 
 
 v216_context = load_v216_context()
 
-st.title("🌐 盤中即時看盤 v2.16.7 市場環境中控台｜台指近月收盤價版")
-st.caption("v2.16.7 修正：台指期近月即時抓不到時，改顯示最近交易日的收盤 / 結算價；不再用 0.00 或空白誤導。")
+st.title("🌐 盤中即時看盤 v2.16.8 市場環境中控台｜台指近月強化版")
+st.caption("v2.16.8 修正：台指期近月改用 Yahoo 近一列強化解析 + FinMind TX 官方日資料備援；假日仍顯示最近收盤/結算，不再空白。")
 render_v216_context(v216_context)
 st.divider()
 
