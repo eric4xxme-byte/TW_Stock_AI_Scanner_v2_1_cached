@@ -1,0 +1,19 @@
+{
+  "MTX": {
+    "ok": true,
+    "symbol": "MTX",
+    "label": "小台近月",
+    "price": 44394.0,
+    "previous_close": 42605.0,
+    "change": 1789.0,
+    "change_pct": 4.199037671634785,
+    "date": "2026-06-12",
+    "contract_date": "202606",
+    "price_type": "last_close",
+    "cached": false,
+    "source": "FinMind TaiwanFuturesDaily last close / settlement",
+    "updated_at": "2026-06-13 12:53:52",
+    "note": "休市/週末/即時源失敗時使用最近交易日收盤或結算價",
+    "cached_at": "2026-06-13 12:53:52"
+  }
+}
