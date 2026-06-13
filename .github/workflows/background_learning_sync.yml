@@ -1,4 +1,4 @@
-name: v2.16.5 Market Context + Background Learning Sync
+name: v2.16.8 Market Context + Background Learning Sync
 
 on:
   workflow_dispatch:
