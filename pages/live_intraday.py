@@ -14,6 +14,9 @@ import re
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
+import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -4658,6 +4661,306 @@ def render_v220_multifactor_cockpit(df: pd.DataFrame, top_n: int = 15) -> None:
     st.caption("整合技術分析、籌碼資金、題材/即時時事代理、大盤夜盤環境與風險分層；目前未接正式新聞 API，時事分先用題材/產業/美盤 proxy，接新聞源後可再升級。")
     st.dataframe(show[cols].head(int(top_n)), use_container_width=True, hide_index=True)
 
+
+
+# -----------------------------
+# v2.21 real news / event intelligence layer
+# -----------------------------
+V221_NEWS_CACHE_PATH = DATA_DIR / "v221_news_context.json"
+
+V221_POSITIVE_KEYWORDS = [
+    "訂單", "接單", "出貨", "營收", "獲利", "EPS", "上修", "目標價", "看好", "買進",
+    "合作", "認證", "量產", "AI", "伺服器", "ASIC", "CPO", "CoWoS", "HPC", "PCB", "NVDA", "輝達",
+    "SpaceX", "衛星", "漲價", "擴產", "併購", "法說", "利多", "突破",
+]
+V221_NEGATIVE_KEYWORDS = [
+    "下修", "衰退", "虧損", "減產", "砍單", "違約", "警示", "處置", "注意股", "列處置",
+    "訴訟", "罰款", "火災", "停工", "利空", "暴跌", "賣壓", "出貨延後", "庫存", "匯損",
+    "戰爭", "制裁", "關稅", "升息", "殖利率飆", "風險", "澄清", "無重大訊息",
+]
+V221_EVENT_BOOST_KEYWORDS = ["最新", "盤中", "今日", "剛剛", "法說", "公告", "重大訊息", "新聞", "傳", "報導"]
+
+
+def _v221_safe_str(x: Any, default: str = "") -> str:
+    try:
+        if x is None:
+            return default
+        s = str(x).strip()
+        if s.lower() in {"nan", "none", "nat"}:
+            return default
+        return s
+    except Exception:
+        return default
+
+
+def _v221_clean_html(text: str) -> str:
+    text = _v221_safe_str(text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _v221_parse_news_time(pub: str) -> str:
+    try:
+        dt = parsedate_to_datetime(pub)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(TAIPEI_TZ)
+        return dt.strftime("%m-%d %H:%M")
+    except Exception:
+        return ""
+
+
+def _v221_score_title(title: str, summary: str = "") -> Tuple[int, int, int, str]:
+    text = (title or "") + " " + (summary or "")
+    pos = sum(1 for k in V221_POSITIVE_KEYWORDS if k.lower() in text.lower())
+    neg = sum(1 for k in V221_NEGATIVE_KEYWORDS if k.lower() in text.lower())
+    boost = sum(1 for k in V221_EVENT_BOOST_KEYWORDS if k.lower() in text.lower())
+    score = 50 + pos * 7 + boost * 2 - neg * 9
+    risk = min(100, neg * 20 + max(0, 50 - score) * 0.4)
+    score = int(max(0, min(100, score)))
+    risk = int(max(0, min(100, risk)))
+    if neg >= 2 or risk >= 60:
+        label = "🔴 利空/風險新聞"
+    elif pos >= 2 and score >= 65:
+        label = "🟢 題材利多升溫"
+    elif pos >= 1:
+        label = "🟡 題材觀察"
+    else:
+        label = "⚪ 無明確新聞催化"
+    return score, risk, pos, label
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _v221_fetch_google_news_rss(query: str, limit: int = 6) -> List[Dict[str, Any]]:
+    """Server-side RSS fetch for news/event context.
+
+    This uses a public RSS endpoint. If the endpoint is blocked / timeout, it
+    simply returns an empty list; the trading page must never crash because news
+    failed to load.
+    """
+    items: List[Dict[str, Any]] = []
+    try:
+        q = urllib.parse.quote_plus(query)
+        url = f"https://news.google.com/rss/search?q={q}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = resp.read(300000)
+        root = ET.fromstring(data)
+        for item in root.findall(".//item")[: max(1, int(limit))]:
+            title = _v221_clean_html(item.findtext("title") or "")
+            link = _v221_safe_str(item.findtext("link") or "")
+            pub = _v221_parse_news_time(item.findtext("pubDate") or "")
+            desc = _v221_clean_html(item.findtext("description") or "")
+            if title:
+                items.append({"title": title, "link": link, "time": pub, "summary": desc, "query": query})
+    except Exception:
+        return []
+    return items
+
+
+def _v221_build_news_queries(df: pd.DataFrame, max_stocks: int = 8) -> List[Dict[str, str]]:
+    queries: List[Dict[str, str]] = []
+    # Market-wide topics first.
+    market_topics = [
+        ("MARKET_AI", "台股 AI 伺服器 半導體 最新"),
+        ("MARKET_GLOBAL", "台股 美股 費半 台指期 夜盤 最新"),
+        ("MARKET_RISK", "台股 關稅 匯率 美債 戰爭 風險 最新"),
+    ]
+    for code, q in market_topics:
+        queries.append({"代號": code, "名稱": code, "query": q, "類型": "市場"})
+
+    if df is None or df.empty:
+        return queries
+    work = df.copy()
+    if "代號" in work.columns:
+        work["代號"] = work["代號"].astype(str).str.replace(".0", "", regex=False).str.zfill(4)
+    sort_cols = [c for c in ["v220最終智能分", "v214調權後分", "即時強度分", "AI總分"] if c in work.columns]
+    if sort_cols:
+        work = work.sort_values(sort_cols, ascending=[False] * len(sort_cols))
+    core = ["2330", "2382", "2313", "3441"]
+    codes = _unique_keep_order(core + work.get("代號", pd.Series(dtype=str)).astype(str).tolist())[:max_stocks]
+    for code in codes:
+        rowdf = work[work.get("代號", "").astype(str) == code] if "代號" in work.columns else pd.DataFrame()
+        if not rowdf.empty:
+            row = rowdf.iloc[0]
+            name = _v221_safe_str(row.get("名稱"), LOCAL_STOCK_INFO.get(code, (code, "", "上市"))[0])
+            industry = _v221_safe_str(row.get("產業"), LOCAL_STOCK_INFO.get(code, ("", "", ""))[1])
+        else:
+            name, industry, _ = LOCAL_STOCK_INFO.get(code, (code, "", "上市"))
+        # Query combines stock name and code, with topic words to reduce irrelevant hits.
+        q = f"{name} {code} 台股 最新 {industry}"
+        queries.append({"代號": code, "名稱": name, "query": q, "類型": "個股"})
+    return queries
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _v221_get_news_context_for_queries(query_rows_json: str) -> Dict[str, Any]:
+    try:
+        query_rows = json.loads(query_rows_json)
+    except Exception:
+        query_rows = []
+    results: Dict[str, Any] = {"updated_at": now_taipei().isoformat(), "items": {}, "error": ""}
+    for qr in query_rows:
+        code = _v221_safe_str(qr.get("代號"))
+        q = _v221_safe_str(qr.get("query"))
+        if not code or not q:
+            continue
+        articles = _v221_fetch_google_news_rss(q, limit=5)
+        scored = []
+        total_score = 50
+        max_risk = 0
+        pos_hits = 0
+        for a in articles:
+            score, risk, pos, label = _v221_score_title(a.get("title", ""), a.get("summary", ""))
+            aa = dict(a)
+            aa.update({"score": score, "risk": risk, "label": label})
+            scored.append(aa)
+            total_score += (score - 50) * 0.35
+            max_risk = max(max_risk, risk)
+            pos_hits += pos
+        event_score = int(max(0, min(100, total_score)))
+        latest = scored[0] if scored else {}
+        results["items"][code] = {
+            "代號": code,
+            "名稱": _v221_safe_str(qr.get("名稱"), code),
+            "類型": _v221_safe_str(qr.get("類型"), "個股"),
+            "query": q,
+            "news_count": len(scored),
+            "event_score": event_score,
+            "news_risk": int(max_risk),
+            "positive_hits": int(pos_hits),
+            "latest_title": _v221_safe_str(latest.get("title"), ""),
+            "latest_time": _v221_safe_str(latest.get("time"), ""),
+            "latest_label": _v221_safe_str(latest.get("label"), "⚪ 無明確新聞催化"),
+            "articles": scored[:5],
+        }
+    return results
+
+
+def build_v221_news_context(df: pd.DataFrame) -> Dict[str, Any]:
+    rows = _v221_build_news_queries(df, max_stocks=9)
+    try:
+        ctx = _v221_get_news_context_for_queries(json.dumps(rows, ensure_ascii=False))
+        DATA_DIR.mkdir(exist_ok=True)
+        V221_NEWS_CACHE_PATH.write_text(json.dumps(ctx, ensure_ascii=False, indent=2), encoding="utf-8")
+        return ctx
+    except Exception as e:
+        # Fall back to last cached news context if the live fetch fails.
+        try:
+            if V221_NEWS_CACHE_PATH.exists():
+                return json.loads(V221_NEWS_CACHE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        return {"updated_at": now_taipei().isoformat(), "items": {}, "error": str(e)}
+
+
+def add_v221_news_event_decision(df: pd.DataFrame, news_ctx: Dict[str, Any]) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    items = (news_ctx or {}).get("items", {}) or {}
+    event_scores = []
+    event_risks = []
+    labels = []
+    latest_titles = []
+    final_scores = []
+    final_signals = []
+    final_reasons = []
+    for _, row in out.iterrows():
+        code = str(row.get("代號", "")).replace(".0", "").zfill(4)
+        item = items.get(code, {}) or {}
+        event = _clean_number(item.get("event_score"), 50)
+        nrisk = _clean_number(item.get("news_risk"), 0)
+        base = _v220_pick_numeric(row, ["v220最終智能分", "v214調權後分", "即時強度分", "AI總分"], 50)
+        risk = _v220_pick_numeric(row, ["v220風險估計分", "風險分"], 35)
+        signal = _v221_safe_str(row.get("v220最終進場訊號"), "⚪ 觀察")
+        title = _v221_safe_str(item.get("latest_title"), "暫無即時新聞")
+        label = _v221_safe_str(item.get("latest_label"), "⚪ 無明確新聞催化")
+        news_count = int(_clean_number(item.get("news_count"), 0))
+        # Blend v2.20 with real news/event context.  News can upgrade only when risk is not high.
+        final = 0.78 * base + 0.18 * event - 0.20 * nrisk
+        if news_count == 0:
+            final -= 2
+        if nrisk >= 65:
+            final -= 10
+        final = max(0, min(100, final))
+        if nrisk >= 70:
+            fsig = "🟠 新聞風險升高，降級等確認"
+        elif final >= 74 and event >= 68 and risk < 55 and ("小量" in signal or "觸發" in signal):
+            fsig = "✅ 高信心右側小量 + 新聞助攻"
+        elif final >= 66 and event >= 60 and risk < 65:
+            fsig = "🟢 題材配合，等右側站穩"
+        elif final >= 58:
+            fsig = "🟡 技術/題材待確認"
+        elif risk >= 72:
+            fsig = "🔴 高風險，不追"
+        else:
+            fsig = "⚪ 觀察"
+        reason = []
+        if event >= 68:
+            reason.append("即時新聞/題材加分")
+        if nrisk >= 50:
+            reason.append("新聞風險需降級")
+        if news_count == 0:
+            reason.append("未抓到新新聞，沿用技術/資金")
+        if "小量" in signal:
+            reason.append("v2.20 進場條件偏強")
+        event_scores.append(round(event, 1))
+        event_risks.append(round(nrisk, 1))
+        labels.append(label)
+        latest_titles.append(title[:80])
+        final_scores.append(round(final, 1))
+        final_signals.append(fsig)
+        final_reasons.append("、".join(reason) if reason else "尚無額外新聞催化")
+    out["v221即時事件分"] = event_scores
+    out["v221新聞風險分"] = event_risks
+    out["v221事件標籤"] = labels
+    out["v221最新事件"] = latest_titles
+    out["v221最終智能分"] = final_scores
+    out["v221最終進場訊號"] = final_signals
+    out["v221事件判斷原因"] = final_reasons
+    return out
+
+
+def render_v221_news_event_cockpit(df: pd.DataFrame, news_ctx: Dict[str, Any], top_n: int = 15) -> None:
+    st.subheader("📰 v2.21 即時時事 / 新聞事件引擎")
+    st.caption("伺服器端抓新聞 RSS，將題材/利多/利空轉成事件分與新聞風險分，再修正 v2.20 的多因子進場訊號。新聞源若暫時被擋，系統會降級為技術/資金判斷，不會當機。")
+    nitems = (news_ctx or {}).get("items", {}) or {}
+    updated = _v221_safe_str((news_ctx or {}).get("updated_at"), "-")
+    total_news = sum(int(v.get("news_count", 0) or 0) for v in nitems.values()) if nitems else 0
+    risk_items = sum(1 for v in nitems.values() if _clean_number(v.get("news_risk"), 0) >= 60) if nitems else 0
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("追蹤題材數", len(nitems))
+    m2.metric("新聞筆數", total_news)
+    m3.metric("新聞風險事件", risk_items)
+    m4.metric("新聞更新", updated[5:16] if len(updated) >= 16 else updated)
+    if df is not None and not df.empty:
+        cols = [c for c in ["代號", "名稱", "v221最終進場訊號", "v221最終智能分", "v221即時事件分", "v221新聞風險分", "v221事件標籤", "v221最新事件", "v220技術分", "v220籌碼資金分", "v220風險分層", "盤中現價", "盤中漲跌幅", "v221事件判斷原因"] if c in df.columns]
+        show = df.copy()
+        if "v221最終智能分" in show.columns:
+            show = show.sort_values("v221最終智能分", ascending=False)
+        st.dataframe(show[cols].head(int(top_n)), use_container_width=True, hide_index=True)
+    rows = []
+    for code, item in nitems.items():
+        if code.startswith("MARKET"):
+            continue
+        rows.append({
+            "代號": code,
+            "名稱": item.get("名稱", code),
+            "事件分": item.get("event_score", 50),
+            "新聞風險": item.get("news_risk", 0),
+            "新聞數": item.get("news_count", 0),
+            "最新標籤": item.get("latest_label", ""),
+            "最新標題": item.get("latest_title", ""),
+            "時間": item.get("latest_time", ""),
+        })
+    with st.expander("新聞 / 題材事件明細", expanded=False):
+        if rows:
+            st.dataframe(pd.DataFrame(rows).sort_values(["新聞風險", "事件分"], ascending=[False, False]), use_container_width=True, hide_index=True)
+        else:
+            st.info("目前沒有抓到新聞事件，系統會沿用技術 / 資金 / 大盤夜盤判斷。")
+
+
 # -----------------------------
 # v2.18 front-end realtime quote panel
 # -----------------------------
@@ -5118,8 +5421,8 @@ v216_context = load_v216_context()
 
 tick_default = _get_query_int("tick", 5, 3, 30, 1)
 
-st.title("🧠 盤中即時看盤 v2.20 多因子智能決策引擎｜AI即時選股 + 右側精準")
-st.caption("v2.20 修正：即時行情不再只固定廣達/華通；改成台積電、廣達、華通 + AI系統最看好清單，並整合技術、籌碼資金、時事題材、大盤夜盤與風險分層。")
+st.title("📰 盤中即時看盤 v2.21 即時時事事件引擎｜多因子智能決策")
+st.caption("v2.21 新增：伺服器端即時新聞 / 題材事件分，將時事利多利空納入多因子進場判斷；若新聞源失敗則自動降級，不影響看盤。")
 # v2.20: realtime ticker panel is rendered after live_df is built, so stock prices can use backend MIS quotes first.
 render_v216_context(v216_context)
 st.divider()
@@ -5300,10 +5603,14 @@ live_df, intraday_memory_df = update_intraday_memory_features(live_df)
 live_df = add_v29_left_predictive_ai(live_df, chase_pct=chase_pct)
 live_df = add_v210_trader_decision(live_df, chase_pct=chase_pct)
 live_df = add_v220_multifactor_decision(live_df, v216_context)
+v221_news_context = build_v221_news_context(live_df)
+live_df = add_v221_news_event_decision(live_df, v221_news_context)
 
-# v2.20 realtime AI-selected ticker is rendered after MIS quote merge so 廣達/華通/台積電 have backend prices first.
+# v2.20/v2.21 realtime AI-selected ticker is rendered after MIS quote merge so 廣達/華通/台積電 have backend prices first.
 render_v220_realtime_ai_ticker_panel(live_df, v216_context, tick_seconds=live_tick_seconds)
-render_v220_multifactor_cockpit(live_df, top_n=top_n)
+render_v221_news_event_cockpit(live_df, v221_news_context, top_n=top_n)
+with st.expander("v2.20 原始多因子分數", expanded=False):
+    render_v220_multifactor_cockpit(live_df, top_n=top_n)
 st.divider()
 
 # v2.11 stable learning + v2.12 lifecycle state machine.
