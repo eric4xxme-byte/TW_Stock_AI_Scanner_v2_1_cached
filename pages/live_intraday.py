@@ -14,6 +14,9 @@ import re
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
+import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -4658,6 +4661,306 @@ def render_v220_multifactor_cockpit(df: pd.DataFrame, top_n: int = 15) -> None:
     st.caption("整合技術分析、籌碼資金、題材/即時時事代理、大盤夜盤環境與風險分層；目前未接正式新聞 API，時事分先用題材/產業/美盤 proxy，接新聞源後可再升級。")
     st.dataframe(show[cols].head(int(top_n)), use_container_width=True, hide_index=True)
 
+
+
+# -----------------------------
+# v2.21 real news / event intelligence layer
+# -----------------------------
+V221_NEWS_CACHE_PATH = DATA_DIR / "v221_news_context.json"
+
+V221_POSITIVE_KEYWORDS = [
+    "訂單", "接單", "出貨", "營收", "獲利", "EPS", "上修", "目標價", "看好", "買進",
+    "合作", "認證", "量產", "AI", "伺服器", "ASIC", "CPO", "CoWoS", "HPC", "PCB", "NVDA", "輝達",
+    "SpaceX", "衛星", "漲價", "擴產", "併購", "法說", "利多", "突破",
+]
+V221_NEGATIVE_KEYWORDS = [
+    "下修", "衰退", "虧損", "減產", "砍單", "違約", "警示", "處置", "注意股", "列處置",
+    "訴訟", "罰款", "火災", "停工", "利空", "暴跌", "賣壓", "出貨延後", "庫存", "匯損",
+    "戰爭", "制裁", "關稅", "升息", "殖利率飆", "風險", "澄清", "無重大訊息",
+]
+V221_EVENT_BOOST_KEYWORDS = ["最新", "盤中", "今日", "剛剛", "法說", "公告", "重大訊息", "新聞", "傳", "報導"]
+
+
+def _v221_safe_str(x: Any, default: str = "") -> str:
+    try:
+        if x is None:
+            return default
+        s = str(x).strip()
+        if s.lower() in {"nan", "none", "nat"}:
+            return default
+        return s
+    except Exception:
+        return default
+
+
+def _v221_clean_html(text: str) -> str:
+    text = _v221_safe_str(text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _v221_parse_news_time(pub: str) -> str:
+    try:
+        dt = parsedate_to_datetime(pub)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(TAIPEI_TZ)
+        return dt.strftime("%m-%d %H:%M")
+    except Exception:
+        return ""
+
+
+def _v221_score_title(title: str, summary: str = "") -> Tuple[int, int, int, str]:
+    text = (title or "") + " " + (summary or "")
+    pos = sum(1 for k in V221_POSITIVE_KEYWORDS if k.lower() in text.lower())
+    neg = sum(1 for k in V221_NEGATIVE_KEYWORDS if k.lower() in text.lower())
+    boost = sum(1 for k in V221_EVENT_BOOST_KEYWORDS if k.lower() in text.lower())
+    score = 50 + pos * 7 + boost * 2 - neg * 9
+    risk = min(100, neg * 20 + max(0, 50 - score) * 0.4)
+    score = int(max(0, min(100, score)))
+    risk = int(max(0, min(100, risk)))
+    if neg >= 2 or risk >= 60:
+        label = "🔴 利空/風險新聞"
+    elif pos >= 2 and score >= 65:
+        label = "🟢 題材利多升溫"
+    elif pos >= 1:
+        label = "🟡 題材觀察"
+    else:
+        label = "⚪ 無明確新聞催化"
+    return score, risk, pos, label
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _v221_fetch_google_news_rss(query: str, limit: int = 6) -> List[Dict[str, Any]]:
+    """Server-side RSS fetch for news/event context.
+
+    This uses a public RSS endpoint. If the endpoint is blocked / timeout, it
+    simply returns an empty list; the trading page must never crash because news
+    failed to load.
+    """
+    items: List[Dict[str, Any]] = []
+    try:
+        q = urllib.parse.quote_plus(query)
+        url = f"https://news.google.com/rss/search?q={q}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = resp.read(300000)
+        root = ET.fromstring(data)
+        for item in root.findall(".//item")[: max(1, int(limit))]:
+            title = _v221_clean_html(item.findtext("title") or "")
+            link = _v221_safe_str(item.findtext("link") or "")
+            pub = _v221_parse_news_time(item.findtext("pubDate") or "")
+            desc = _v221_clean_html(item.findtext("description") or "")
+            if title:
+                items.append({"title": title, "link": link, "time": pub, "summary": desc, "query": query})
+    except Exception:
+        return []
+    return items
+
+
+def _v221_build_news_queries(df: pd.DataFrame, max_stocks: int = 8) -> List[Dict[str, str]]:
+    queries: List[Dict[str, str]] = []
+    # Market-wide topics first.
+    market_topics = [
+        ("MARKET_AI", "台股 AI 伺服器 半導體 最新"),
+        ("MARKET_GLOBAL", "台股 美股 費半 台指期 夜盤 最新"),
+        ("MARKET_RISK", "台股 關稅 匯率 美債 戰爭 風險 最新"),
+    ]
+    for code, q in market_topics:
+        queries.append({"代號": code, "名稱": code, "query": q, "類型": "市場"})
+
+    if df is None or df.empty:
+        return queries
+    work = df.copy()
+    if "代號" in work.columns:
+        work["代號"] = work["代號"].astype(str).str.replace(".0", "", regex=False).str.zfill(4)
+    sort_cols = [c for c in ["v220最終智能分", "v214調權後分", "即時強度分", "AI總分"] if c in work.columns]
+    if sort_cols:
+        work = work.sort_values(sort_cols, ascending=[False] * len(sort_cols))
+    core = ["2330", "2382", "2313", "3441"]
+    codes = _unique_keep_order(core + work.get("代號", pd.Series(dtype=str)).astype(str).tolist())[:max_stocks]
+    for code in codes:
+        rowdf = work[work.get("代號", "").astype(str) == code] if "代號" in work.columns else pd.DataFrame()
+        if not rowdf.empty:
+            row = rowdf.iloc[0]
+            name = _v221_safe_str(row.get("名稱"), LOCAL_STOCK_INFO.get(code, (code, "", "上市"))[0])
+            industry = _v221_safe_str(row.get("產業"), LOCAL_STOCK_INFO.get(code, ("", "", ""))[1])
+        else:
+            name, industry, _ = LOCAL_STOCK_INFO.get(code, (code, "", "上市"))
+        # Query combines stock name and code, with topic words to reduce irrelevant hits.
+        q = f"{name} {code} 台股 最新 {industry}"
+        queries.append({"代號": code, "名稱": name, "query": q, "類型": "個股"})
+    return queries
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _v221_get_news_context_for_queries(query_rows_json: str) -> Dict[str, Any]:
+    try:
+        query_rows = json.loads(query_rows_json)
+    except Exception:
+        query_rows = []
+    results: Dict[str, Any] = {"updated_at": now_taipei().isoformat(), "items": {}, "error": ""}
+    for qr in query_rows:
+        code = _v221_safe_str(qr.get("代號"))
+        q = _v221_safe_str(qr.get("query"))
+        if not code or not q:
+            continue
+        articles = _v221_fetch_google_news_rss(q, limit=5)
+        scored = []
+        total_score = 50
+        max_risk = 0
+        pos_hits = 0
+        for a in articles:
+            score, risk, pos, label = _v221_score_title(a.get("title", ""), a.get("summary", ""))
+            aa = dict(a)
+            aa.update({"score": score, "risk": risk, "label": label})
+            scored.append(aa)
+            total_score += (score - 50) * 0.35
+            max_risk = max(max_risk, risk)
+            pos_hits += pos
+        event_score = int(max(0, min(100, total_score)))
+        latest = scored[0] if scored else {}
+        results["items"][code] = {
+            "代號": code,
+            "名稱": _v221_safe_str(qr.get("名稱"), code),
+            "類型": _v221_safe_str(qr.get("類型"), "個股"),
+            "query": q,
+            "news_count": len(scored),
+            "event_score": event_score,
+            "news_risk": int(max_risk),
+            "positive_hits": int(pos_hits),
+            "latest_title": _v221_safe_str(latest.get("title"), ""),
+            "latest_time": _v221_safe_str(latest.get("time"), ""),
+            "latest_label": _v221_safe_str(latest.get("label"), "⚪ 無明確新聞催化"),
+            "articles": scored[:5],
+        }
+    return results
+
+
+def build_v221_news_context(df: pd.DataFrame) -> Dict[str, Any]:
+    rows = _v221_build_news_queries(df, max_stocks=9)
+    try:
+        ctx = _v221_get_news_context_for_queries(json.dumps(rows, ensure_ascii=False))
+        DATA_DIR.mkdir(exist_ok=True)
+        V221_NEWS_CACHE_PATH.write_text(json.dumps(ctx, ensure_ascii=False, indent=2), encoding="utf-8")
+        return ctx
+    except Exception as e:
+        # Fall back to last cached news context if the live fetch fails.
+        try:
+            if V221_NEWS_CACHE_PATH.exists():
+                return json.loads(V221_NEWS_CACHE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        return {"updated_at": now_taipei().isoformat(), "items": {}, "error": str(e)}
+
+
+def add_v221_news_event_decision(df: pd.DataFrame, news_ctx: Dict[str, Any]) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    items = (news_ctx or {}).get("items", {}) or {}
+    event_scores = []
+    event_risks = []
+    labels = []
+    latest_titles = []
+    final_scores = []
+    final_signals = []
+    final_reasons = []
+    for _, row in out.iterrows():
+        code = str(row.get("代號", "")).replace(".0", "").zfill(4)
+        item = items.get(code, {}) or {}
+        event = _clean_number(item.get("event_score"), 50)
+        nrisk = _clean_number(item.get("news_risk"), 0)
+        base = _v220_pick_numeric(row, ["v220最終智能分", "v214調權後分", "即時強度分", "AI總分"], 50)
+        risk = _v220_pick_numeric(row, ["v220風險估計分", "風險分"], 35)
+        signal = _v221_safe_str(row.get("v220最終進場訊號"), "⚪ 觀察")
+        title = _v221_safe_str(item.get("latest_title"), "暫無即時新聞")
+        label = _v221_safe_str(item.get("latest_label"), "⚪ 無明確新聞催化")
+        news_count = int(_clean_number(item.get("news_count"), 0))
+        # Blend v2.20 with real news/event context.  News can upgrade only when risk is not high.
+        final = 0.78 * base + 0.18 * event - 0.20 * nrisk
+        if news_count == 0:
+            final -= 2
+        if nrisk >= 65:
+            final -= 10
+        final = max(0, min(100, final))
+        if nrisk >= 70:
+            fsig = "🟠 新聞風險升高，降級等確認"
+        elif final >= 74 and event >= 68 and risk < 55 and ("小量" in signal or "觸發" in signal):
+            fsig = "✅ 高信心右側小量 + 新聞助攻"
+        elif final >= 66 and event >= 60 and risk < 65:
+            fsig = "🟢 題材配合，等右側站穩"
+        elif final >= 58:
+            fsig = "🟡 技術/題材待確認"
+        elif risk >= 72:
+            fsig = "🔴 高風險，不追"
+        else:
+            fsig = "⚪ 觀察"
+        reason = []
+        if event >= 68:
+            reason.append("即時新聞/題材加分")
+        if nrisk >= 50:
+            reason.append("新聞風險需降級")
+        if news_count == 0:
+            reason.append("未抓到新新聞，沿用技術/資金")
+        if "小量" in signal:
+            reason.append("v2.20 進場條件偏強")
+        event_scores.append(round(event, 1))
+        event_risks.append(round(nrisk, 1))
+        labels.append(label)
+        latest_titles.append(title[:80])
+        final_scores.append(round(final, 1))
+        final_signals.append(fsig)
+        final_reasons.append("、".join(reason) if reason else "尚無額外新聞催化")
+    out["v221即時事件分"] = event_scores
+    out["v221新聞風險分"] = event_risks
+    out["v221事件標籤"] = labels
+    out["v221最新事件"] = latest_titles
+    out["v221最終智能分"] = final_scores
+    out["v221最終進場訊號"] = final_signals
+    out["v221事件判斷原因"] = final_reasons
+    return out
+
+
+def render_v221_news_event_cockpit(df: pd.DataFrame, news_ctx: Dict[str, Any], top_n: int = 15) -> None:
+    st.subheader("📰 v2.21 即時時事 / 新聞事件引擎")
+    st.caption("伺服器端抓新聞 RSS，將題材/利多/利空轉成事件分與新聞風險分，再修正 v2.20 的多因子進場訊號。新聞源若暫時被擋，系統會降級為技術/資金判斷，不會當機。")
+    nitems = (news_ctx or {}).get("items", {}) or {}
+    updated = _v221_safe_str((news_ctx or {}).get("updated_at"), "-")
+    total_news = sum(int(v.get("news_count", 0) or 0) for v in nitems.values()) if nitems else 0
+    risk_items = sum(1 for v in nitems.values() if _clean_number(v.get("news_risk"), 0) >= 60) if nitems else 0
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("追蹤題材數", len(nitems))
+    m2.metric("新聞筆數", total_news)
+    m3.metric("新聞風險事件", risk_items)
+    m4.metric("新聞更新", updated[5:16] if len(updated) >= 16 else updated)
+    if df is not None and not df.empty:
+        cols = [c for c in ["代號", "名稱", "v221最終進場訊號", "v221最終智能分", "v221即時事件分", "v221新聞風險分", "v221事件標籤", "v221最新事件", "v220技術分", "v220籌碼資金分", "v220風險分層", "盤中現價", "盤中漲跌幅", "v221事件判斷原因"] if c in df.columns]
+        show = df.copy()
+        if "v221最終智能分" in show.columns:
+            show = show.sort_values("v221最終智能分", ascending=False)
+        st.dataframe(show[cols].head(int(top_n)), use_container_width=True, hide_index=True)
+    rows = []
+    for code, item in nitems.items():
+        if code.startswith("MARKET"):
+            continue
+        rows.append({
+            "代號": code,
+            "名稱": item.get("名稱", code),
+            "事件分": item.get("event_score", 50),
+            "新聞風險": item.get("news_risk", 0),
+            "新聞數": item.get("news_count", 0),
+            "最新標籤": item.get("latest_label", ""),
+            "最新標題": item.get("latest_title", ""),
+            "時間": item.get("latest_time", ""),
+        })
+    with st.expander("新聞 / 題材事件明細", expanded=False):
+        if rows:
+            st.dataframe(pd.DataFrame(rows).sort_values(["新聞風險", "事件分"], ascending=[False, False]), use_container_width=True, hide_index=True)
+        else:
+            st.info("目前沒有抓到新聞事件，系統會沿用技術 / 資金 / 大盤夜盤判斷。")
+
+
 # -----------------------------
 # v2.18 front-end realtime quote panel
 # -----------------------------
@@ -4871,6 +5174,148 @@ def render_v218_realtime_ticker_panel(ctx: Dict[str, Any], tick_seconds: int = 5
 
 
 # -----------------------------
+
+
+# v2.22 news/event quality gate + reflection filter
+def _v222_event_item(news_ctx: Dict[str, Any], code: str) -> Dict[str, Any]:
+    try:
+        return ((news_ctx or {}).get("items") or {}).get(str(code), {}) or {}
+    except Exception:
+        return {}
+
+def _v222_confidence_from_item(item: Dict[str, Any], title: str) -> Tuple[float, str]:
+    news_count = int(_clean_number(item.get("news_count", 0), 0))
+    event_score = _clean_number(item.get("event_score", 50), 50)
+    risk = _clean_number(item.get("news_risk", 0), 0)
+    t = _v221_safe_str(title)
+    confidence = 35.0
+    reasons = []
+    if news_count >= 5:
+        confidence += 28; reasons.append("多來源/多篇新聞")
+    elif news_count >= 3:
+        confidence += 18; reasons.append("新聞數足夠")
+    elif news_count >= 1:
+        confidence += 7; reasons.append("有新聞來源")
+    else:
+        confidence -= 12; reasons.append("新聞不足")
+    if event_score >= 72:
+        confidence += 14; reasons.append("題材強")
+    elif event_score >= 60:
+        confidence += 7; reasons.append("題材偏強")
+    if risk >= 45:
+        confidence -= 25; reasons.append("利空/風險字眼高")
+    elif risk >= 25:
+        confidence -= 12; reasons.append("新聞風險偏高")
+    if any(k in t for k in ["傳", "市場傳", "臆測", "傳聞", "未證實"]):
+        confidence -= 18; reasons.append("傳聞型，降權")
+    if any(k in t for k in ["公告", "法說", "財報", "營收", "董事會", "重大訊息", "正式"]):
+        confidence += 12; reasons.append("正式資訊")
+    confidence = max(0, min(100, confidence))
+    return confidence, "、".join(reasons) if reasons else "一般新聞可信度"
+
+def _v222_reflection_state(row: pd.Series, event_score: float, risk: float) -> Tuple[str, float, str]:
+    pct = _clean_number(row.get("盤中漲跌幅"), 0)
+    strength = _clean_number(row.get("即時強度分"), 0)
+    surge = _clean_number(row.get("漲停前兆分"), _clean_number(row.get("v29漲停前兆分"), 0))
+    if pct >= 7.5:
+        return "🔴 消息多半已反映", -18.0, "漲幅已高，新聞加分降權"
+    if pct >= 4.5 and event_score >= 65:
+        return "🟠 部分反映", -8.0, "已有明顯漲幅，避免追新聞"
+    if pct <= -2.5 and risk >= 30:
+        return "🔴 利空正在反映", -22.0, "新聞風險與價格同步轉弱"
+    if strength >= 62 and event_score >= 60 and pct < 4.5:
+        return "🟢 尚未完全反映", 10.0, "資金轉強但未過熱"
+    if surge >= 65 and pct < 6.5:
+        return "🚀 前兆升溫", 12.0, "爆衝前兆但尚未極端過熱"
+    return "⚪ 未明顯反映", 0.0, "價格反應仍中性"
+
+def _v222_risk_level(score: float, news_risk: float, market_score: float, night_risk: float, pct: float) -> str:
+    if news_risk >= 55 or pct >= 8.5 or night_risk >= 70:
+        return "極高"
+    if news_risk >= 35 or pct >= 6.5 or market_score < 45:
+        return "高"
+    if news_risk >= 18 or pct >= 4.0 or market_score < 58:
+        return "中"
+    return "低"
+
+def add_v222_event_quality_decision(df: pd.DataFrame, news_ctx: Dict[str, Any]) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    event_conf, reflected, decay_adj, risk_layers, final_scores, final_sigs, reasons = [], [], [], [], [], [], []
+    market_score = _clean_number((v216_context or {}).get("market_env_score"), 55) if "v216_context" in globals() else 55
+    night_risk = _clean_number((v216_context or {}).get("night_risk_score"), 50) if "v216_context" in globals() else 50
+    for _, row in out.iterrows():
+        code = _v221_safe_str(row.get("代號"))
+        item = _v222_event_item(news_ctx, code)
+        title = _v221_safe_str(row.get("v221最新事件"), item.get("latest_title", ""))
+        base = _clean_number(row.get("v221最終智能分"), _clean_number(row.get("v220最終智能分"), 50))
+        event_score = _clean_number(row.get("v221即時事件分"), item.get("event_score", 50))
+        news_risk = _clean_number(row.get("v221新聞風險分"), item.get("news_risk", 0))
+        confidence, conf_reason = _v222_confidence_from_item(item, title)
+        ref_state, ref_adj, ref_reason = _v222_reflection_state(row, event_score, news_risk)
+        pct = _clean_number(row.get("盤中漲跌幅"), 0)
+        risk_layer = _v222_risk_level(base, news_risk, market_score, night_risk, pct)
+        # Confidence gate: news can only strongly upgrade when confidence is high and price not already overheated.
+        news_alpha = 0.18 if confidence >= 65 else (0.10 if confidence >= 45 else 0.04)
+        final = base * (1 - news_alpha) + event_score * news_alpha - news_risk * 0.22 + ref_adj
+        if market_score < 50:
+            final -= 6
+        if night_risk > 65:
+            final -= 5
+        final = round(max(0, min(100, final)), 1)
+        old_sig = _v221_safe_str(row.get("v221最終進場訊號"), _v221_safe_str(row.get("v220最終進場訊號"), "⚪ 觀察"))
+        if risk_layer in ["極高"]:
+            sig = "🔴 事件/環境高風險，不追"
+        elif "已反映" in ref_state and pct >= 7:
+            sig = "🔴 新聞已反映，避免追高"
+        elif final >= 76 and confidence >= 65 and risk_layer in ["低", "中"] and ("小量" in old_sig or "觸發" in old_sig):
+            sig = "✅ 高信心右側小量｜事件確認"
+        elif final >= 68 and confidence >= 55 and risk_layer != "高":
+            sig = "🟢 事件支持，等站穩確認"
+        elif final >= 60 and risk_layer in ["低", "中"]:
+            sig = "🟡 技術/資金可看，事件待確認"
+        else:
+            sig = "⚪ 觀察，事件不足"
+        event_conf.append(round(confidence, 1))
+        reflected.append(ref_state)
+        decay_adj.append(round(ref_adj, 1))
+        risk_layers.append(risk_layer)
+        final_scores.append(final)
+        final_sigs.append(sig)
+        reasons.append(f"{conf_reason}；{ref_reason}；風險={risk_layer}")
+    out["v222事件可信度"] = event_conf
+    out["v222消息反映狀態"] = reflected
+    out["v222消息反映調整"] = decay_adj
+    out["v222風險層級"] = risk_layers
+    out["v222最終智能分"] = final_scores
+    out["v222最終進場訊號"] = final_sigs
+    out["v222判斷原因"] = reasons
+    return out
+
+def render_v222_event_quality_cockpit(df: pd.DataFrame, news_ctx: Dict[str, Any], top_n: int = 15) -> None:
+    st.subheader("🧠 v2.22 事件可信度 / 已反映過濾引擎")
+    st.caption("v2.22 不再把新聞一律加分；會判斷新聞可信度、是否已經反映在漲幅、是否只是傳聞，以及大盤/夜盤風險後再修正進場訊號。")
+    if df is None or df.empty:
+        st.info("目前沒有可分析資料。")
+        return
+    total = len(df)
+    high_conf = int((pd.to_numeric(df.get("v222事件可信度", pd.Series(dtype=float)), errors="coerce").fillna(0) >= 65).sum())
+    reflected_n = int(df.get("v222消息反映狀態", pd.Series(dtype=str)).astype(str).str.contains("已反映|部分反映", regex=True).sum()) if "v222消息反映狀態" in df.columns else 0
+    risk_hi = int(df.get("v222風險層級", pd.Series(dtype=str)).astype(str).isin(["高", "極高"]).sum()) if "v222風險層級" in df.columns else 0
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("分析標的", total)
+    c2.metric("高可信事件", high_conf)
+    c3.metric("消息已反映", reflected_n)
+    c4.metric("高風險事件", risk_hi)
+    cols = [c for c in ["代號", "名稱", "v222最終進場訊號", "v222最終智能分", "v222事件可信度", "v222消息反映狀態", "v222風險層級", "v221最新事件", "v220技術分", "v220籌碼資金分", "盤中現價", "盤中漲跌幅", "v222判斷原因"] if c in df.columns]
+    show = df[cols].copy()
+    if "v222最終智能分" in show.columns:
+        show = show.sort_values("v222最終智能分", ascending=False)
+    st.dataframe(show.head(top_n), use_container_width=True, hide_index=True)
+    with st.expander("v2.21 原始新聞分數明細", expanded=False):
+        render_v221_news_event_cockpit(df, news_ctx, top_n=top_n)
+
 # v2.19 realtime alert event engine + right-side precision entry
 # -----------------------------
 def _v219_zone_numbers(text_value: Any) -> Tuple[float, float]:
@@ -5114,12 +5559,274 @@ def render_v219_realtime_alert_panel(lifecycle_df: pd.DataFrame, tick_seconds: i
     components.html(html, height=330, scrolling=False)
 
 
+
+
+# -----------------------------
+# v2.23 Core Refactor: Decision Consistency Engine
+# -----------------------------
+
+def _v223_bool_contains(row: pd.Series, cols: List[str], patterns: str) -> bool:
+    try:
+        for c in cols:
+            if c in row.index and re.search(patterns, _safe_text(row.get(c), "")):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _v223_market_state(ctx: Dict[str, Any]) -> Tuple[float, float, str]:
+    try:
+        m = _clean_number((ctx or {}).get("market_env_score"), 55)
+    except Exception:
+        m = 55.0
+    try:
+        n = _clean_number((ctx or {}).get("night_risk_score"), 50)
+    except Exception:
+        n = 50.0
+    if m >= 68 and n < 62:
+        label = "🟢 環境偏多"
+    elif m < 45 or n >= 72:
+        label = "🔴 環境偏弱"
+    else:
+        label = "🟡 環境中性"
+    return float(m), float(n), label
+
+
+def add_v223_consistency_decision(df: pd.DataFrame, ctx: Dict[str, Any]) -> pd.DataFrame:
+    """
+    v2.23: one final decision per stock.
+    Priority: risk veto -> market environment -> technical trigger -> capital confirmation -> event quality.
+    This intentionally does not add another competing signal; it consolidates v219/v220/v221/v222/v216 into one result.
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    market_score, night_risk, market_label = _v223_market_state(ctx)
+    final_signals, final_scores, buy_conclusions, risk_levels = [], [], [], []
+    tech_states, capital_states, event_states, market_adj, reasons, next_steps, priorities = [], [], [], [], [], [], []
+
+    for _, row in out.iterrows():
+        px = _clean_number(row.get("盤中現價"), np.nan)
+        pct = _clean_number(row.get("盤中漲跌幅"), 0)
+        risk_raw = _clean_number(row.get("風險分"), _clean_number(row.get("v220風險估計分"), 50))
+        stop = _clean_number(row.get("防守停損"), np.nan)
+        right_px = _clean_number(row.get("右側加碼價"), np.nan)
+        cap = _clean_number(row.get("追價上限"), np.nan)
+        tech = _clean_number(row.get("v220技術分"), _clean_number(row.get("即時強度分"), 50))
+        capital = _clean_number(row.get("v220籌碼資金分"), _clean_number(row.get("盤中資金分"), 50))
+        event = _clean_number(row.get("v222事件可信度"), _clean_number(row.get("v221即時事件分"), 50))
+        event_risk = _clean_number(row.get("v221新聞風險分"), 0)
+        base_score = _clean_number(row.get("v222最終智能分"), _clean_number(row.get("v221最終智能分"), _clean_number(row.get("v220最終智能分"), 50)))
+        right_sig = _safe_text(row.get("v219右側精準進場"), "")
+        v222_sig = _safe_text(row.get("v222最終進場訊號"), "")
+        reflected = _safe_text(row.get("v222消息反映狀態"), "")
+        event_risk_layer = _safe_text(row.get("v222風險層級"), "")
+        lifecycle = _safe_text(row.get("v212生命週期狀態"), "")
+
+        # layer labels
+        if _is_nan(px) or px <= 0:
+            tech_state = "⚪ 等報價"
+        elif "右側確認" in right_sig or "可小量" in right_sig:
+            tech_state = "✅ 右側確認"
+        elif "觸發" in right_sig:
+            tech_state = "🟢 右側觸發"
+        elif re.search("到價|可試單", lifecycle):
+            tech_state = "✅ 左側到價"
+        elif tech >= 68:
+            tech_state = "🟢 技術偏強"
+        elif tech >= 55:
+            tech_state = "🟡 技術中性"
+        else:
+            tech_state = "⚪ 技術不足"
+
+        if capital >= 68:
+            cap_state = "🟢 資金確認"
+        elif capital >= 55:
+            cap_state = "🟡 資金普通"
+        else:
+            cap_state = "⚪ 資金不足"
+
+        if event_risk >= 45 or "高風險" in event_risk_layer:
+            evt_state = "🔴 事件風險"
+        elif "已反映" in reflected:
+            evt_state = "🟠 消息已反映"
+        elif event >= 65:
+            evt_state = "🟢 事件支持"
+        elif event >= 50:
+            evt_state = "🟡 事件中性"
+        else:
+            evt_state = "⚪ 無事件加分"
+
+        # risk level with market/systemic context
+        if event_risk_layer == "極高" or risk_raw >= 80 or event_risk >= 55 or pct >= 8.5 or night_risk >= 78:
+            risk_level = "極高"
+        elif event_risk_layer == "高" or risk_raw >= 65 or pct >= 6.5 or market_score < 45 or night_risk >= 68:
+            risk_level = "高"
+        elif risk_raw >= 45 or pct >= 4.5 or market_score < 58 or night_risk >= 58:
+            risk_level = "中"
+        else:
+            risk_level = "低"
+
+        # score: start from v222/v220 but make veto layers explicit.
+        score = base_score
+        score += (tech - 55) * 0.22
+        score += (capital - 55) * 0.18
+        score += (event - 50) * 0.08
+        score += (market_score - 55) * 0.12
+        score -= max(0, night_risk - 55) * 0.12
+        score -= max(0, risk_raw - 45) * 0.18
+        score -= event_risk * 0.08
+        if "已反映" in reflected:
+            score -= 8
+        if not _is_nan(cap) and not _is_nan(px) and cap > 0 and px > cap:
+            score -= 16
+        if not _is_nan(stop) and not _is_nan(px) and stop > 0 and px <= stop:
+            score -= 28
+        score = round(max(0, min(100, score)), 1)
+
+        # final single signal
+        reason_bits = []
+        if _is_nan(px) or px <= 0:
+            final = "⚪ 等報價"
+            conclusion = "不進"
+            priority = 80
+            step = "等待有效即時價，不用猜。"
+            reason_bits.append("沒有有效現價")
+        elif not _is_nan(stop) and stop > 0 and px <= stop:
+            final = "⚫ 避開"
+            conclusion = "不買，結構破壞"
+            priority = 90
+            step = "跌破防守價，等待重新建立結構。"
+            reason_bits.append("跌破防守停損")
+        elif risk_level == "極高":
+            final = "⚫ 避開"
+            conclusion = "不可碰"
+            priority = 95
+            step = "風險層級極高，停止追價或試單。"
+            reason_bits.append("極高風險否決")
+        elif risk_level == "高" and (pct >= 6.5 or "已反映" in reflected or event_risk >= 35):
+            final = "🔴 不追"
+            conclusion = "高風險不追"
+            priority = 70
+            step = "等回測、等風險下降，不做右側追價。"
+            reason_bits.append("高風險/消息已反映")
+        elif score >= 76 and risk_level in ["低", "中"] and ("右側確認" in tech_state or "左側到價" in tech_state) and capital >= 58 and market_score >= 50:
+            final = "✅ 可小量進場"
+            conclusion = "可小量，不重倉"
+            priority = 1
+            step = "只允許小量，照防守停損；若 1~2 輪無法站穩，降級。"
+            reason_bits.append("技術觸發 + 資金/環境可接受")
+        elif score >= 68 and risk_level in ["低", "中"] and ("觸發" in tech_state or "技術偏強" in tech_state):
+            final = "🟢 等站穩確認"
+            conclusion = "先不追，等站穩"
+            priority = 2
+            step = "等下一輪仍站在右側價附近，且沒有超過追價上限。"
+            reason_bits.append("技術偏強但確認不足")
+        elif score >= 60 and risk_level in ["低", "中"]:
+            final = "🟡 等回測"
+            conclusion = "等更低風險買點"
+            priority = 3
+            step = "等回到左側區或重新放量站穩，不買在中間。"
+            reason_bits.append("條件中等，缺少明確觸發")
+        elif risk_level == "高":
+            final = "🟠 高風險只觀察"
+            conclusion = "只看不買"
+            priority = 6
+            step = "風險偏高，除非大盤/量價改善，否則不進。"
+            reason_bits.append("風險高於可試單標準")
+        else:
+            final = "⚪ 觀察"
+            conclusion = "不進"
+            priority = 5
+            step = "技術/資金/事件不同步，等待更明確訊號。"
+            reason_bits.append("多因子不同步")
+
+        if market_score < 48 and final.startswith("✅"):
+            final = "🟡 環境降級，等確認"
+            conclusion = "不直接買"
+            priority = min(priority + 2, 6)
+            step = "大盤偏弱，原本可試單降級為等待確認。"
+            reason_bits.append("大盤偏弱降級")
+
+        final_signals.append(final)
+        final_scores.append(score)
+        buy_conclusions.append(conclusion)
+        risk_levels.append(risk_level)
+        tech_states.append(tech_state)
+        capital_states.append(cap_state)
+        event_states.append(evt_state)
+        market_adj.append(market_label)
+        next_steps.append(step)
+        priorities.append(priority)
+        reasons.append("；".join(reason_bits + [f"技術={tech_state}", f"資金={cap_state}", f"事件={evt_state}", f"環境={market_label}"]))
+
+    out["v223最終訊號"] = final_signals
+    out["v223最終分"] = final_scores
+    out["v223買賣結論"] = buy_conclusions
+    out["v223風險層級"] = risk_levels
+    out["v223技術狀態"] = tech_states
+    out["v223籌碼確認"] = capital_states
+    out["v223事件修正"] = event_states
+    out["v223大盤修正"] = market_adj
+    out["v223下一步"] = next_steps
+    out["v223優先級"] = priorities
+    out["v223決策理由"] = reasons
+    return out
+
+
+def render_v223_consistency_cockpit(df: pd.DataFrame, ctx: Dict[str, Any], top_n: int = 15) -> None:
+    st.subheader("🧭 v2.23 AI 最終進場決策｜決策一致性引擎")
+    st.caption("這張表是盤中主決策：先做風險否決，再看大盤/夜盤、技術觸發、籌碼資金、事件可信度；同一檔只給一個最終訊號。")
+    if df is None or df.empty:
+        st.info("目前沒有可分析資料。")
+        return
+    work = df.copy()
+    if "v223優先級" in work.columns or "v223最終分" in work.columns:
+        work = _safe_sort(work, ["v223優先級", "v223最終分", "即時強度分"], ascending=[True, False, False])
+    buy_n = int(work.get("v223最終訊號", pd.Series(dtype=str)).astype(str).str.contains("可小量", regex=False).sum()) if "v223最終訊號" in work.columns else 0
+    confirm_n = int(work.get("v223最終訊號", pd.Series(dtype=str)).astype(str).str.contains("站穩", regex=False).sum()) if "v223最終訊號" in work.columns else 0
+    wait_n = int(work.get("v223最終訊號", pd.Series(dtype=str)).astype(str).str.contains("等回測|觀察", regex=True).sum()) if "v223最終訊號" in work.columns else 0
+    danger_n = int(work.get("v223最終訊號", pd.Series(dtype=str)).astype(str).str.contains("不追|避開|高風險", regex=True).sum()) if "v223最終訊號" in work.columns else 0
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("✅ 可小量", buy_n)
+    c2.metric("🟢 等站穩", confirm_n)
+    c3.metric("🟡 等/觀察", wait_n)
+    c4.metric("🔴 風險不進", danger_n)
+    cols = _cols_exist(work, [
+        "代號", "名稱", "盤中現價", "盤中漲跌幅", "v223最終訊號", "v223買賣結論", "v223最終分", "v223風險層級",
+        "v223技術狀態", "v223籌碼確認", "v223事件修正", "v223大盤修正", "第一買點", "右側加碼價", "防守停損", "追價上限", "v223下一步", "v223決策理由", "報價時間"
+    ])
+    show = work[cols].head(top_n)
+    try:
+        st.dataframe(show.style.applymap(_v212_style_signal, subset=[c for c in ["v223最終訊號", "v223風險層級"] if c in show.columns]), use_container_width=True, hide_index=True)
+    except Exception:
+        st.dataframe(show, use_container_width=True, hide_index=True)
+
+
+def render_v223_focus(df: pd.DataFrame, top_n: int = 12) -> None:
+    st.subheader("🎯 核心監控股｜台積電 / 廣達 / 華通 / 系統精選")
+    if df is None or df.empty:
+        st.info("目前沒有核心監控股資料。")
+        return
+    fixed = {"2330": 1, "2382": 2, "2313": 3, "3441": 4}
+    work = df.copy()
+    work["_focus_rank"] = work.get("代號", "").astype(str).str.zfill(4).map(fixed).fillna(99)
+    picked = pd.concat([
+        work[work["_focus_rank"] < 99],
+        _safe_sort(work[work["_focus_rank"] >= 99], ["v223優先級", "v223最終分", "即時強度分"], ascending=[True, False, False]).head(max(0, top_n-4))
+    ], ignore_index=True)
+    picked = picked.drop_duplicates(subset=["代號"]).sort_values(["_focus_rank", "v223優先級", "v223最終分"], ascending=[True, True, False]).head(top_n)
+    cols = _cols_exist(picked, ["代號", "名稱", "盤中現價", "盤中漲跌幅", "v223最終訊號", "v223買賣結論", "v223風險層級", "v223技術狀態", "v223籌碼確認", "v223事件修正", "第一買點", "右側加碼價", "防守停損", "v223下一步"])
+    st.dataframe(picked[cols], use_container_width=True, hide_index=True)
+
+
 v216_context = load_v216_context()
 
 tick_default = _get_query_int("tick", 5, 3, 30, 1)
 
-st.title("🧠 盤中即時看盤 v2.20 多因子智能決策引擎｜AI即時選股 + 右側精準")
-st.caption("v2.20 修正：即時行情不再只固定廣達/華通；改成台積電、廣達、華通 + AI系統最看好清單，並整合技術、籌碼資金、時事題材、大盤夜盤與風險分層。")
+st.title("🧭 盤中即時看盤 v2.23 核心重構｜決策一致性引擎")
+st.caption("v2.23 重點：把技術、籌碼資金、事件可信度、大盤夜盤與風險否決整合成一個最終訊號，避免同一檔股票出現多個互相矛盾判斷。")
 # v2.20: realtime ticker panel is rendered after live_df is built, so stock prices can use backend MIS quotes first.
 render_v216_context(v216_context)
 st.divider()
@@ -5300,10 +6007,18 @@ live_df, intraday_memory_df = update_intraday_memory_features(live_df)
 live_df = add_v29_left_predictive_ai(live_df, chase_pct=chase_pct)
 live_df = add_v210_trader_decision(live_df, chase_pct=chase_pct)
 live_df = add_v220_multifactor_decision(live_df, v216_context)
+v221_news_context = build_v221_news_context(live_df)
+live_df = add_v221_news_event_decision(live_df, v221_news_context)
+live_df = add_v222_event_quality_decision(live_df, v221_news_context)
+live_df = add_v223_consistency_decision(live_df, v216_context)
 
-# v2.20 realtime AI-selected ticker is rendered after MIS quote merge so 廣達/華通/台積電 have backend prices first.
+# v2.23 realtime AI-selected ticker is rendered after MIS quote merge so 廣達/華通/台積電 have backend prices first.
 render_v220_realtime_ai_ticker_panel(live_df, v216_context, tick_seconds=live_tick_seconds)
-render_v220_multifactor_cockpit(live_df, top_n=top_n)
+render_v223_consistency_cockpit(live_df, v216_context, top_n=top_n)
+render_v223_focus(live_df, top_n=max(top_n, 12))
+with st.expander("🧪 事件 / 多因子原始分數", expanded=False):
+    render_v222_event_quality_cockpit(live_df, v221_news_context, top_n=top_n)
+    render_v220_multifactor_cockpit(live_df, top_n=top_n)
 st.divider()
 
 # v2.11 stable learning + v2.12 lifecycle state machine.
@@ -5329,6 +6044,7 @@ v214_weight_profile = build_v214_weight_profile(v213_signal_journal_df)
 lifecycle_df = apply_v214_auto_weights(lifecycle_df, v214_weight_profile)
 lifecycle_df = apply_v216_market_adjustment(lifecycle_df, v216_context)
 lifecycle_df = add_v219_right_entry_signal(lifecycle_df)
+lifecycle_df = add_v223_consistency_decision(lifecycle_df, v216_context)
 v213_summary = build_v213_journal_summary(v213_signal_journal_df)
 v215_current_verified_df = build_v215_postclose_verification(v213_signal_journal_df, lifecycle_df)
 v215_existing_verified_df = _v215_load_verified_journal()
@@ -5441,20 +6157,20 @@ else:
     st.warning("學習勝率不是每輪即時變動的『學習率』；要等盤後驗證樣本累積後才有意義。最高只會顯示 🟢 高信心小量，仍必須照防守停損執行。")
 
 # 1) Primary current decision table.
-st.subheader("🧭 v2.16 交易員目前決策｜含大盤/夜盤修正")
-st.caption("主表只保留會影響進場的欄位。v2.16 會依大盤環境分與夜盤風險分，將可試單訊號保守降級或維持。")
+st.subheader("🧭 v2.23 最終進場決策｜一致性主表")
+st.caption("主表只顯示最終訊號與必要價格。若要看新聞、生命週期、Google Sheet、全部明細，請打開下方進階診斷。")
 main_cols = _cols_exist(lifecycle_df, [
-    "代號", "名稱", "市場", "產業", "交易型態", "v219右側精準進場", "v219右側判斷原因", "v216調整後決策", "v216環境修正", "v216大盤環境", "v216夜盤風險", "v214信心閘門", "v212生命週期狀態", "v212目前決策", "我會不會買",
+    "代號", "名稱", "市場", "產業", "交易型態", "v223最終訊號", "v223買賣結論", "v223最終分", "v223風險層級", "v223技術狀態", "v223籌碼確認", "v223事件修正", "v223大盤修正", "v223下一步", "v219右側精準進場", "v219右側判斷原因", "v216調整後決策", "v216環境修正", "v216大盤環境", "v216夜盤風險", "v214信心閘門", "v212生命週期狀態", "v212目前決策", "我會不會買",
     "第一買點", "盤中現價", "v214停損距離%", "v212位置判斷", "防守停損", "右側加碼價", "追價上限",
     "盤中漲跌幅", "刷新漲速%", "v214調權後分", "左側低吸分", "盤中資金分", "v29漲停前兆分", "v210決策分",
     "v214下一步", "v212下一步", "還缺什麼確認", "不能買原因", "資料來源", "AI來源", "報價時間"
 ])
-main_df = _safe_sort(filtered, ["v212優先級", "v212排序分", "即時強度分"], ascending=[True, False, False]).head(top_n)
+main_df = _safe_sort(filtered, ["v223優先級", "v223最終分", "v212優先級", "即時強度分"], ascending=[True, False, True, False]).head(top_n)
 if main_df.empty:
     st.info("目前沒有符合篩選條件的股票。可以降低左側篩選的 AI / 即時強度門檻，或等待下一輪刷新。")
 else:
     try:
-        st.dataframe(main_df[main_cols].style.applymap(_v212_style_signal, subset=["v219右側精準進場", "v216調整後決策", "v214信心閘門", "v212生命週期狀態"]), use_container_width=True, hide_index=True)
+        st.dataframe(main_df[main_cols].style.applymap(_v212_style_signal, subset=[c for c in ["v223最終訊號", "v223風險層級", "v219右側精準進場", "v216調整後決策", "v214信心閘門", "v212生命週期狀態"] if c in main_df.columns]), use_container_width=True, hide_index=True)
     except Exception:
         st.dataframe(main_df[main_cols], use_container_width=True, hide_index=True)
 
@@ -5541,4 +6257,4 @@ with st.expander("🧪 進階診斷 / 市場池 / 爆衝雷達 / 原始學習紀
         ])
         st.dataframe(lifecycle_df[all_cols], use_container_width=True, hide_index=True)
 
-st.caption("提醒：v2.19 的前端警示是即時事件層；這仍是盤中快照與規則化風控系統，不是保證獲利或券商逐筆資料。v2.15 的目的，是把訊號結果保存並驗證，讓後續調權有根據；最高信號仍只代表「小量試單 + 嚴格停損」，不是無腦重倉。")
+st.caption("提醒：v2.23 的最終訊號是決策一致性層；v2.19 的前端警示是即時事件層；這仍是盤中快照與規則化風控系統，不是保證獲利或券商逐筆資料。v2.15 的目的，是把訊號結果保存並驗證，讓後續調權有根據；最高信號仍只代表「小量試單 + 嚴格停損」，不是無腦重倉。")
