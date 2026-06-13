@@ -129,6 +129,29 @@ def _to__clean_number(value: Any, default: float = 0.0) -> float:
     return _clean_number(value, default)
 
 
+def _is_nan(value: Any) -> bool:
+    """Return True when a value should be treated as missing/invalid.
+
+    v2.19.1 referenced _is_nan() inside the right-entry signal block, but the
+    helper was not defined. Keep this small compatibility helper so all v2.19
+    right-side checks can safely handle np.nan, None, empty strings, and text.
+    """
+    try:
+        if value is None:
+            return True
+        if isinstance(value, float):
+            return math.isnan(value)
+        if isinstance(value, (np.floating,)):
+            return bool(np.isnan(value))
+        text = str(value).strip()
+        if text in {"", "-", "--", "nan", "NaN", "None", "null"}:
+            return True
+        num = _to_float(value, default=np.nan)
+        return isinstance(num, float) and math.isnan(num)
+    except Exception:
+        return True
+
+
 def _normalize_code(value: Any) -> str:
     return "".join(ch for ch in str(value).strip() if ch.isdigit()).zfill(4)
 
@@ -4843,8 +4866,8 @@ v216_context = load_v216_context()
 
 tick_default = _get_query_int("tick", 5, 3, 30, 1)
 
-st.title("🚨 盤中即時看盤 v2.19.1 即時警示事件引擎｜右側精準進場穩定版")
-st.caption("v2.19 新增：價格跳動後直接觸發到價、突破、右側站穩、跌破防守與爆衝警示；AI 決策區維持慢速重算。")
+st.title("🚨 盤中即時看盤 v2.19.2 即時警示事件引擎｜右側進場防呆版")
+st.caption("v2.19.2 修正：補上右側進場判斷缺少的 _is_nan 防呆，價格缺值或文字不會再讓整頁當機。")
 render_v218_realtime_ticker_panel(v216_context, tick_seconds=tick_default)
 render_v216_context(v216_context)
 st.divider()
