@@ -4314,12 +4314,12 @@ def render_v216_context(ctx: Dict[str, Any]) -> None:
     st.markdown("#### 核心價格")
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("加權指數", _v216_metric_price(twii, "加權指數"), _v216_metric_pct(twii, "加權指數"))
-    k2.metric("台指期近一", _v216_metric_price(txf, "台指期近一"), _v216_metric_pct(txf, "台指期近一"))
+    k2.metric("台指期近月", _v216_metric_price(txf, "台指期近月"), _v216_metric_pct(txf, "台指期近月"))
     k3.metric("櫃買指數", _v216_metric_price(twoii, "櫃買指數"), _v216_metric_pct(twoii, "櫃買指數"))
     k4.metric("NASDAQ 期貨", _v216_metric_price(nq, "NASDAQ 期貨"), _v216_metric_pct(nq, "NASDAQ 期貨"))
 
-    if not _v216_valid_market_price(txf, "台指期近一"):
-        st.warning("台指期近一目前沒有取得有效即時價，系統不會再用 0.00 當成台指價。大盤環境暫以加權、櫃買、NASDAQ/S&P 期貨、費半與市場廣度輔助判斷。")
+    if not _v216_valid_market_price(txf, "台指期近月"):
+        st.warning("台指期近月目前沒有取得有效即時價，系統不會再用 0.00 當成台指價。大盤環境暫以加權、櫃買、NASDAQ/S&P 期貨、費半與市場廣度輔助判斷。")
 
     # 3) Secondary macro line, compact.
     m1, m2, m3, m4 = st.columns(4)
@@ -4348,8 +4348,8 @@ def render_v216_context(ctx: Dict[str, Any]) -> None:
     # 5) Everything else collapses. This fixes the clutter.
     detail_rows = [
         _v216_asset_row(twii, "加權指數"),
-        _v216_asset_row(txf, "台指期近一"),
-        _v216_asset_row(mtx, "小台近一"),
+        _v216_asset_row(txf, "台指期近月"),
+        _v216_asset_row(mtx, "小台近月"),
         _v216_asset_row(twoii, "櫃買指數"),
         _v216_asset_row(nq, "NASDAQ 100 期貨"),
         _v216_asset_row(es, "S&P 500 期貨"),
@@ -4360,13 +4360,13 @@ def render_v216_context(ctx: Dict[str, Any]) -> None:
     ]
     with st.expander("完整大盤 / 夜盤價格明細", expanded=False):
         st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
-        st.caption("台指期若顯示『未取得有效價』，代表資料源暫時沒有回傳可用近月期貨價格；系統不會用 0 或錯誤值參與決策。")
+        st.caption("台指期若顯示『未取得有效價』，代表 FinMind / 備援來源暫時沒有回傳可用近月期貨價格；系統不會用 0 或錯誤值參與決策。")
 
 
 v216_context = load_v216_context()
 
-st.title("🌐 盤中即時看盤 v2.16.4 市場環境中控台｜台指防呆 + 版面精簡")
-st.caption("v2.16.4 修正：台指期若抓不到有效即時價，不再顯示 0.00；大盤/夜盤區改成中控台 + 明細摺疊，避免畫面越來越亂。")
+st.title("🌐 盤中即時看盤 v2.16.5 市場環境中控台｜台指近月版")
+st.caption("v2.16.5 修正：台指改抓「台指期近月」，優先使用 FinMind 台股期貨即時資訊；若抓不到不再顯示 0.00。")
 render_v216_context(v216_context)
 st.divider()
 
