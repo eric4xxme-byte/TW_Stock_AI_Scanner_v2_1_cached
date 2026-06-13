@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-TW Stock AI Scanner v2.16.5｜Market / night-session context builder
+TW Stock AI Scanner v2.16.7｜Market / night-session context builder
 
 Purpose:
 - Run from GitHub Actions without opening Streamlit.
@@ -37,6 +37,7 @@ HISTORY_FILE = DATA_DIR / "v216_market_context_history.csv"
 INTRADAY_SNAPSHOT_FILE = DATA_DIR / "intraday_snapshot.csv"
 JOURNAL_FILE = DATA_DIR / "v215_verified_signal_journal.csv"
 META_FILE = DATA_DIR / "v215_background_sync_meta.json"
+TAIFEX_CACHE_FILE = DATA_DIR / "v216_taifex_last_valid.json"
 
 TAIPEI = timezone(timedelta(hours=8))
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36"
@@ -102,6 +103,46 @@ def invalidate_taifex_quote(obj: Dict[str, Any], reason: str) -> Dict[str, Any]:
         "error": reason,
     })
     return obj
+
+
+def _read_taifex_cache() -> Dict[str, Any]:
+    try:
+        if TAIFEX_CACHE_FILE.exists():
+            data = json.loads(TAIFEX_CACHE_FILE.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+def _write_taifex_cache(result: Dict[str, Any]) -> None:
+    """Persist the latest valid TXF/MTX quotes so weekend/off-hours UI can
+    display the last real near-month quote instead of a misleading blank/0.
+    """
+    try:
+        cache = _read_taifex_cache()
+        for key in ["TXF", "MTX"]:
+            q = (result or {}).get(key, {}) or {}
+            if q.get("ok") and valid_taifex_price(q.get("price")) and not q.get("cached"):
+                qq = dict(q)
+                qq["cached_at"] = now_tw().strftime("%Y-%m-%d %H:%M:%S")
+                cache[key] = qq
+        if cache:
+            TAIFEX_CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+def _cached_taifex_quote(key: str, fallback_label: str, reason: str) -> Dict[str, Any]:
+    cache = _read_taifex_cache()
+    q = dict((cache.get(key) or {}))
+    if q.get("ok") and valid_taifex_price(q.get("price")):
+        q["label"] = q.get("label") or fallback_label
+        q["cached"] = True
+        q["ok"] = True
+        q["source"] = "Cached last valid near-month futures quote"
+        q["cache_reason"] = reason
+        q["updated_at"] = q.get("updated_at") or q.get("cached_at")
+        return q
+    return invalidate_taifex_quote({"symbol": key, "label": fallback_label}, reason)
 
 def read_csv_safe(path: Path) -> pd.DataFrame:
     if not path.exists():
@@ -272,6 +313,102 @@ def fetch_finmind_near_month_futures(data_id: str, label: str) -> Dict[str, Any]
         }
 
 
+
+def fetch_finmind_futures_daily_close(data_id: str, label: str, days: int = 45) -> Dict[str, Any]:
+    """Fetch the latest TXF/MTX near-month daily close / settlement as a holiday fallback.
+
+    On weekends or after the real-time futures endpoint is unavailable, TXF still
+    has a last official close / settlement from the most recent trading day.
+    This function uses FinMind TaiwanFuturesDaily and returns that value instead
+    of leaving the dashboard blank or using a fake 0.00.
+    """
+    token = os.environ.get("FINMIND_TOKEN", "").strip()
+    end_dt = now_tw().date()
+    start_dt = end_dt - timedelta(days=days)
+    url = "https://api.finmindtrade.com/api/v4/data"
+    params = {
+        "dataset": "TaiwanFuturesDaily",
+        "data_id": data_id,
+        "start_date": start_dt.isoformat(),
+        "end_date": end_dt.isoformat(),
+    }
+    headers = {"User-Agent": UA}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=15)
+        payload = r.json() if r.text else {}
+        if not r.ok:
+            return {"ok": False, "symbol": data_id, "label": label, "source": "FinMind TaiwanFuturesDaily last close", "error": f"HTTP {r.status_code}: {str(payload)[:180]}"}
+        rows = payload.get("data") or []
+        if isinstance(rows, dict):
+            rows = [rows]
+        if not isinstance(rows, list) or not rows:
+            return {"ok": False, "symbol": data_id, "label": label, "source": "FinMind TaiwanFuturesDaily last close", "error": "empty daily rows"}
+
+        candidates = []
+        for rr in rows:
+            if not isinstance(rr, dict):
+                continue
+            fid = str(rr.get("futures_id") or rr.get("symbol") or rr.get("data_id") or data_id).upper().strip()
+            if fid and not fid.startswith(data_id.upper()):
+                continue
+            # Prefer regular day-session rows when the field exists, but do not
+            # discard unknown sessions because FinMind column names vary.
+            session_txt = str(rr.get("trading_session") or rr.get("session") or rr.get("交易時段") or "").strip()
+            price = None
+            for col in ["settlement_price", "settlement", "close", "收盤價", "結算價"]:
+                price = safe_float(rr.get(col), None)
+                if valid_taifex_price(price):
+                    break
+            if not valid_taifex_price(price):
+                continue
+            vol = safe_float(rr.get("volume") or rr.get("total_volume") or rr.get("交易口數"), 0) or 0
+            date_txt = str(rr.get("date") or rr.get("Date") or "")
+            contract = str(rr.get("contract_date") or rr.get("delivery_month") or rr.get("交割月份") or "")
+            score = 0
+            # Near-month continuous/front-month rows are preferred when present.
+            if fid == f"{data_id.upper()}R1" or fid.endswith("R1"):
+                score += 1_000_000_000
+            # A regular day session close is better for holiday reference than a
+            # night-session transient value.
+            if any(k in session_txt for k in ["一般", "日盤", "regular", "day"]):
+                score += 50_000_000
+            score += int(vol)
+            candidates.append((date_txt, score, contract, rr, float(price)))
+        if not candidates:
+            return {"ok": False, "symbol": data_id, "label": label, "source": "FinMind TaiwanFuturesDaily last close", "error": "no valid daily close / settlement quote"}
+        candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        date_txt, score, contract, row, price = candidates[0]
+
+        # Previous valid close for percentage reference.
+        prev = None
+        for d2, score2, contract2, row2, price2 in candidates[1:]:
+            if d2 < date_txt:
+                prev = price2
+                break
+        change = (price - prev) if prev else None
+        pct = (change / prev * 100) if prev not in (None, 0) else None
+        return {
+            "ok": True,
+            "symbol": str(row.get("futures_id") or data_id),
+            "label": label,
+            "price": price,
+            "previous_close": prev,
+            "change": change,
+            "change_pct": pct,
+            "date": date_txt,
+            "contract_date": contract,
+            "price_type": "last_close",
+            "cached": False,
+            "source": "FinMind TaiwanFuturesDaily last close / settlement",
+            "updated_at": now_tw().strftime("%Y-%m-%d %H:%M:%S"),
+            "note": "休市/週末/即時源失敗時使用最近交易日收盤或結算價",
+        }
+    except Exception as exc:
+        return {"ok": False, "symbol": data_id, "label": label, "source": "FinMind TaiwanFuturesDaily last close", "error": str(exc)}
+
+
 def fetch_tw_yahoo_futures() -> Dict[str, Any]:
     """Fetch Taiwan index futures near-month quote.
 
@@ -363,8 +500,32 @@ def fetch_tw_yahoo_futures() -> Dict[str, Any]:
         if not result["TXF"].get("ok"):
             result["TXF"].update({"ok": False, "error": str(exc)})
 
+    # 3) Official last close / settlement fallback.
+    # On weekends and holidays TXF has no live trade, but it still has the most
+    # recent official close / settlement. Use that before falling back to local cache.
     if not result["TXF"].get("ok"):
-        result["TXF"] = invalidate_taifex_quote(result.get("TXF", {}), result.get("TXF", {}).get("finmind_error") or "no valid TXF near-month quote")
+        txf_close = fetch_finmind_futures_daily_close("TXF", "台指期近月")
+        if txf_close.get("ok"):
+            result["TXF"] = txf_close
+        else:
+            result["TXF"].update({"daily_close_error": txf_close.get("error")})
+    if not result["MTX"].get("ok"):
+        mtx_close = fetch_finmind_futures_daily_close("MTX", "小台近月")
+        if mtx_close.get("ok"):
+            result["MTX"] = mtx_close
+        else:
+            result["MTX"].update({"daily_close_error": mtx_close.get("error")})
+
+    # 4) Last local cache fallback if even official daily close is unavailable.
+    # This is marked as cached so the UI can distinguish it from live / official close.
+    if not result["TXF"].get("ok"):
+        reason = result.get("TXF", {}).get("daily_close_error") or result.get("TXF", {}).get("finmind_error") or result.get("TXF", {}).get("error") or "no valid TXF near-month quote"
+        result["TXF"] = _cached_taifex_quote("TXF", "台指期近月", reason)
+    if not result["MTX"].get("ok"):
+        reason = result.get("MTX", {}).get("daily_close_error") or result.get("MTX", {}).get("finmind_error") or result.get("MTX", {}).get("error") or "no valid MTX near-month quote"
+        result["MTX"] = _cached_taifex_quote("MTX", "小台近月", reason)
+
+    _write_taifex_cache(result)
     return result
 
 def market_breadth_from_files() -> Dict[str, Any]:
