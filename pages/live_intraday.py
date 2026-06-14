@@ -81,6 +81,113 @@ FOCUS_CODES = ["3441", "2382", "2313"]
 FOCUS_LABELS = {"3441": "聯一光", "2382": "廣達", "2313": "華通"}
 
 
+# v2.23.4 stock name normalizer.
+# Some quote sources return stock code as the name (for example 2303 -> "2303"),
+# and the old merge logic overwrote good AI/market-pool names with that numeric value.
+# Keep a wider local fallback map and never display duplicated labels like "2303 2303".
+EXTRA_STOCK_INFO = {
+    "0050": ("元大台灣50", "ETF", "上市"),
+    "0056": ("元大高股息", "ETF", "上市"),
+    "1101": ("台泥", "水泥", "上市"),
+    "1303": ("南亞", "塑膠", "上市"),
+    "1714": ("和桐", "化工", "上市"),
+    "2301": ("光寶科", "電子工業", "上市"),
+    "2303": ("聯電", "半導體業", "上市"),
+    "2308": ("台達電", "電子工業", "上市"),
+    "2317": ("鴻海", "電子工業", "上市"),
+    "2327": ("國巨*", "電子零組件業", "上市"),
+    "2337": ("旺宏", "半導體業", "上市"),
+    "2344": ("華邦電", "半導體業", "上市"),
+    "2353": ("宏碁", "電腦及週邊", "上市"),
+    "2356": ("英業達", "電腦及週邊", "上市"),
+    "2357": ("華碩", "電腦及週邊", "上市"),
+    "2376": ("技嘉", "電腦及週邊", "上市"),
+    "2382": ("廣達", "電腦及週邊", "上市"),
+    "2408": ("南亞科", "半導體業", "上市"),
+    "2409": ("友達", "光電業", "上市"),
+    "2454": ("聯發科", "半導體業", "上市"),
+    "2481": ("強茂", "半導體業", "上市"),
+    "2603": ("長榮", "航運業", "上市"),
+    "2609": ("陽明", "航運業", "上市"),
+    "2885": ("元大金", "金融保險", "上市"),
+    "3006": ("晶豪科", "半導體業", "上市"),
+    "3037": ("欣興", "電子零組件業", "上市"),
+    "3105": ("穩懋", "半導體業", "上櫃"),
+    "3231": ("緯創", "電腦及週邊", "上市"),
+    "3481": ("群創", "光電業", "上市"),
+    "3711": ("日月光投控", "半導體業", "上市"),
+    "4958": ("臻鼎-KY", "電子零組件業", "上市"),
+    "5347": ("世界", "半導體業", "上櫃"),
+    "6239": ("力成", "半導體業", "上市"),
+    "6282": ("康舒", "電子零組件業", "上市"),
+    "6770": ("力積電", "半導體業", "上市"),
+    "8112": ("至上", "電子通路", "上市"),
+    "8299": ("群聯", "半導體業", "上櫃"),
+}
+LOCAL_STOCK_INFO.update(EXTRA_STOCK_INFO)
+
+
+def _is_bad_stock_name(name: Any, code: Any = "") -> bool:
+    try:
+        code = _normalize_code(code)
+    except Exception:
+        code = str(code or "").strip().zfill(4)
+    text = str(name or "").strip()
+    if not text or text.lower() in {"nan", "none", "null", "-", "--", "unknown", "未知"}:
+        return True
+    # Numeric names are almost always bad display names from quote APIs.
+    text_digits = re.sub(r"\D", "", text)
+    if code and (text == code or text_digits == code):
+        return True
+    if re.fullmatch(r"\d+(?:\.0+)?", text):
+        return True
+    return False
+
+
+def _stock_display_name(code: Any, current: Any = None) -> str:
+    code = _normalize_code(code)
+    if not _is_bad_stock_name(current, code):
+        return str(current).strip()
+    return LOCAL_STOCK_INFO.get(code, (code, "", ""))[0]
+
+
+def _stock_display_market(code: Any, current: Any = None) -> str:
+    code = _normalize_code(code)
+    text = str(current or "").strip()
+    if text and text.lower() not in {"nan", "none", "null", "-", "--", "unknown", "未知"}:
+        return text
+    return LOCAL_STOCK_INFO.get(code, ("", "", "未知"))[2]
+
+
+def _stock_display_industry(code: Any, current: Any = None) -> str:
+    code = _normalize_code(code)
+    text = str(current or "").strip()
+    if text and text.lower() not in {"nan", "none", "null", "-", "--", "unknown", "未知"}:
+        return text
+    return LOCAL_STOCK_INFO.get(code, ("", "未知", ""))[1]
+
+
+def normalize_stock_identity(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize 代號/名稱/市場/產業 so all tables and ticker cards display names.
+
+    This prevents two visible bugs:
+    1) realtime cards like "2303 2303" when a quote source returns the code as the name;
+    2) decision tables with blank / numeric names after MIS quote merge.
+    """
+    if not isinstance(df, pd.DataFrame) or df.empty or "代號" not in df.columns:
+        return df
+    out = df.copy()
+    out["代號"] = out["代號"].astype(str).str.replace(".0", "", regex=False).str.zfill(4)
+    if "名稱" not in out.columns:
+        out["名稱"] = out["代號"]
+    out["名稱"] = [_stock_display_name(c, n) for c, n in zip(out["代號"], out["名稱"])]
+    if "市場" in out.columns:
+        out["市場"] = [_stock_display_market(c, m) for c, m in zip(out["代號"], out["市場"])]
+    if "產業" in out.columns:
+        out["產業"] = [_stock_display_industry(c, ind) for c, ind in zip(out["代號"], out["產業"])]
+    return out
+
+
 def _to_float(value, default=np.nan):
     try:
         if value is None:
@@ -250,7 +357,7 @@ def _parse_market_rows(data: Any, market: str) -> List[Dict[str, Any]]:
         rows.append(
             {
                 "代號": code,
-                "名稱": str(name).strip() if name else code,
+                "名稱": _stock_display_name(code, name),
                 "產業": "未知",
                 "市場": market,
                 "成交金額": money_num,
@@ -302,7 +409,7 @@ def load_rank() -> pd.DataFrame:
     if "手動加入" not in df.columns:
         df["手動加入"] = False
     df["AI來源"] = "盤後AI"
-    return df
+    return normalize_stock_identity(df)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -364,6 +471,7 @@ def fetch_market_pool(pool_size: int) -> Tuple[pd.DataFrame, str]:
     else:
         pool["市場池基礎分"] = 50.0
 
+    pool = normalize_stock_identity(pool)
     return pool, "；".join(sources)
 
 
@@ -399,12 +507,14 @@ def build_live_universe(rank_df: pd.DataFrame, mode: str, pool_size: int, manual
         ]
         universe = universe[[c for c in keep if c in universe.columns]].copy()
         universe = append_manual_codes(universe, manual_codes, manual_ai_score, manual_risk_score)
+        universe = normalize_stock_identity(universe)
         return universe, f"盤中市場池掃描｜{source}"
 
     universe = rank_df.copy()
     universe["資料來源"] = universe.get("資料來源", "盤後AI候選")
     universe["AI來源"] = "盤後AI"
     universe = append_manual_codes(universe, manual_codes, manual_ai_score, manual_risk_score)
+    universe = normalize_stock_identity(universe)
     return universe, "盤後AI候選 + 手動監控"
 
 
@@ -4595,20 +4705,20 @@ def _v220_build_ticker_payload(live_df: pd.DataFrame, ctx: Dict[str, Any], max_s
         for code in selected:
             rowdf = df[df["代號"] == code]
             if rowdf.empty:
-                nm = LOCAL_STOCK_INFO.get(code, (code, "", "上市"))[0]
-                mkt = LOCAL_STOCK_INFO.get(code, (code, "", "上市"))[2]
+                nm = _stock_display_name(code, None)
+                mkt = _stock_display_market(code, None)
                 price = pct = None
             else:
                 row = rowdf.iloc[0]
-                nm = str(row.get("名稱") or LOCAL_STOCK_INFO.get(code, (code, "", "上市"))[0])
-                mkt = str(row.get("市場") or LOCAL_STOCK_INFO.get(code, (code, "", "上市"))[2])
+                nm = _stock_display_name(code, row.get("名稱"))
+                mkt = _stock_display_market(code, row.get("市場"))
                 price = _clean_number(row.get("盤中現價"), np.nan)
                 pct = _clean_number(row.get("盤中漲跌幅"), np.nan)
                 if _is_nan(price): price = None
                 if _is_nan(pct): pct = None
             market_key = "otc" if ("櫃" in str(mkt)) else "tse"
             items[code] = {
-                "label": f"{nm} {code}",
+                "label": f"{nm} {code}" if str(nm) != str(code) else code,
                 "price": price,
                 "pct": pct,
                 "source": "MIS backend + 前端MIS",
@@ -4628,7 +4738,7 @@ def render_v220_realtime_ai_ticker_panel(live_df: pd.DataFrame, ctx: Dict[str, A
     payload = json.dumps(_v220_build_ticker_payload(live_df, ctx), ensure_ascii=False)
     html = f"""
 <div id=\"rt-root\" class=\"rt-root\">
-  <div class=\"rt-head\"><div><div class=\"rt-title\">⚡ v2.23.3 AI 即時行情跳動面板</div><div class=\"rt-sub\">台積電/廣達/華通 + AI 最看好清單；只跳數字，不重整整頁。</div></div><div class=\"rt-status\"><span id=\"rt-dot\" class=\"dot wait\"></span><span id=\"rt-status-text\">初始化</span></div></div>
+  <div class=\"rt-head\"><div><div class=\"rt-title\">⚡ v2.23.4 AI 即時行情跳動面板</div><div class=\"rt-sub\">台積電/廣達/華通 + AI 最看好清單；只跳數字，不重整整頁。</div></div><div class=\"rt-status\"><span id=\"rt-dot\" class=\"dot wait\"></span><span id=\"rt-status-text\">初始化</span></div></div>
   <div id=\"rt-grid\" class=\"rt-grid\"></div>
 </div>
 <style>
@@ -6019,7 +6129,7 @@ def save_v231_limitup_feature_samples(df: pd.DataFrame, max_rows: int = 5000) ->
 
 
 def render_v231_data_quality_and_limitup_collector(df: pd.DataFrame, ctx: Dict[str, Any], sample_rows: Optional[pd.DataFrame] = None) -> None:
-    st.subheader("🧪 v2.23.3 手機版即時盤修正 + 漲停前兆欄位蒐集")
+    st.subheader("🧪 v2.23.4 手機版即時盤修正 + 漲停前兆欄位蒐集")
     st.caption("這一版先收集 v2.24 需要的真實樣本；這裡不是正式買賣訊號，不會取代 v2.23 最終決策。")
     if df is None or df.empty:
         st.info("目前沒有資料可以檢查。")
@@ -6066,7 +6176,7 @@ v216_context = load_v216_context()
 
 tick_default = _get_query_int("tick", 5, 3, 30, 1)
 
-st.title("📱 盤中即時看盤 v2.23.3 手機版即時盤修正｜資料品質 + 漲停前兆蒐集")
+st.title("📱 盤中即時看盤 v2.23.4 股票名稱修正｜資料品質 + 漲停前兆蒐集")
 st.caption("v2.23.1 重點：保留 v2.23 最終進場決策，並開始蒐集漲停前 5～15 分鐘預警模型需要的真實欄位與資料品質指標。")
 # v2.20: realtime ticker panel is rendered after live_df is built, so stock prices can use backend MIS quotes first.
 render_v216_context(v216_context)
@@ -6229,9 +6339,14 @@ if quotes_df.empty:
 else:
     merged = merged.merge(quotes_df, on="代號", how="left")
     if "即時名稱" in merged.columns:
-        merged["名稱"] = merged["即時名稱"].fillna(merged["名稱"])
+        # Do not let MIS numeric/blank names overwrite valid market-pool or AI names.
+        merged["名稱"] = [
+            _stock_display_name(c, qn if not _is_bad_stock_name(qn, c) else old_name)
+            for c, qn, old_name in zip(merged["代號"], merged["即時名稱"], merged["名稱"])
+        ]
     if "報價市場" in merged.columns:
         merged["市場"] = merged["報價市場"].fillna(merged["市場"])
+    merged = normalize_stock_identity(merged)
     if quote_source_note != "MIS即時報價":
         st.info(f"本輪 MIS 即時報價沒有成功，已{quote_source_note}，避免決策表歸零；等下一輪即時報價恢復會自動更新。")
 
@@ -6289,6 +6404,7 @@ lifecycle_df = apply_v214_auto_weights(lifecycle_df, v214_weight_profile)
 lifecycle_df = apply_v216_market_adjustment(lifecycle_df, v216_context)
 lifecycle_df = add_v219_right_entry_signal(lifecycle_df)
 lifecycle_df = add_v223_consistency_decision(lifecycle_df, v216_context)
+lifecycle_df = normalize_stock_identity(lifecycle_df)
 lifecycle_df = add_v231_limitup_collection_features(lifecycle_df, v216_context)
 v213_summary = build_v213_journal_summary(v213_signal_journal_df)
 v215_current_verified_df = build_v215_postclose_verification(v213_signal_journal_df, lifecycle_df)
@@ -6410,6 +6526,7 @@ main_cols = _cols_exist(lifecycle_df, [
     "盤中漲跌幅", "刷新漲速%", "v214調權後分", "左側低吸分", "盤中資金分", "v29漲停前兆分", "v210決策分",
     "v214下一步", "v212下一步", "還缺什麼確認", "不能買原因", "資料來源", "AI來源", "報價時間"
 ])
+filtered = normalize_stock_identity(filtered)
 main_df = _safe_sort(filtered, ["v223優先級", "v223最終分", "v212優先級", "即時強度分"], ascending=[True, False, True, False]).head(top_n)
 if main_df.empty:
     st.info("目前沒有符合篩選條件的股票。可以降低左側篩選的 AI / 即時強度門檻，或等待下一輪刷新。")
