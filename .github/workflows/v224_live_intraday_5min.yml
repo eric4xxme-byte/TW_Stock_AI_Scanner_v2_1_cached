@@ -1,4 +1,4 @@
-name: v2.24 Live Intraday Auto Sync 5min
+name: v2.24.5 Live Intraday Auto Sync 5min + Google Sheet
 
 on:
   workflow_dispatch:
@@ -11,9 +11,13 @@ on:
         description: "Extra focus stock codes, comma separated"
         required: false
         default: "3441,2382,2313,6770,2409,3042,6257"
+      sheet_sync_rows:
+        description: "Max rows to sync to Google Sheet per run"
+        required: false
+        default: "120"
   schedule:
     # GitHub cron uses UTC. Taiwan = UTC+8.
-    # Avoid minute 00 because GitHub documents high load at start of hour can delay/drop scheduled jobs.
+    # Avoid minute 00 because GitHub can delay/drop scheduled jobs at high-load times.
     # TW 08:52, 08:57 pre-open warmup
     - cron: "52,57 0 * * 1-5"
     # TW 09:03-12:58 every 5 minutes
@@ -31,6 +35,7 @@ env:
   TZ: Asia/Taipei
   LIVE_LIMIT_DEFAULT: "80"
   LIVE_FOCUS_CODES_DEFAULT: "3441,2382,2313,6770,2409,3042,6257"
+  SHEET_SYNC_ROWS_DEFAULT: "120"
 
 concurrency:
   group: v224-live-intraday-main
@@ -39,7 +44,7 @@ concurrency:
 jobs:
   live-intraday:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
 
     steps:
       - name: Checkout repository
@@ -70,6 +75,22 @@ jobs:
         run: |
           python tw_live_engine.py --limit "${LIVE_LIMIT}" --focus-codes "${LIVE_FOCUS_CODES}"
 
+      - name: Sync Google Sheet learning journal
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          GSHEET_WEBHOOK_URL: ${{ secrets.GSHEET_WEBHOOK_URL }}
+          FORCE_RUN: "1"
+          BACKGROUND_POOL_LIMIT: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.limit || env.LIVE_LIMIT_DEFAULT }}
+          BACKGROUND_SYNC_LIMIT: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.sheet_sync_rows || env.SHEET_SYNC_ROWS_DEFAULT }}
+          BACKGROUND_BATCH_SIZE: "20"
+        run: |
+          if [ -f background_learning_sync.py ]; then
+            echo "Running background_learning_sync.py to update v215 journal + Google Sheet..."
+            timeout 170s python background_learning_sync.py || echo "Google Sheet sync failed/timeout; keep live CSV output and continue."
+          else
+            echo "background_learning_sync.py not found; skip Google Sheet sync."
+          fi
+
       - name: Validate generated files
         run: |
           test -f data/live_intraday.csv
@@ -86,16 +107,20 @@ jobs:
           assert '代號' in df.columns, 'missing 代號 column'
           assert '盤中現價' in df.columns, 'missing 盤中現價 column'
           PY
+          if [ -f data/v215_background_sync_meta.json ]; then
+            echo "=== Google Sheet sync meta ==="
+            cat data/v215_background_sync_meta.json || true
+          fi
 
-      - name: Commit live data
+      - name: Commit live data and learning journal
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/live_intraday.csv data/live_intraday_meta.json data/intraday_snapshot.csv data/intraday_meta.json
+          git add -A data
           if git diff --cached --quiet; then
-            echo "No live data changes to commit."
+            echo "No live data or learning journal changes to commit."
             exit 0
           fi
-          git commit -m "chore: v2.24 live intraday auto sync"
+          git commit -m "chore: v2.24.5 live intraday and sheet sync"
           git pull --rebase --autostash origin main || true
           git push origin HEAD:main
