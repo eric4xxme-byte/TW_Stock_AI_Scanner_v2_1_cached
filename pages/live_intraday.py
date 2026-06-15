@@ -5748,10 +5748,19 @@ def add_v223_consistency_decision(df: pd.DataFrame, ctx: Dict[str, Any]) -> pd.D
         reflected = _safe_text(row.get("v222消息反映狀態"), "")
         event_risk_layer = _safe_text(row.get("v222風險層級"), "")
         lifecycle = _safe_text(row.get("v212生命週期狀態"), "")
+        first_buy_text = row.get("第一買點", row.get("左側試單價", row.get("左側試單區", row.get("左側低吸區", ""))))
+        first_lo, first_hi = _v219_zone_numbers(first_buy_text)
+        first_zone_valid = bool((not _is_nan(first_lo)) and (not _is_nan(first_hi)) and first_lo > 0 and first_hi > 0)
+        first_zone_hit = bool(first_zone_valid and (not _is_nan(px)) and px > 0 and first_lo <= px <= first_hi)
+        first_zone_near = bool(first_zone_valid and (not _is_nan(px)) and px > 0 and first_lo * 0.995 <= px <= first_hi * 1.008)
 
-        # layer labels
+        # layer labels. v2.24.1: 到第一買點必須先被標成可判斷狀態，不能還顯示普通觀察。
         if _is_nan(px) or px <= 0:
             tech_state = "⚪ 等報價"
+        elif first_zone_hit:
+            tech_state = "✅ 第一買點到價"
+        elif first_zone_near:
+            tech_state = "🟢 接近第一買點"
         elif "右側確認" in right_sig or "可小量" in right_sig:
             tech_state = "✅ 右側確認"
         elif "觸發" in right_sig:
@@ -5836,7 +5845,26 @@ def add_v223_consistency_decision(df: pd.DataFrame, ctx: Dict[str, Any]) -> pd.D
             priority = 70
             step = "等回測、等風險下降，不做右側追價。"
             reason_bits.append("高風險/消息已反映")
-        elif score >= 76 and risk_level in ["低", "中"] and ("右側確認" in tech_state or "左側到價" in tech_state) and capital >= 58 and market_score >= 50:
+        elif first_zone_hit and risk_level in ["低", "中"] and market_score >= 48 and risk_raw < 65 and pct < 7.8:
+            if capital >= 45 or tech >= 55 or score >= 52:
+                final = "✅ 到第一買點 / 可小量"
+                conclusion = "可極小量試單"
+                priority = 0
+                step = f"現價已在第一買點 {_fmt_price(first_lo)}～{_fmt_price(first_hi)}；只小量，停損看 {_fmt_price(stop) if not _is_nan(stop) and stop > 0 else '防守價'}，1~2 輪不轉強就撤。"
+                reason_bits.append("v2.24.1：現價進入第一買點，不能再只顯示觀察")
+            else:
+                final = "🟢 到第一買點，等量能確認"
+                conclusion = "可盯試單"
+                priority = 1
+                step = f"現價已到第一買點 {_fmt_price(first_lo)}～{_fmt_price(first_hi)}，但資金/技術不足；等下一輪不破且量能改善。"
+                reason_bits.append("v2.24.1：到價但確認不足")
+        elif first_zone_near and risk_level in ["低", "中"] and market_score >= 48 and risk_raw < 65:
+            final = "🟢 接近第一買點"
+            conclusion = "盯到價，不追中間價"
+            priority = 2
+            step = f"接近第一買點 {_fmt_price(first_lo)}～{_fmt_price(first_hi)}；等真正進區間或放量站穩再小量。"
+            reason_bits.append("v2.24.1：接近第一買點")
+        elif score >= 76 and risk_level in ["低", "中"] and ("右側確認" in tech_state or "左側到價" in tech_state or "第一買點到價" in tech_state) and capital >= 58 and market_score >= 50:
             final = "✅ 可小量進場"
             conclusion = "可小量，不重倉"
             priority = 1
@@ -6120,19 +6148,19 @@ def add_v224_attack_priority_decision(df: pd.DataFrame, ctx: Dict[str, Any], cha
                 out.at[idx, "v223買賣結論"] = "已過最佳新進點"
                 out.at[idx, "v223下一步"] = "不新追；已有部位看是否鎖住，沒部位只看回測/開板後結構。"
                 out.at[idx, "v223優先級"] = 0
-                out.at[idx, "v223決策理由"] = f"v2.24 攻擊層覆蓋：{reason}"
+                out.at[idx, "v223決策理由"] = f"v2.24.1 攻擊/到價層覆蓋：{reason}"
             elif mode.startswith("✅") and ("觀察" in old or "等回測" in old or "不進" in _safe_text(out.at[idx, "v223買賣結論"], "")):
                 out.at[idx, "v223最終訊號"] = "✅ 攻擊試單"
                 out.at[idx, "v223買賣結論"] = "可極小量，嚴格停損"
                 out.at[idx, "v223下一步"] = f"攻擊試單區 {entry}；停損 {stop_txt}；1~2 輪不續強就撤。"
                 out.at[idx, "v223優先級"] = 0
-                out.at[idx, "v223決策理由"] = f"v2.24 攻擊層覆蓋：{reason}"
+                out.at[idx, "v223決策理由"] = f"v2.24.1 攻擊/到價層覆蓋：{reason}"
             elif mode.startswith("🚀") and ("觀察" in old or "等回測" in old):
                 out.at[idx, "v223最終訊號"] = "🚀 攻擊前兆"
                 out.at[idx, "v223買賣結論"] = "盯盤，不追，等觸發"
                 out.at[idx, "v223下一步"] = action
                 out.at[idx, "v223優先級"] = min(_v224_num(row, ["v223優先級"], 5), 2)
-                out.at[idx, "v223決策理由"] = f"v2.24 攻擊層提醒：{reason}"
+                out.at[idx, "v223決策理由"] = f"v2.24.1 攻擊/到價層提醒：{reason}"
 
     out["v224攻擊分"] = attack_scores
     out["v224攻擊模式"] = attack_modes
@@ -6721,7 +6749,7 @@ v216_context = load_v216_context()
 
 tick_default = _get_query_int("tick", 5, 3, 30, 1)
 
-st.title("🚀 盤中即時看盤 v2.24 攻擊優先｜漲停前兆進場修正版")
+st.title("🎯 盤中即時看盤 v2.24.1 到價即決｜第一買點修正版")
 st.caption("v2.23.11 重點：即時行情面板優先刷新；AI 決策自動刷新時會限制重算池，避免卡住 5 秒行情刷新。")
 # v2.20: realtime ticker panel is rendered after live_df is built, so stock prices can use backend MIS quotes first.
 st.info("v2.23.11：上方行情面板優先刷新；若你開 AI 局部刷新，系統會自動限制 AI 重算池，避免即時行情被 600 檔大池拖慢。")
