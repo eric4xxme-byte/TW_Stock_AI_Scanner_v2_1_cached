@@ -4734,6 +4734,11 @@ def _v220_build_ticker_payload(live_df: pd.DataFrame, ctx: Dict[str, Any], max_s
 
 
 def render_v220_realtime_ai_ticker_panel(live_df: pd.DataFrame, ctx: Dict[str, Any], tick_seconds: int = 5) -> None:
+    # v2.23.6：停用舊版前端 fetch 面板。
+    # 原因：瀏覽器端直接抓 TWSE MIS / Yahoo 常被 CORS 或休市快取擋住，
+    # 會造成畫面看似「即時更新」但數字其實不動。
+    # 真正的跳動面板改由下方 st.fragment 後端抓價，只局部刷新。
+    return
     tick_seconds = int(max(3, min(30, tick_seconds or 5)))
     payload = json.dumps(_v220_build_ticker_payload(live_df, ctx), ensure_ascii=False)
     html = f"""
@@ -6129,7 +6134,7 @@ def save_v231_limitup_feature_samples(df: pd.DataFrame, max_rows: int = 5000) ->
 
 
 def render_v231_data_quality_and_limitup_collector(df: pd.DataFrame, ctx: Dict[str, Any], sample_rows: Optional[pd.DataFrame] = None) -> None:
-    st.subheader("🧪 v2.23.5 局部 AI 決策刷新 + 漲停前兆欄位蒐集")
+    st.subheader("🧪 v2.23.6 真局部即時行情 + 漲停前兆欄位蒐集")
     st.caption("這一版先收集 v2.24 需要的真實樣本；這裡不是正式買賣訊號，不會取代 v2.23 最終決策。")
     if df is None or df.empty:
         st.info("目前沒有資料可以檢查。")
@@ -6172,12 +6177,197 @@ def render_v231_data_quality_and_limitup_collector(df: pd.DataFrame, ctx: Dict[s
     if sample_rows is not None and not sample_rows.empty:
         st.caption(f"已寫入本輪前兆樣本 {len(sample_rows)} 筆到 `{V231_LIMITUP_FEATURE_PATH}`。長期學習仍以 Google Sheet / 背景同步為主。")
 
+
+# -----------------------------
+# v2.23.6 true backend ticker fragment
+# -----------------------------
+@st.cache_data(ttl=8, show_spinner=False)
+def _v236_fetch_yahoo_chart_server(symbol: str) -> Dict[str, Any]:
+    """Server-side Yahoo chart quote so browser CORS will not freeze the quote panel."""
+    sym = str(symbol or "").strip()
+    if not sym:
+        return {}
+    try:
+        url = "https://query1.finance.yahoo.com/v8/finance/chart/" + requests.utils.quote(sym, safe="")
+        params = {"interval": "1m", "range": "1d", "_": str(int(time.time() * 1000))}
+        headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json,text/plain,*/*"}
+        r = requests.get(url, params=params, headers=headers, timeout=6)
+        if r.status_code != 200:
+            return {}
+        j = r.json()
+        result = (((j or {}).get("chart") or {}).get("result") or [None])[0]
+        if not result:
+            return {}
+        meta = result.get("meta") or {}
+        price = _clean_number(meta.get("regularMarketPrice"), np.nan)
+        prev = _clean_number(meta.get("previousClose"), np.nan)
+        if _is_nan(price) or price <= 0:
+            # Some index/future quotes only have last close during off-hours.
+            price = _clean_number(meta.get("chartPreviousClose"), np.nan)
+        pct = np.nan
+        if not _is_nan(price) and not _is_nan(prev) and prev > 0:
+            pct = round((price - prev) / prev * 100, 2)
+        if _is_nan(price) or price <= 0:
+            return {}
+        return {"price": float(price), "pct": None if _is_nan(pct) else float(pct), "source": f"Yahoo server {sym}", "time": now_taipei().strftime("%H:%M:%S")}
+    except Exception:
+        return {}
+
+
+def _v236_market_cards_from_context(ctx: Dict[str, Any]) -> List[Dict[str, Any]]:
+    ctx = ctx or {}
+    idx = ctx.get("indices", {}) or {}
+    night = ctx.get("night_proxies", {}) or {}
+    fut = ctx.get("taiwan_futures", {}) or {}
+
+    def from_obj(key: str, label: str, obj: Dict[str, Any], yahoo: str = "") -> Dict[str, Any]:
+        obj = obj or {}
+        price = _clean_number(obj.get("price"), np.nan)
+        pct = _clean_number(obj.get("change_pct"), np.nan)
+        source = str(obj.get("source") or "背景快取")
+        ts = str(obj.get("time") or obj.get("updated_at") or ctx.get("updated_at") or "")
+        # Server-side Yahoo overwrites stale background values when available.
+        if yahoo:
+            y = _v236_fetch_yahoo_chart_server(yahoo)
+            if y.get("price"):
+                price = y.get("price")
+                pct = y.get("pct")
+                source = y.get("source")
+                ts = y.get("time")
+        return {"key": key, "label": label, "price": price, "pct": pct, "source": source, "time": ts, "kind": "market"}
+
+    txf = fut.get("TXF") or night.get("TXF") or idx.get("TXF") or {}
+    # WTX& 目前以背景 WTX 直抓為主；不要用加權指數替代。
+    cards = [
+        from_obj("wtx", "台指期近月 WTX&", txf, ""),
+        from_obj("twii", "加權指數", idx.get("TWII") or {}, "^TWII"),
+        from_obj("twoii", "櫃買指數", idx.get("TWOII") or {}, "^TWOII"),
+        from_obj("nq", "NASDAQ 期貨", night.get("NQ=F") or {}, "NQ=F"),
+        from_obj("es", "S&P 500 期貨", night.get("ES=F") or {}, "ES=F"),
+        from_obj("sox", "費半", night.get("SOX") or {}, "^SOX"),
+    ]
+    return cards
+
+
+def _v236_select_ticker_universe(rank_df: pd.DataFrame, tracked_codes: List[str], top_k: int = 8) -> pd.DataFrame:
+    """Select core stocks + AI top names without calling slow market-pool APIs each ticker refresh."""
+    core = ["2330", "2382", "2313"]
+    codes = _unique_keep_order(core + list(tracked_codes or []))
+    df = rank_df.copy() if isinstance(rank_df, pd.DataFrame) else pd.DataFrame()
+    if not df.empty and "代號" in df.columns:
+        df["代號"] = df["代號"].astype(str).str.replace(".0", "", regex=False).str.zfill(4)
+        sort_cols = [c for c in ["v223最終分", "v220最終智能分", "v214調權後分", "AI總分", "即時強度分"] if c in df.columns]
+        if sort_cols:
+            df = _safe_sort(df, sort_cols, ascending=[False]*len(sort_cols))
+        codes = _unique_keep_order(codes + [c for c in df["代號"].tolist() if c not in codes])[: max(3, int(top_k))]
+    rows = []
+    for c in codes:
+        c = _normalize_code(c)
+        row = df[df["代號"] == c].iloc[0].to_dict() if (not df.empty and "代號" in df.columns and (df["代號"] == c).any()) else {}
+        rows.append({
+            "代號": c,
+            "名稱": _stock_display_name(c, row.get("名稱")),
+            "市場": _stock_display_market(c, row.get("市場")),
+            "產業": _stock_display_industry(c, row.get("產業")),
+        })
+    return normalize_stock_identity(pd.DataFrame(rows))
+
+
+def _v236_build_stock_ticker_cards(rank_df: pd.DataFrame, tracked_codes: List[str], top_n: int = 8) -> List[Dict[str, Any]]:
+    uni = _v236_select_ticker_universe(rank_df, tracked_codes, top_n)
+    if uni.empty:
+        return []
+    quotes = fetch_twse_mis_quotes(build_symbols(uni))
+    merged = uni.copy()
+    if not quotes.empty:
+        merged = merged.merge(quotes, on="代號", how="left")
+        if "即時名稱" in merged.columns:
+            merged["名稱"] = [_stock_display_name(c, qn if not _is_bad_stock_name(qn, c) else old) for c, qn, old in zip(merged["代號"], merged["即時名稱"], merged["名稱"])]
+        if "報價市場" in merged.columns:
+            merged["市場"] = merged["報價市場"].fillna(merged["市場"])
+    # fallback to previous fragment snapshot if this single refresh misses TWSE MIS.
+    px_ok = pd.to_numeric(merged.get("盤中現價", pd.Series(dtype=float)), errors="coerce").fillna(0).gt(0).sum()
+    if px_ok <= 0:
+        old = st.session_state.get("v236_last_ticker_stock_df")
+        if isinstance(old, pd.DataFrame) and not old.empty:
+            merged = old.copy()
+    else:
+        st.session_state["v236_last_ticker_stock_df"] = merged.copy()
+    cards = []
+    for _, row in merged.iterrows():
+        code = _normalize_code(row.get("代號"))
+        name = _stock_display_name(code, row.get("名稱"))
+        price = _clean_number(row.get("盤中現價"), np.nan)
+        pct = _clean_number(row.get("盤中漲跌幅"), np.nan)
+        cards.append({
+            "key": code,
+            "label": f"{name} {code}",
+            "price": price,
+            "pct": pct,
+            "source": "TWSE MIS 後端局部刷新" if not _is_nan(price) and price > 0 else "等待 MIS 報價",
+            "time": _safe_text(row.get("報價時間"), now_taipei().strftime("%H:%M:%S")),
+            "kind": "stock",
+        })
+    return cards
+
+
+def _v236_fmt_price(v: Any) -> str:
+    x = _clean_number(v, np.nan)
+    if _is_nan(x) or x <= 0:
+        return "-"
+    if abs(x) >= 1000:
+        return f"{x:,.2f}".rstrip("0").rstrip(".")
+    return f"{x:,.2f}".rstrip("0").rstrip(".")
+
+
+def _v236_fmt_pct(v: Any) -> str:
+    x = _clean_number(v, np.nan)
+    if _is_nan(x):
+        return "-"
+    return f"{x:+.2f}%"
+
+
+def render_v236_backend_ticker_panel(ctx: Dict[str, Any], rank_df: pd.DataFrame, tracked_codes: List[str], tick_seconds: int = 5, max_stocks: int = 8) -> None:
+    market_cards = _v236_market_cards_from_context(ctx)
+    stock_cards = _v236_build_stock_ticker_cards(rank_df, tracked_codes, top_n=max_stocks)
+    cards = market_cards + stock_cards
+    now = now_taipei().strftime("%H:%M:%S")
+    html = """
+<style>
+.v236-wrap{border:1px solid #e6e8ef;border-radius:18px;padding:16px 18px;margin:8px 0 18px;background:linear-gradient(180deg,#fff,#fbfcff);box-shadow:0 1px 3px rgba(15,23,42,.05)}
+.v236-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:12px}.v236-title{font-size:20px;font-weight:900;color:#111827}.v236-sub{font-size:13px;color:#6b7280;margin-top:3px}.v236-status{font-size:13px;color:#334155;white-space:nowrap}.v236-dot{display:inline-block;width:9px;height:9px;background:#22c55e;border-radius:99px;margin-right:6px;box-shadow:0 0 0 4px rgba(34,197,94,.12)}
+.v236-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}.v236-card{border:1px solid #edf0f5;border-radius:14px;background:#fff;padding:12px;min-height:106px;box-sizing:border-box}.v236-name{font-size:13px;color:#475569;font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.v236-price{font-size:28px;line-height:1.15;font-weight:900;color:#0f172a;margin-top:6px;letter-spacing:-.02em}.v236-pct{display:inline-flex;margin-top:8px;font-size:13px;font-weight:800;border-radius:999px;padding:3px 8px;background:#f1f5f9;color:#64748b}.v236-up{background:#dcfce7;color:#15803d}.v236-down{background:#fee2e2;color:#dc2626}.v236-src{font-size:11px;color:#94a3b8;margin-top:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+@media(max-width:900px){.v236-wrap{padding:12px}.v236-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.v236-card{min-height:94px;padding:10px}.v236-price{font-size:24px}.v236-title{font-size:18px}}
+@media(max-width:430px){.v236-grid{grid-template-columns:1fr}.v236-price{font-size:23px}.v236-status{font-size:12px}}
+</style>
+<div class="v236-wrap">
+  <div class="v236-head">
+    <div><div class="v236-title">⚡ v2.23.6 真局部即時行情面板</div><div class="v236-sub">後端每輪抓 TWSE MIS / Yahoo，再用 Streamlit fragment 只刷新這個面板；不是整頁重整，也不靠被 CORS 擋住的前端 fetch。</div></div>
+    <div class="v236-status"><span class="v236-dot"></span>局部更新 %s ｜ 約每 %s 秒</div>
+  </div>
+  <div class="v236-grid">
+""" % (now, int(tick_seconds))
+    for c in cards:
+        pct_num = _clean_number(c.get("pct"), np.nan)
+        pct_cls = "v236-up" if (not _is_nan(pct_num) and pct_num > 0) else "v236-down" if (not _is_nan(pct_num) and pct_num < 0) else ""
+        src = _safe_text(c.get("source"), "") + ("｜" + _safe_text(c.get("time"), "") if _safe_text(c.get("time"), "") else "")
+        html += f"""
+    <div class="v236-card">
+      <div class="v236-name">{_safe_text(c.get('label'), c.get('key'))}</div>
+      <div class="v236-price">{_v236_fmt_price(c.get('price'))}</div>
+      <div class="v236-pct {pct_cls}">{_v236_fmt_pct(c.get('pct'))}</div>
+      <div class="v236-src">{src}</div>
+    </div>
+"""
+    html += "</div></div>"
+    st.markdown(html, unsafe_allow_html=True)
+
 v216_context = load_v216_context()
 
 tick_default = _get_query_int("tick", 5, 3, 30, 1)
 
-st.title("🧩 盤中即時看盤 v2.23.5 局部 AI 決策刷新｜資料品質 + 漲停前兆蒐集")
-st.caption("v2.23.5 重點：上方即時行情只跳數字；下方 AI 決策用 Streamlit fragment 局部重算，避免整頁一直刷新。")
+st.title("🧩 盤中即時看盤 v2.23.6 真局部即時行情｜資料品質 + 漲停前兆蒐集")
+st.caption("v2.23.6 重點：上方即時行情改成後端 fragment 局部刷新，不再依賴被 CORS 擋住的前端 fetch；下方 AI 決策也維持局部重算。")
 # v2.20: realtime ticker panel is rendered after live_df is built, so stock prices can use backend MIS quotes first.
 render_v216_context(v216_context)
 st.divider()
@@ -6299,6 +6489,22 @@ if ai_rerun_enabled:
     else:
         st.warning("目前 Streamlit 版本不支援 st.fragment 局部刷新；為避免整頁閃爍，已停用整頁自動重整，請用手動重新整理。")
 
+
+
+# v2.23.6: ticker itself also uses server-side fragment refresh.
+# This is the real fix for "numbers don't move": browser-side JS fetches are often blocked by CORS,
+# so the quote panel must refresh from Python backend while keeping the rest of the page stable.
+def _render_v236_realtime_ticker_region():
+    ctx = load_v216_context()
+    rank_df_ticker = load_rank()
+    render_v236_backend_ticker_panel(ctx, rank_df_ticker, tracked_codes, tick_seconds=live_tick_seconds, max_stocks=max(8, min(14, int(top_n))))
+
+if hasattr(st, "fragment"):
+    _render_v236_realtime_ticker_region = st.fragment(run_every=f"{int(live_tick_seconds)}s")(_render_v236_realtime_ticker_region)
+else:
+    st.warning("目前 Streamlit 版本不支援 st.fragment；即時行情面板只能在頁面重算時更新。")
+
+_render_v236_realtime_ticker_region()
 
 # v2.23.5: AI 決策區改用 Streamlit fragment 局部刷新。
 # 這會讓下方決策表定期重算，但不再用 window.location.reload() 造成整頁刷新。
