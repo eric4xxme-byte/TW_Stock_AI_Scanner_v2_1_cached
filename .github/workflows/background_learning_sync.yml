@@ -1,4 +1,4 @@
-name: v2.16.10 Fast Background Learning Sync
+name: v2.16.11 Scheduled Background Learning Sync
 
 on:
   workflow_dispatch:
@@ -12,25 +12,27 @@ on:
         required: false
         default: "120"
   schedule:
-    # Taiwan time UTC+8
-    # 09:00-13:55 Mon-Fri, every 5 minutes
-    - cron: "*/5 1-5 * * 1-5"
-    # 14:10 post-close verification
+    # GitHub cron uses UTC. Taiwan = UTC+8.
+    # TW regular session 09:00-13:35 = UTC 01:00-05:35, Mon-Fri.
+    # Use explicit minute list instead of */5 so the schedule is easier to verify in GitHub.
+    - cron: "0,5,10,15,20,25,30,35,40,45,50,55 1-4 * * 1-5"
+    - cron: "0,5,10,15,20,25,30,35 5 * * 1-5"
+    # Post-close verification / second verification.
     - cron: "10 6 * * 1-5"
-    # 15:30 second post-close verification
     - cron: "30 7 * * 1-5"
 
 permissions:
   contents: write
 
+# Do not cancel a run that is already committing data. Keep each run short with timeouts instead.
 concurrency:
-  group: v216-background-learning-sync-${{ github.ref }}
-  cancel-in-progress: true
+  group: v21611-background-learning-sync-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  v216-fast-background-sync:
+  scheduled-background-sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 7
+    timeout-minutes: 6
 
     steps:
       - name: Checkout repository
@@ -48,77 +50,76 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas numpy requests python-dateutil pytz
 
-      - name: Prepare data folder
+      - name: Print schedule diagnostics
         run: |
+          echo "event_name=${{ github.event_name }}"
+          echo "utc_now=$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          TZ=Asia/Taipei date '+taipei_now=%Y-%m-%d %H:%M:%S GMT+8'
           mkdir -p data
-          echo "Run started at $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 
-      - name: Update market context with hard timeout
+      - name: Update market context with timeout
         env:
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
         run: |
           if [ -f background_market_context.py ]; then
-            echo "Running background_market_context.py with 90s timeout..."
-            timeout 90s python background_market_context.py || echo "background_market_context.py timed out or failed; continue."
+            echo "Running background_market_context.py..."
+            timeout 75s python background_market_context.py || echo "background_market_context.py timeout/fail; continue."
           else
             echo "background_market_context.py not found; skip."
           fi
 
-      - name: Run background learning sync with hard timeout
+      - name: Run background learning sync with timeout
         env:
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
           GSHEET_WEBHOOK_URL: ${{ secrets.GSHEET_WEBHOOK_URL }}
-          FORCE_RUN: ${{ github.event.inputs.force_run || '0' }}
+          FORCE_RUN: ${{ github.event.inputs.force_run || '1' }}
           MAX_SYNC_ROWS: ${{ github.event.inputs.sync_rows || '120' }}
         run: |
           if [ -f background_learning_sync.py ]; then
-            echo "Running background_learning_sync.py with 240s timeout..."
-            timeout 240s python background_learning_sync.py || echo "background_learning_sync.py timed out or failed; continue to commit any generated files."
+            echo "Running background_learning_sync.py..."
+            timeout 210s python background_learning_sync.py || echo "background_learning_sync.py timeout/fail; continue to commit diagnostics."
           else
             echo "background_learning_sync.py not found; skip."
           fi
 
-      - name: Run limit-up precursor collector with hard timeout
+      - name: Run limit-up precursor collector with timeout
         run: |
           if [ -f background_limitup_collector.py ]; then
-            echo "Running background_limitup_collector.py with 90s timeout..."
-            timeout 90s python background_limitup_collector.py || echo "background_limitup_collector.py timed out or failed; continue."
+            echo "Running background_limitup_collector.py..."
+            timeout 60s python background_limitup_collector.py || echo "background_limitup_collector.py timeout/fail; continue."
           else
             echo "background_limitup_collector.py not found; skip."
           fi
 
-      - name: Ensure optional v2 data files exist
+      - name: Ensure minimum data files exist
         run: |
           python - <<'PY'
           import json, os, datetime
           os.makedirs('data', exist_ok=True)
-          now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+          now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).isoformat()
           defaults = {
-            'data/v215_background_sync_meta.json': {'updated_at': now, 'status': 'fallback_created_by_v21610', 'sync': {'ok': False, 'message': 'fallback only; check workflow logs'}},
-            'data/v216_market_context.json': {'updated_at': now, 'status': 'fallback_created_by_v21610'},
-            'data/v216_night_session_context.json': {'updated_at': now, 'status': 'fallback_created_by_v21610'},
-            'data/v216_post_close_verification.json': {'updated_at': now, 'status': 'fallback_created_by_v21610'},
-            'data/v231_limitup_precursor_meta.json': {'updated_at': now, 'status': 'fallback_created_by_v21610'},
+            'data/v215_background_sync_meta.json': {'updated_at': now, 'status': 'fallback_created_by_v21611', 'sync': {'ok': False, 'message': 'fallback only; check workflow logs'}},
+            'data/v216_market_context.json': {'updated_at': now, 'status': 'fallback_created_by_v21611'},
+            'data/v216_night_session_context.json': {'updated_at': now, 'status': 'fallback_created_by_v21611'},
+            'data/v216_post_close_verification.json': {'updated_at': now, 'status': 'fallback_created_by_v21611'},
+            'data/v231_limitup_precursor_meta.json': {'updated_at': now, 'status': 'fallback_created_by_v21611'},
           }
           for p, obj in defaults.items():
-            if not os.path.exists(p):
-              with open(p, 'w', encoding='utf-8') as f:
-                json.dump(obj, f, ensure_ascii=False, indent=2)
-          # create CSV header if collector file missing
+              if not os.path.exists(p):
+                  with open(p, 'w', encoding='utf-8') as f:
+                      json.dump(obj, f, ensure_ascii=False, indent=2)
           csv_path = 'data/v231_limitup_precursor_features.csv'
           if not os.path.exists(csv_path):
-            with open(csv_path, 'w', encoding='utf-8') as f:
-              f.write('date,time,code,name,price,pct,limitup_distance_pct,precursor_score,reason\n')
+              with open(csv_path, 'w', encoding='utf-8') as f:
+                  f.write('date,time,code,name,price,pct,limitup_distance_pct,precursor_score,reason\n')
           PY
 
-      - name: Show generated files
+      - name: Show generated sync status
         run: |
-          echo "=== data folder ==="
-          ls -la data | sed -n '1,200p'
+          echo "=== data changed files ==="
+          git status --short data || true
           echo "=== v215 sync meta ==="
           cat data/v215_background_sync_meta.json || true
-          echo "=== v216 market context ==="
-          cat data/v216_market_context.json || true
           echo "=== v231 precursor meta ==="
           cat data/v231_limitup_precursor_meta.json || true
 
@@ -126,12 +127,11 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git status --short
           git add -A data
           if git diff --cached --quiet; then
             echo "No data changes to commit."
             exit 0
           fi
-          git commit -m "chore: v2.16.10 fast background sync data"
+          git commit -m "chore: v2.16.11 scheduled background sync data"
           git pull --rebase --autostash origin main
           git push origin main
