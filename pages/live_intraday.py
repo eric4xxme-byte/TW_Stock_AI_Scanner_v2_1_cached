@@ -4734,7 +4734,7 @@ def _v220_build_ticker_payload(live_df: pd.DataFrame, ctx: Dict[str, Any], max_s
 
 
 def render_v220_realtime_ai_ticker_panel(live_df: pd.DataFrame, ctx: Dict[str, Any], tick_seconds: int = 5) -> None:
-    # v2.23.7：停用舊版前端 fetch 面板。
+    # v2.23.8：停用舊版前端 fetch 面板。
     # 原因：瀏覽器端直接抓 TWSE MIS / Yahoo 常被 CORS 或休市快取擋住，
     # 會造成畫面看似「即時更新」但數字其實不動。
     # 真正的跳動面板改由下方 st.fragment 後端抓價，只局部刷新。
@@ -6134,7 +6134,7 @@ def save_v231_limitup_feature_samples(df: pd.DataFrame, max_rows: int = 5000) ->
 
 
 def render_v231_data_quality_and_limitup_collector(df: pd.DataFrame, ctx: Dict[str, Any], sample_rows: Optional[pd.DataFrame] = None) -> None:
-    st.subheader("🧪 v2.23.7 真局部即時行情渲染修正 + 漲停前兆欄位蒐集")
+    st.subheader("🧪 v2.23.8 真局部即時行情渲染修正 + 漲停前兆欄位蒐集")
     st.caption("這一版先收集 v2.24 需要的真實樣本；這裡不是正式買賣訊號，不會取代 v2.23 最終決策。")
     if df is None or df.empty:
         st.info("目前沒有資料可以檢查。")
@@ -6179,7 +6179,7 @@ def render_v231_data_quality_and_limitup_collector(df: pd.DataFrame, ctx: Dict[s
 
 
 # -----------------------------
-# v2.23.7 true backend ticker fragment
+# v2.23.8 true backend ticker fragment
 # -----------------------------
 @st.cache_data(ttl=8, show_spinner=False)
 def _v236_fetch_yahoo_chart_server(symbol: str) -> Dict[str, Any]:
@@ -6214,20 +6214,92 @@ def _v236_fetch_yahoo_chart_server(symbol: str) -> Dict[str, Any]:
         return {}
 
 
+@st.cache_data(ttl=3, show_spinner=False)
+def _v238_fetch_twse_mis_index_quotes() -> Dict[str, Dict[str, Any]]:
+    """Fetch Taiwan market indices from TWSE MIS directly.
+
+    v2.23.8 fix:
+    Yahoo chart often lags or returns a cached daily index snapshot. During market hours,
+    the ticker panel must use TWSE MIS index channels instead:
+    - tse_t00.tw = 加權指數
+    - otc_o00.tw = 櫃買指數
+    This prevents the market cards from looking frozen while individual stock cards update.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw",
+        "Connection": "keep-alive",
+    }
+    out: Dict[str, Dict[str, Any]] = {}
+    try:
+        session = requests.Session()
+        session.headers.update(headers)
+        try:
+            session.get("https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw", timeout=5)
+        except Exception:
+            pass
+        params = {
+            "ex_ch": "tse_t00.tw|otc_o00.tw",
+            "json": "1",
+            "delay": "0",
+            "_": str(int(time.time() * 1000)),
+        }
+        r = session.get(QUOTE_URL, params=params, timeout=8)
+        r.encoding = "utf-8"
+        payload = r.json()
+        msg_array = payload.get("msgArray", []) if isinstance(payload, dict) else []
+        for q in msg_array or []:
+            if not isinstance(q, dict):
+                continue
+            ex_ch = str(q.get("ex_ch") or q.get("ch") or "").lower()
+            key = "TWII" if "tse_t00" in ex_ch else "TWOII" if "otc_o00" in ex_ch else ""
+            if not key:
+                # Some MIS responses omit ex_ch but keep a channel/name hint.
+                n = str(q.get("n") or q.get("c") or "")
+                if "加權" in n or q.get("c") == "t00":
+                    key = "TWII"
+                elif "櫃買" in n or q.get("c") == "o00":
+                    key = "TWOII"
+            if not key:
+                continue
+            price = _to_float(q.get("z"))
+            if math.isnan(price):
+                price = _to_float(q.get("o"))
+            prev = _to_float(q.get("y"))
+            pct = np.nan
+            if not math.isnan(price) and not math.isnan(prev) and prev > 0:
+                pct = round((price - prev) / prev * 100, 2)
+            if math.isnan(price) or price <= 0:
+                continue
+            date_part = str(q.get("d", ""))
+            time_part = str(q.get("t", ""))
+            out[key] = {
+                "price": float(price),
+                "change_pct": None if _is_nan(pct) else float(pct),
+                "source": "TWSE MIS 指數即時" if key == "TWII" else "TPEx MIS 指數即時",
+                "time": f"{date_part} {time_part}".strip() or now_taipei().strftime("%H:%M:%S"),
+            }
+    except Exception:
+        return out
+    return out
+
+
 def _v236_market_cards_from_context(ctx: Dict[str, Any]) -> List[Dict[str, Any]]:
     ctx = ctx or {}
     idx = ctx.get("indices", {}) or {}
     night = ctx.get("night_proxies", {}) or {}
     fut = ctx.get("taiwan_futures", {}) or {}
+    mis_idx = _v238_fetch_twse_mis_index_quotes()
 
-    def from_obj(key: str, label: str, obj: Dict[str, Any], yahoo: str = "") -> Dict[str, Any]:
+    def from_obj(key: str, label: str, obj: Dict[str, Any], yahoo: str = "", prefer_yahoo: bool = True) -> Dict[str, Any]:
         obj = obj or {}
         price = _clean_number(obj.get("price"), np.nan)
         pct = _clean_number(obj.get("change_pct"), np.nan)
         source = str(obj.get("source") or "背景快取")
         ts = str(obj.get("time") or obj.get("updated_at") or ctx.get("updated_at") or "")
-        # Server-side Yahoo overwrites stale background values when available.
-        if yahoo:
+        if yahoo and prefer_yahoo:
             y = _v236_fetch_yahoo_chart_server(yahoo)
             if y.get("price"):
                 price = y.get("price")
@@ -6237,14 +6309,16 @@ def _v236_market_cards_from_context(ctx: Dict[str, Any]) -> List[Dict[str, Any]]
         return {"key": key, "label": label, "price": price, "pct": pct, "source": source, "time": ts, "kind": "market"}
 
     txf = fut.get("TXF") or night.get("TXF") or idx.get("TXF") or {}
-    # WTX& 目前以背景 WTX 直抓為主；不要用加權指數替代。
+    # v2.23.8: TWII/TWOII use MIS first; Yahoo is fallback only, because Yahoo chart may freeze intraday.
+    twii_obj = mis_idx.get("TWII") or idx.get("TWII") or {}
+    twoii_obj = mis_idx.get("TWOII") or idx.get("TWOII") or {}
     cards = [
-        from_obj("wtx", "台指期近月 WTX&", txf, ""),
-        from_obj("twii", "加權指數", idx.get("TWII") or {}, "^TWII"),
-        from_obj("twoii", "櫃買指數", idx.get("TWOII") or {}, "^TWOII"),
-        from_obj("nq", "NASDAQ 期貨", night.get("NQ=F") or {}, "NQ=F"),
-        from_obj("es", "S&P 500 期貨", night.get("ES=F") or {}, "ES=F"),
-        from_obj("sox", "費半", night.get("SOX") or {}, "^SOX"),
+        from_obj("wtx", "台指期近月 WTX&", txf, "", prefer_yahoo=False),
+        from_obj("twii", "加權指數", twii_obj, "^TWII", prefer_yahoo=False),
+        from_obj("twoii", "櫃買指數", twoii_obj, "^TWOII", prefer_yahoo=False),
+        from_obj("nq", "NASDAQ 期貨", night.get("NQ=F") or {}, "NQ=F", prefer_yahoo=True),
+        from_obj("es", "S&P 500 期貨", night.get("ES=F") or {}, "ES=F", prefer_yahoo=True),
+        from_obj("sox", "費半", night.get("SOX") or {}, "^SOX", prefer_yahoo=True),
     ]
     return cards
 
@@ -6342,7 +6416,7 @@ def render_v236_backend_ticker_panel(ctx: Dict[str, Any], rank_df: pd.DataFrame,
 </style>
 <div class="v236-wrap">
   <div class="v236-head">
-    <div><div class="v236-title">⚡ v2.23.7 真局部即時行情渲染修正面板</div><div class="v236-sub">後端每輪抓 TWSE MIS / Yahoo，並用 iframe 原生渲染，只刷新這個面板；避免 HTML 被當成文字顯示。</div></div>
+    <div><div class="v236-title">⚡ v2.23.8 真即時大盤 MIS 局部行情面板</div><div class="v236-sub">後端每輪抓 TWSE MIS 指數 / TWSE MIS 個股 / Yahoo 期貨，只局部刷新行情面板；大盤不再只讀 Yahoo 快取。</div></div>
     <div class="v236-status"><span class="v236-dot"></span>局部更新 %s ｜ 約每 %s 秒</div>
   </div>
   <div class="v236-grid">
@@ -6360,7 +6434,7 @@ def render_v236_backend_ticker_panel(ctx: Dict[str, Any], rank_df: pd.DataFrame,
     </div>
 """
     html += "</div></div>"
-    # v2.23.7: use components.html, not st.markdown.
+    # v2.23.8: use components.html, not st.markdown.
     # st.markdown may treat indented HTML card lines as a Markdown code block,
     # which is why the UI showed literal <div class=...> text.
     rows = max(1, math.ceil(len(cards) / 5))
@@ -6371,10 +6445,10 @@ v216_context = load_v216_context()
 
 tick_default = _get_query_int("tick", 5, 3, 30, 1)
 
-st.title("🧩 盤中即時看盤 v2.23.7 真局部即時行情｜渲染修正 + 市場核心局部刷新")
-st.caption("v2.23.7 重點：修正即時行情面板 HTML 被顯示成文字；上方行情與核心大盤價格用後端 fragment 局部刷新，不再整頁重整。")
+st.title("🧩 盤中即時看盤 v2.23.8 真即時大盤 MIS 修正版｜局部刷新")
+st.caption("v2.23.8 重點：修正加權/櫃買不即時問題：大盤改優先抓 TWSE MIS t00 / OTC o00，局部刷新，不再只讀 Yahoo 背景快取。")
 # v2.20: realtime ticker panel is rendered after live_df is built, so stock prices can use backend MIS quotes first.
-st.info("v2.23.7：上方市場核心價格改由下方『真局部即時行情面板』更新；完整大盤 / 夜盤明細請展開診斷區，避免靜態快取誤導。")
+st.info("v2.23.8：上方市場核心價格改由下方『真局部即時行情面板』更新；完整大盤 / 夜盤明細請展開診斷區，避免靜態快取誤導。")
 st.divider()
 
 refresh_default = _get_query_int("refresh", 60, 15, 300, 15)
@@ -6496,7 +6570,7 @@ if ai_rerun_enabled:
 
 
 
-# v2.23.7: ticker itself also uses server-side fragment refresh.
+# v2.23.8: ticker itself also uses server-side fragment refresh.
 # This is the real fix for "numbers don't move": browser-side JS fetches are often blocked by CORS,
 # so the quote panel must refresh from Python backend while keeping the rest of the page stable.
 def _render_v236_realtime_ticker_region():
