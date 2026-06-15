@@ -5977,6 +5977,191 @@ def _v231_limit_up_distance(px: float, prev_close: float) -> float:
         return np.nan
 
 
+
+# -----------------------------
+# v2.24 Attack Priority Engine: do not let conservative decision hide limit-up attack signals
+# -----------------------------
+def _v224_num(row: pd.Series, cols: List[str], default: float = 0.0) -> float:
+    for c in cols:
+        try:
+            if c in row.index:
+                v = _clean_number(row.get(c), np.nan)
+                if not _is_nan(v):
+                    return float(v)
+        except Exception:
+            pass
+    return float(default)
+
+
+def add_v224_attack_priority_decision(df: pd.DataFrame, ctx: Dict[str, Any], chase_pct: float = 7.0) -> pd.DataFrame:
+    """v2.24: aggressive-but-controlled attack layer.
+
+    Problem fixed: v2.23 is intentionally conservative and can keep fast limit-up names as "觀察".
+    This layer separates "attack radar" from ordinary risk gating:
+    - If a name is already near/at limit-up, surface it as "漲停攻擊中 / 已過最佳新進點" instead of generic observation.
+    - If it is accelerating before the late chase zone, allow only a tiny attack trial with strict stop.
+    - It never says to chase after the best risk/reward window is gone.
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    market_score, night_risk, market_label = _v223_market_state(ctx if isinstance(ctx, dict) else {})
+
+    attack_scores=[]; attack_modes=[]; attack_actions=[]; attack_reasons=[]; attack_entry=[]; attack_stop=[]; attack_risk=[]
+
+    for idx, row in out.iterrows():
+        px = _v224_num(row, ["盤中現價", "目前價格", "現價"], np.nan)
+        pct = _v224_num(row, ["盤中漲跌幅", "漲跌幅"], 0)
+        high = _v224_num(row, ["最高", "盤中最高", "最高價格"], np.nan)
+        low = _v224_num(row, ["最低", "盤中最低", "最低價格"], np.nan)
+        open_px = _v224_num(row, ["開盤", "開盤價"], np.nan)
+        prev = _v224_num(row, ["昨收", "參考價", "前收"], np.nan)
+        strength = _v224_num(row, ["即時強度分", "盤中強度分", "v29即時入場分"], 50)
+        ai = _v224_num(row, ["v214調權後分", "AI總分", "盤後AI分", "市場池估分"], 50)
+        capital = _v224_num(row, ["v220籌碼資金分", "盤中資金分"], 50)
+        risk = _v224_num(row, ["風險分", "v220風險估計分"], 40)
+        limit_score = _v224_num(row, ["v231漲停前兆蒐集分", "v29漲停前兆分", "漲停前兆分", "爆衝分"], 0)
+        speed_score = _v224_num(row, ["v231短線漲速分", "短線漲速分"], 0)
+        vol_jump = _v224_num(row, ["v231量能跳升分", "量能跳升分"], 0)
+        reattack = _v224_num(row, ["v231二次攻擊分", "二次攻擊分"], 0)
+        limit_dist = _v224_num(row, ["漲停距離%", "v231漲停距離%"], np.nan)
+        if _is_nan(limit_dist):
+            if not _is_nan(prev) and prev > 0 and not _is_nan(px) and px > 0:
+                limit_up = _round_up_tick(prev * 1.10) if '_round_up_tick' in globals() else prev * 1.10
+                limit_dist = max(0.0, (limit_up - px) / px * 100)
+            elif pct > 0:
+                limit_dist = max(0.0, 10.0 - pct)
+        near_high = False
+        try:
+            near_high = bool((not _is_nan(px)) and (not _is_nan(high)) and high > 0 and px >= high * 0.992)
+        except Exception:
+            near_high = False
+
+        no_px = bool(_is_nan(px) or px <= 0)
+        near_limit = bool((pct >= 9.0) or ((not _is_nan(limit_dist)) and limit_dist <= 1.1))
+        late_chase = bool((pct >= max(float(chase_pct or 7.0), 7.8)) or ((not _is_nan(limit_dist)) and limit_dist <= 1.6))
+        attack_window = bool((2.0 <= pct <= 7.8) and (not _is_nan(px)) and px > 0)
+        env_ok = bool(market_score >= 45 and night_risk < 78)
+        risk_ok = bool(risk < 68)
+
+        # Attack score emphasizes acceleration and money flow BEFORE the late chase zone.
+        score = 0.0
+        score += min(26.0, max(0.0, pct) * 3.0)
+        score += min(20.0, max(0.0, strength - 50) * 0.75)
+        score += min(18.0, max(0.0, limit_score) * 0.18)
+        score += min(12.0, max(0.0, capital - 50) * 0.35)
+        score += min(12.0, max(0.0, ai - 45) * 0.25)
+        score += min(8.0, max(0.0, speed_score) * 0.08)
+        score += min(8.0, max(0.0, vol_jump) * 0.08)
+        score += min(6.0, max(0.0, reattack) * 0.06)
+        score += 6.0 if near_high else 0.0
+        score += 5.0 if env_ok else -8.0
+        score -= max(0.0, risk - 45) * 0.25
+        if late_chase:
+            score -= 8.0
+        score = round(max(0.0, min(100.0, score)), 1)
+
+        if no_px:
+            mode = "⚪ 等報價"
+            action = "不判斷"
+            reason = "沒有有效即時價格"
+            entry = "-"; stop_txt = "-"; risk_txt = "無報價"
+        elif near_limit:
+            mode = "🔥 漲停攻擊中"
+            action = "已過最佳新進點；只看排隊/持有，不追高"
+            reason = "已接近或到達漲停區，系統必須標示強攻而不是觀察，但新進風險報酬已差。"
+            entry = "已過最佳點"
+            stop_txt = _fmt_price(_round_down_tick(px * 0.985) if '_round_down_tick' in globals() else px * 0.985)
+            risk_txt = "高：漲停附近不追"
+        elif attack_window and score >= 76 and risk_ok and env_ok and (near_high or speed_score >= 55 or limit_score >= 65 or strength >= 66):
+            mode = "✅ 攻擊試單"
+            action = "可極小量試單；只做第一筆，不加碼，不站穩就撤"
+            reason = "漲速、強度、資金/前兆同時升溫，仍未到漲停高風險區。"
+            entry_low = _round_down_tick(px * 0.995) if '_round_down_tick' in globals() else px * 0.995
+            entry_high = _round_up_tick(px * 1.004) if '_round_up_tick' in globals() else px * 1.004
+            entry = f"{_fmt_price(entry_low)}～{_fmt_price(entry_high)}"
+            stp = low if (not _is_nan(low) and low > 0 and low < px) else px * 0.972
+            stop_txt = _fmt_price(_round_down_tick(stp) if '_round_down_tick' in globals() else stp)
+            risk_txt = "中：只允許小量"
+        elif attack_window and score >= 62 and env_ok:
+            mode = "🚀 攻擊前兆"
+            action = "盯突破/回測不破；還不是無腦買點"
+            reason = "前兆升溫，但仍缺少站穩或資金確認。"
+            entry = f"等突破 {_fmt_price(high) if not _is_nan(high) else '日內高'} 或回測不破"
+            stp = low if (not _is_nan(low) and low > 0 and low < px) else px * 0.975
+            stop_txt = _fmt_price(_round_down_tick(stp) if '_round_down_tick' in globals() else stp)
+            risk_txt = "中"
+        elif late_chase:
+            mode = "🔴 已進追高區"
+            action = "不追；等拉回承接或尾盤確認"
+            reason = "漲幅/漲停距離已不適合新進，避免買在最右側。"
+            entry = "等拉回"
+            stop_txt = _fmt_price(_round_down_tick(px * 0.98) if '_round_down_tick' in globals() else px * 0.98)
+            risk_txt = "高"
+        else:
+            mode = "⚪ 普通觀察"
+            action = "不進；等待攻擊分升高"
+            reason = "漲速、強度或資金尚未構成攻擊訊號。"
+            entry = "-"; stop_txt = "-"; risk_txt = "低/中"
+
+        attack_scores.append(score)
+        attack_modes.append(mode)
+        attack_actions.append(action)
+        attack_reasons.append(reason)
+        attack_entry.append(entry)
+        attack_stop.append(stop_txt)
+        attack_risk.append(risk_txt)
+
+        # Override conservative v223 when it would hide an active attack state.
+        if "v223最終訊號" in out.columns:
+            old = _safe_text(out.at[idx, "v223最終訊號"], "")
+            if mode.startswith("🔥"):
+                out.at[idx, "v223最終訊號"] = "🔥 漲停攻擊中"
+                out.at[idx, "v223買賣結論"] = "已過最佳新進點"
+                out.at[idx, "v223下一步"] = "不新追；已有部位看是否鎖住，沒部位只看回測/開板後結構。"
+                out.at[idx, "v223優先級"] = 0
+                out.at[idx, "v223決策理由"] = f"v2.24 攻擊層覆蓋：{reason}"
+            elif mode.startswith("✅") and ("觀察" in old or "等回測" in old or "不進" in _safe_text(out.at[idx, "v223買賣結論"], "")):
+                out.at[idx, "v223最終訊號"] = "✅ 攻擊試單"
+                out.at[idx, "v223買賣結論"] = "可極小量，嚴格停損"
+                out.at[idx, "v223下一步"] = f"攻擊試單區 {entry}；停損 {stop_txt}；1~2 輪不續強就撤。"
+                out.at[idx, "v223優先級"] = 0
+                out.at[idx, "v223決策理由"] = f"v2.24 攻擊層覆蓋：{reason}"
+            elif mode.startswith("🚀") and ("觀察" in old or "等回測" in old):
+                out.at[idx, "v223最終訊號"] = "🚀 攻擊前兆"
+                out.at[idx, "v223買賣結論"] = "盯盤，不追，等觸發"
+                out.at[idx, "v223下一步"] = action
+                out.at[idx, "v223優先級"] = min(_v224_num(row, ["v223優先級"], 5), 2)
+                out.at[idx, "v223決策理由"] = f"v2.24 攻擊層提醒：{reason}"
+
+    out["v224攻擊分"] = attack_scores
+    out["v224攻擊模式"] = attack_modes
+    out["v224即時建議"] = attack_actions
+    out["v224攻擊入場區"] = attack_entry
+    out["v224攻擊停損"] = attack_stop
+    out["v224攻擊風險"] = attack_risk
+    out["v224攻擊理由"] = attack_reasons
+    return out
+
+
+def render_v224_attack_cockpit(df: pd.DataFrame, top_n: int = 12) -> None:
+    if df is None or df.empty or "v224攻擊分" not in df.columns:
+        return
+    st.subheader("🚀 v2.24 漲停攻擊雷達｜進場時機修正")
+    st.caption("這張表專門處理聯一光這種突然攻擊股：先抓攻擊前兆與試單窗口；若已漲停/近漲停，會標示『已過最佳新進點』，不再只是觀察。")
+    work = df.copy()
+    work = _safe_sort(work, ["v223優先級", "v224攻擊分", "盤中漲跌幅"], ascending=[True, False, False])
+    attack_n = int(work.get("v224攻擊模式", pd.Series(dtype=str)).astype(str).str.contains("攻擊試單", regex=False).sum())
+    hot_n = int(work.get("v224攻擊模式", pd.Series(dtype=str)).astype(str).str.contains("漲停攻擊中|攻擊前兆", regex=True).sum())
+    late_n = int(work.get("v224攻擊模式", pd.Series(dtype=str)).astype(str).str.contains("追高|漲停攻擊中", regex=True).sum())
+    c1, c2, c3 = st.columns(3)
+    c1.metric("可攻擊試單", attack_n)
+    c2.metric("前兆/攻擊中", hot_n)
+    c3.metric("已過最佳點/不追", late_n)
+    cols = _cols_exist(work, ["代號", "名稱", "盤中現價", "盤中漲跌幅", "v224攻擊模式", "v224攻擊分", "v224即時建議", "v224攻擊入場區", "v224攻擊停損", "v223最終訊號", "v223買賣結論", "v224攻擊理由", "報價時間"])
+    if cols:
+        st.dataframe(work[cols].head(top_n), use_container_width=True, hide_index=True)
+
 def add_v231_limitup_collection_features(df: pd.DataFrame, ctx: Dict[str, Any]) -> pd.DataFrame:
     """v2.23.1: collect the exact fields needed to train v2.24 later.
 
@@ -6536,7 +6721,7 @@ v216_context = load_v216_context()
 
 tick_default = _get_query_int("tick", 5, 3, 30, 1)
 
-st.title("🧩 盤中即時看盤 v2.23.11 即時行情優先｜AI 不阻塞版")
+st.title("🚀 盤中即時看盤 v2.24 攻擊優先｜漲停前兆進場修正版")
 st.caption("v2.23.11 重點：即時行情面板優先刷新；AI 決策自動刷新時會限制重算池，避免卡住 5 秒行情刷新。")
 # v2.20: realtime ticker panel is rendered after live_df is built, so stock prices can use backend MIS quotes first.
 st.info("v2.23.11：上方行情面板優先刷新；若你開 AI 局部刷新，系統會自動限制 AI 重算池，避免即時行情被 600 檔大池拖慢。")
@@ -6751,11 +6936,13 @@ def _render_v235_ai_decision_region():
     live_df = add_v221_news_event_decision(live_df, v221_news_context)
     live_df = add_v222_event_quality_decision(live_df, v221_news_context)
     live_df = add_v223_consistency_decision(live_df, v216_context)
+    live_df = add_v224_attack_priority_decision(live_df, v216_context, chase_pct=chase_pct)
     live_df = add_v231_limitup_collection_features(live_df, v216_context)
     v231_current_samples_df = save_v231_limitup_feature_samples(live_df)
 
     # v2.23 realtime AI-selected ticker is rendered after MIS quote merge so 廣達/華通/台積電 have backend prices first.
     render_v220_realtime_ai_ticker_panel(live_df, v216_context, tick_seconds=live_tick_seconds)
+    render_v224_attack_cockpit(live_df, top_n=top_n)
     render_v223_consistency_cockpit(live_df, v216_context, top_n=top_n)
     render_v223_focus(live_df, top_n=max(top_n, 12))
     render_v231_data_quality_and_limitup_collector(live_df, v216_context, v231_current_samples_df)
@@ -6788,6 +6975,7 @@ def _render_v235_ai_decision_region():
     lifecycle_df = apply_v216_market_adjustment(lifecycle_df, v216_context)
     lifecycle_df = add_v219_right_entry_signal(lifecycle_df)
     lifecycle_df = add_v223_consistency_decision(lifecycle_df, v216_context)
+    lifecycle_df = add_v224_attack_priority_decision(lifecycle_df, v216_context, chase_pct=chase_pct)
     lifecycle_df = normalize_stock_identity(lifecycle_df)
     lifecycle_df = add_v231_limitup_collection_features(lifecycle_df, v216_context)
     v213_summary = build_v213_journal_summary(v213_signal_journal_df)
@@ -6905,7 +7093,7 @@ def _render_v235_ai_decision_region():
     st.subheader("🧭 v2.23 最終進場決策｜一致性主表")
     st.caption("主表只顯示最終訊號與必要價格。若要看新聞、生命週期、Google Sheet、全部明細，請打開下方進階診斷。")
     main_cols = _cols_exist(lifecycle_df, [
-        "代號", "名稱", "市場", "產業", "交易型態", "v223最終訊號", "v223買賣結論", "v223最終分", "v223風險層級", "v223技術狀態", "v223籌碼確認", "v223事件修正", "v223大盤修正", "v223下一步", "v219右側精準進場", "v219右側判斷原因", "v216調整後決策", "v216環境修正", "v216大盤環境", "v216夜盤風險", "v214信心閘門", "v212生命週期狀態", "v212目前決策", "我會不會買",
+        "代號", "名稱", "市場", "產業", "交易型態", "v223最終訊號", "v223買賣結論", "v224攻擊模式", "v224攻擊分", "v224即時建議", "v224攻擊入場區", "v224攻擊停損", "v223最終分", "v223風險層級", "v223技術狀態", "v223籌碼確認", "v223事件修正", "v223大盤修正", "v223下一步", "v219右側精準進場", "v219右側判斷原因", "v216調整後決策", "v216環境修正", "v216大盤環境", "v216夜盤風險", "v214信心閘門", "v212生命週期狀態", "v212目前決策", "我會不會買",
         "第一買點", "盤中現價", "v214停損距離%", "v212位置判斷", "防守停損", "右側加碼價", "追價上限",
         "盤中漲跌幅", "刷新漲速%", "v214調權後分", "左側低吸分", "盤中資金分", "v29漲停前兆分", "v210決策分",
         "v214下一步", "v212下一步", "還缺什麼確認", "不能買原因", "資料來源", "AI來源", "報價時間"
