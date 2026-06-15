@@ -4734,7 +4734,7 @@ def _v220_build_ticker_payload(live_df: pd.DataFrame, ctx: Dict[str, Any], max_s
 
 
 def render_v220_realtime_ai_ticker_panel(live_df: pd.DataFrame, ctx: Dict[str, Any], tick_seconds: int = 5) -> None:
-    # v2.23.6：停用舊版前端 fetch 面板。
+    # v2.23.7：停用舊版前端 fetch 面板。
     # 原因：瀏覽器端直接抓 TWSE MIS / Yahoo 常被 CORS 或休市快取擋住，
     # 會造成畫面看似「即時更新」但數字其實不動。
     # 真正的跳動面板改由下方 st.fragment 後端抓價，只局部刷新。
@@ -6134,7 +6134,7 @@ def save_v231_limitup_feature_samples(df: pd.DataFrame, max_rows: int = 5000) ->
 
 
 def render_v231_data_quality_and_limitup_collector(df: pd.DataFrame, ctx: Dict[str, Any], sample_rows: Optional[pd.DataFrame] = None) -> None:
-    st.subheader("🧪 v2.23.6 真局部即時行情 + 漲停前兆欄位蒐集")
+    st.subheader("🧪 v2.23.7 真局部即時行情渲染修正 + 漲停前兆欄位蒐集")
     st.caption("這一版先收集 v2.24 需要的真實樣本；這裡不是正式買賣訊號，不會取代 v2.23 最終決策。")
     if df is None or df.empty:
         st.info("目前沒有資料可以檢查。")
@@ -6179,7 +6179,7 @@ def render_v231_data_quality_and_limitup_collector(df: pd.DataFrame, ctx: Dict[s
 
 
 # -----------------------------
-# v2.23.6 true backend ticker fragment
+# v2.23.7 true backend ticker fragment
 # -----------------------------
 @st.cache_data(ttl=8, show_spinner=False)
 def _v236_fetch_yahoo_chart_server(symbol: str) -> Dict[str, Any]:
@@ -6342,7 +6342,7 @@ def render_v236_backend_ticker_panel(ctx: Dict[str, Any], rank_df: pd.DataFrame,
 </style>
 <div class="v236-wrap">
   <div class="v236-head">
-    <div><div class="v236-title">⚡ v2.23.6 真局部即時行情面板</div><div class="v236-sub">後端每輪抓 TWSE MIS / Yahoo，再用 Streamlit fragment 只刷新這個面板；不是整頁重整，也不靠被 CORS 擋住的前端 fetch。</div></div>
+    <div><div class="v236-title">⚡ v2.23.7 真局部即時行情渲染修正面板</div><div class="v236-sub">後端每輪抓 TWSE MIS / Yahoo，並用 iframe 原生渲染，只刷新這個面板；避免 HTML 被當成文字顯示。</div></div>
     <div class="v236-status"><span class="v236-dot"></span>局部更新 %s ｜ 約每 %s 秒</div>
   </div>
   <div class="v236-grid">
@@ -6360,16 +6360,21 @@ def render_v236_backend_ticker_panel(ctx: Dict[str, Any], rank_df: pd.DataFrame,
     </div>
 """
     html += "</div></div>"
-    st.markdown(html, unsafe_allow_html=True)
+    # v2.23.7: use components.html, not st.markdown.
+    # st.markdown may treat indented HTML card lines as a Markdown code block,
+    # which is why the UI showed literal <div class=...> text.
+    rows = max(1, math.ceil(len(cards) / 5))
+    panel_height = min(980, max(310, 128 + rows * 124))
+    components.html(html, height=panel_height, scrolling=True)
 
 v216_context = load_v216_context()
 
 tick_default = _get_query_int("tick", 5, 3, 30, 1)
 
-st.title("🧩 盤中即時看盤 v2.23.6 真局部即時行情｜資料品質 + 漲停前兆蒐集")
-st.caption("v2.23.6 重點：上方即時行情改成後端 fragment 局部刷新，不再依賴被 CORS 擋住的前端 fetch；下方 AI 決策也維持局部重算。")
+st.title("🧩 盤中即時看盤 v2.23.7 真局部即時行情｜渲染修正 + 市場核心局部刷新")
+st.caption("v2.23.7 重點：修正即時行情面板 HTML 被顯示成文字；上方行情與核心大盤價格用後端 fragment 局部刷新，不再整頁重整。")
 # v2.20: realtime ticker panel is rendered after live_df is built, so stock prices can use backend MIS quotes first.
-render_v216_context(v216_context)
+st.info("v2.23.7：上方市場核心價格改由下方『真局部即時行情面板』更新；完整大盤 / 夜盤明細請展開診斷區，避免靜態快取誤導。")
 st.divider()
 
 refresh_default = _get_query_int("refresh", 60, 15, 300, 15)
@@ -6491,7 +6496,7 @@ if ai_rerun_enabled:
 
 
 
-# v2.23.6: ticker itself also uses server-side fragment refresh.
+# v2.23.7: ticker itself also uses server-side fragment refresh.
 # This is the real fix for "numbers don't move": browser-side JS fetches are often blocked by CORS,
 # so the quote panel must refresh from Python backend while keeping the rest of the page stable.
 def _render_v236_realtime_ticker_region():
