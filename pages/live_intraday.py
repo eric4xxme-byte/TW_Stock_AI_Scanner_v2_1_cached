@@ -6875,6 +6875,37 @@ def render_v236_backend_ticker_panel(ctx: Dict[str, Any], rank_df: pd.DataFrame,
     market_cards = _v236_market_cards_from_context(ctx)
     stock_cards = _v236_build_stock_ticker_cards(rank_df, tracked_codes, top_n=max_stocks)
     cards = market_cards + stock_cards
+    # v2.24.3: do not confuse local refresh with quote update.
+    # Compare this round with the previous rendered round and label every card.
+    prev_cards = st.session_state.get("v243_prev_quote_cards", {}) or {}
+    current_cards = {}
+    changed_price_count = 0
+    changed_time_count = 0
+    for c in cards:
+        k = str(c.get("key") or c.get("label") or "")
+        price_txt = _v236_fmt_price(c.get("price"))
+        time_txt = _safe_text(c.get("time"), "")
+        old = prev_cards.get(k, {}) if isinstance(prev_cards, dict) else {}
+        old_price = old.get("price_txt")
+        old_time = old.get("time_txt")
+        price_changed = bool(old_price is not None and price_txt != old_price)
+        time_changed = bool(old_time is not None and time_txt != old_time)
+        if old_price is None:
+            c["fresh_tag"] = "首次讀取"
+            c["fresh_cls"] = "v236-neutral"
+        elif price_changed:
+            c["fresh_tag"] = "✅ 價格變動"
+            c["fresh_cls"] = "v236-fresh"
+            changed_price_count += 1
+        elif time_changed:
+            c["fresh_tag"] = "🟡 時間更新"
+            c["fresh_cls"] = "v236-time"
+            changed_time_count += 1
+        else:
+            c["fresh_tag"] = "⚠️ 資料未變"
+            c["fresh_cls"] = "v236-stale"
+        current_cards[k] = {"price_txt": price_txt, "time_txt": time_txt}
+    st.session_state["v243_prev_quote_cards"] = current_cards
     st.session_state["v236_ticker_refresh_count"] = int(st.session_state.get("v236_ticker_refresh_count", 0)) + 1
     refresh_no = int(st.session_state.get("v236_ticker_refresh_count", 0))
     now = now_taipei().strftime("%H:%M:%S")
@@ -6882,14 +6913,14 @@ def render_v236_backend_ticker_panel(ctx: Dict[str, Any], rank_df: pd.DataFrame,
 <style>
 .v236-wrap{border:1px solid #e6e8ef;border-radius:18px;padding:16px 18px;margin:8px 0 18px;background:linear-gradient(180deg,#fff,#fbfcff);box-shadow:0 1px 3px rgba(15,23,42,.05)}
 .v236-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:12px}.v236-title{font-size:20px;font-weight:900;color:#111827}.v236-sub{font-size:13px;color:#6b7280;margin-top:3px}.v236-status{font-size:13px;color:#334155;white-space:nowrap}.v236-dot{display:inline-block;width:9px;height:9px;background:#22c55e;border-radius:99px;margin-right:6px;box-shadow:0 0 0 4px rgba(34,197,94,.12)}
-.v236-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}.v236-card{border:1px solid #edf0f5;border-radius:14px;background:#fff;padding:12px;min-height:106px;box-sizing:border-box}.v236-name{font-size:13px;color:#475569;font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.v236-price{font-size:28px;line-height:1.15;font-weight:900;color:#0f172a;margin-top:6px;letter-spacing:-.02em}.v236-pct{display:inline-flex;margin-top:8px;font-size:13px;font-weight:800;border-radius:999px;padding:3px 8px;background:#f1f5f9;color:#64748b}.v236-up{background:#dcfce7;color:#15803d}.v236-down{background:#fee2e2;color:#dc2626}.v236-src{font-size:11px;color:#94a3b8;margin-top:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.v236-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}.v236-card{border:1px solid #edf0f5;border-radius:14px;background:#fff;padding:12px;min-height:106px;box-sizing:border-box}.v236-name{font-size:13px;color:#475569;font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.v236-price{font-size:28px;line-height:1.15;font-weight:900;color:#0f172a;margin-top:6px;letter-spacing:-.02em}.v236-pct{display:inline-flex;margin-top:8px;font-size:13px;font-weight:800;border-radius:999px;padding:3px 8px;background:#f1f5f9;color:#64748b}.v236-up{background:#dcfce7;color:#15803d}.v236-down{background:#fee2e2;color:#dc2626}.v236-src{font-size:11px;color:#94a3b8;margin-top:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.v236-fresh,.v236-time,.v236-stale,.v236-neutral{display:inline-flex;margin-top:6px;font-size:11px;font-weight:800;border-radius:999px;padding:2px 7px}.v236-fresh{background:#dcfce7;color:#15803d}.v236-time{background:#fef9c3;color:#a16207}.v236-stale{background:#fee2e2;color:#b91c1c}.v236-neutral{background:#f1f5f9;color:#64748b}
 @media(max-width:900px){.v236-wrap{padding:12px}.v236-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.v236-card{min-height:94px;padding:10px}.v236-price{font-size:24px}.v236-title{font-size:18px}}
 @media(max-width:430px){.v236-grid{grid-template-columns:1fr}.v236-price{font-size:23px}.v236-status{font-size:12px}}
 </style>
 <div class="v236-wrap">
   <div class="v236-head">
-    <div><div class="v236-title">⚡ v2.23.11 即時行情優先面板</div><div class="v236-sub">每輪強制重新抓 TWSE MIS 指數 / 個股；來源時間沒更新會明確顯示，不再假裝即時。</div></div>
-    <div class="v236-status"><span class="v236-dot"></span>局部更新 %s ｜ 約每 %s 秒 ｜ 第 %s 輪</div>
+    <div><div class="v236-title">🧪 v2.24.3 真實報價狀態面板</div><div class="v236-sub">每輪輪詢報價源；只有價格或來源時間真的變化才算有效更新，不再用本機刷新時間假裝報價跳動。</div></div>
+    <div class="v236-status"><span class="v236-dot"></span>本機輪詢 %s ｜ 約每 %s 秒 ｜ 第 %s 輪</div>
   </div>
   <div class="v236-grid">
 """ % (now, int(tick_seconds), refresh_no)
@@ -6902,6 +6933,7 @@ def render_v236_backend_ticker_panel(ctx: Dict[str, Any], rank_df: pd.DataFrame,
       <div class="v236-name">{_safe_text(c.get('label'), c.get('key'))}</div>
       <div class="v236-price">{_v236_fmt_price(c.get('price'))}</div>
       <div class="v236-pct {pct_cls}">{_v236_fmt_pct(c.get('pct'))}</div>
+      <div class="{_safe_text(c.get('fresh_cls'), 'v236-neutral')}">{_safe_text(c.get('fresh_tag'), '')}</div>
       <div class="v236-src">{src}</div>
     </div>
 """
@@ -6917,10 +6949,10 @@ v216_context = load_v216_context()
 
 tick_default = _get_query_int("tick", 5, 3, 30, 1)
 
-st.title("🎯 盤中即時看盤 v2.24.2 實戰進場雷達｜攻擊窗口修正版")
-st.caption("v2.23.11 重點：即時行情面板優先刷新；AI 決策自動刷新時會限制重算池，避免卡住 5 秒行情刷新。")
+st.title("🧪 盤中即時看盤 v2.24.3 真實報價狀態｜不再假裝跳動")
+st.caption("v2.24.3 重點：本區改看「資料是否真的變動」；若輪次增加但價格與來源時間沒變，代表資料源沒有回新 tick。")
 # v2.20: realtime ticker panel is rendered after live_df is built, so stock prices can use backend MIS quotes first.
-st.info("v2.23.11：上方行情面板優先刷新；若你開 AI 局部刷新，系統會自動限制 AI 重算池，避免即時行情被 600 檔大池拖慢。")
+st.info("v2.24.3：上方行情面板只代表輪詢，不再保證價格每 5 秒會變；若要券商級逐筆跳動，仍需券商 WebSocket / 正式行情 API。")
 st.divider()
 
 refresh_default = _get_query_int("refresh", 60, 15, 300, 15)
