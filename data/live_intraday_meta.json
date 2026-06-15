@@ -1,0 +1,23 @@
+{
+  "updated_at": "2026-06-16T00:07:16+08:00",
+  "status": "ok",
+  "session_mode": "off_hours",
+  "workflow_version": "v2.24-live-intraday",
+  "candidate_count": 34,
+  "query_channel_count": 68,
+  "quote_raw_count": 68,
+  "valid_price_count": 34,
+  "trade_price_count": 34,
+  "quote_failed_count": 0,
+  "focus_codes": [
+    "3441",
+    "2382",
+    "2313",
+    "6770",
+    "2409",
+    "3042",
+    "6257"
+  ],
+  "errors_tail": [],
+  "note": "前台應以 data/live_intraday_meta.json 的 updated_at 判斷資料是否真的更新；不要只看 Streamlit rerun 時間。"
+}
