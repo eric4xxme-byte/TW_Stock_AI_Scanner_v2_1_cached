@@ -81,7 +81,7 @@ FOCUS_CODES = ["3441", "2382", "2313"]
 FOCUS_LABELS = {"3441": "聯一光", "2382": "廣達", "2313": "華通"}
 
 
-# v2.23.4 stock name normalizer.
+# v2.23.5 partial AI refresh + stock name normalizer.
 # Some quote sources return stock code as the name (for example 2303 -> "2303"),
 # and the old merge logic overwrote good AI/market-pool names with that numeric value.
 # Keep a wider local fallback map and never display duplicated labels like "2303 2303".
@@ -4738,7 +4738,7 @@ def render_v220_realtime_ai_ticker_panel(live_df: pd.DataFrame, ctx: Dict[str, A
     payload = json.dumps(_v220_build_ticker_payload(live_df, ctx), ensure_ascii=False)
     html = f"""
 <div id=\"rt-root\" class=\"rt-root\">
-  <div class=\"rt-head\"><div><div class=\"rt-title\">⚡ v2.23.4 AI 即時行情跳動面板</div><div class=\"rt-sub\">台積電/廣達/華通 + AI 最看好清單；只跳數字，不重整整頁。</div></div><div class=\"rt-status\"><span id=\"rt-dot\" class=\"dot wait\"></span><span id=\"rt-status-text\">初始化</span></div></div>
+  <div class=\"rt-head\"><div><div class=\"rt-title\">⚡ v2.23.5 AI 即時行情跳動面板</div><div class=\"rt-sub\">台積電/廣達/華通 + AI 最看好清單；只跳數字，不重整整頁。</div></div><div class=\"rt-status\"><span id=\"rt-dot\" class=\"dot wait\"></span><span id=\"rt-status-text\">初始化</span></div></div>
   <div id=\"rt-grid\" class=\"rt-grid\"></div>
 </div>
 <style>
@@ -6129,7 +6129,7 @@ def save_v231_limitup_feature_samples(df: pd.DataFrame, max_rows: int = 5000) ->
 
 
 def render_v231_data_quality_and_limitup_collector(df: pd.DataFrame, ctx: Dict[str, Any], sample_rows: Optional[pd.DataFrame] = None) -> None:
-    st.subheader("🧪 v2.23.4 手機版即時盤修正 + 漲停前兆欄位蒐集")
+    st.subheader("🧪 v2.23.5 局部 AI 決策刷新 + 漲停前兆欄位蒐集")
     st.caption("這一版先收集 v2.24 需要的真實樣本；這裡不是正式買賣訊號，不會取代 v2.23 最終決策。")
     if df is None or df.empty:
         st.info("目前沒有資料可以檢查。")
@@ -6176,8 +6176,8 @@ v216_context = load_v216_context()
 
 tick_default = _get_query_int("tick", 5, 3, 30, 1)
 
-st.title("📱 盤中即時看盤 v2.23.4 股票名稱修正｜資料品質 + 漲停前兆蒐集")
-st.caption("v2.23.1 重點：保留 v2.23 最終進場決策，並開始蒐集漲停前 5～15 分鐘預警模型需要的真實欄位與資料品質指標。")
+st.title("🧩 盤中即時看盤 v2.23.5 局部 AI 決策刷新｜資料品質 + 漲停前兆蒐集")
+st.caption("v2.23.5 重點：上方即時行情只跳數字；下方 AI 決策用 Streamlit fragment 局部重算，避免整頁一直刷新。")
 # v2.20: realtime ticker panel is rendered after live_df is built, so stock prices can use backend MIS quotes first.
 render_v216_context(v216_context)
 st.divider()
@@ -6206,8 +6206,8 @@ with st.sidebar:
     )
     pool_size = st.slider("市場池檔數", min_value=30, max_value=600, value=pool_default, step=10, disabled=(scan_mode != "盤中市場池掃描"))
     live_tick_seconds = st.slider("即時數字跳動秒數", min_value=3, max_value=30, value=tick_default, step=1, help="只更新上方即時行情面板，不會重整整頁。")
-    ai_rerun_enabled = st.toggle("AI 決策自動整頁重算", value=ai_rerun_default, help="關閉時，只有上方即時行情面板跳動；AI 決策需手動重新整理或開啟此選項。")
-    refresh_seconds = st.slider("AI 決策重算秒數", min_value=15, max_value=300, value=refresh_default, step=15, disabled=not ai_rerun_enabled)
+    ai_rerun_enabled = st.toggle("AI 決策局部自動刷新", value=ai_rerun_default, help="開啟後只重算下方 AI 決策區，不再用整頁 reload；若 Streamlit 版本不支援 fragment，會改成手動刷新。")
+    refresh_seconds = st.slider("AI 決策局部刷新秒數", min_value=15, max_value=300, value=refresh_default, step=15, disabled=not ai_rerun_enabled)
     top_n = st.slider("主表顯示前 N 檔", min_value=5, max_value=50, value=top_n_default, step=5)
     min_ai = st.slider("最低 AI / 市場池分", 0, 100, min_ai_default, 5)
     min_strength = st.slider("最低即時強度分", 0, 100, min_strength_default, 5)
@@ -6266,7 +6266,7 @@ with st.sidebar:
     if str(v215_webhook_url or "").strip() or v215_enable_gsheet or v215_auto_sync:
         save_v215_gsheet_config(v215_webhook_url, v215_enable_gsheet, v215_auto_sync)
 
-    st.caption(f"即時行情：約每 {live_tick_seconds} 秒只跳數字；AI整頁重算：{(str(refresh_seconds) + ' 秒') if ai_rerun_enabled else '關閉'}；自動同步：{'已開啟' if v215_auto_sync and v215_enable_gsheet else '未開啟'}")
+    st.caption(f"即時行情：約每 {live_tick_seconds} 秒只跳數字；AI局部刷新：{(str(refresh_seconds) + ' 秒') if ai_rerun_enabled else '關閉'}；自動同步：{'已開啟' if v215_auto_sync and v215_enable_gsheet else '未開啟'}")
     _sync_status_sidebar = latest_v215_sync_status()
     st.caption(f"最後同步：{_sync_status_sidebar.get('time', '-')}｜{_sync_status_sidebar.get('status', '-') }｜{_sync_status_sidebar.get('rows', 0)} 筆")
     if st.button("儲存 Google Sheet 設定", type="secondary", key="v215_save_gsheet_config_btn"):
@@ -6294,329 +6294,336 @@ _set_query_if_changed({
 })
 
 if ai_rerun_enabled:
-    components.html(
-        f"""
-        <script>
-          setTimeout(function() {{ window.parent.location.reload(); }}, {int(refresh_seconds) * 1000});
-        </script>
-        """,
-        height=0,
-    )
-
-rank_df = load_rank()
-with st.spinner("建立盤中掃描清單並抓取即時報價..."):
-    universe_df, universe_source = build_live_universe(rank_df, scan_mode, pool_size, tracked_codes)
-    symbols = build_symbols(universe_df)
-    quotes_df = fetch_twse_mis_quotes(symbols)
-
-# v2.12.1: temporary quote outages should not make the whole page show 0/0.
-# Prefer fresh MIS quotes; otherwise reuse the last in-session quote snapshot, then fall back to data/intraday_snapshot.csv if present.
-quote_source_note = "MIS即時報價"
-if quotes_df.empty or "盤中現價" not in quotes_df.columns or pd.to_numeric(quotes_df.get("盤中現價"), errors="coerce").notna().sum() == 0:
-    fallback_df = st.session_state.get("v212_last_good_quotes_df")
-    if isinstance(fallback_df, pd.DataFrame) and not fallback_df.empty:
-        quotes_df = fallback_df.copy()
-        quote_source_note = "沿用上一輪成功報價"
+    if hasattr(st, "fragment"):
+        st.info(f"AI 決策局部刷新已啟用：每 {int(refresh_seconds)} 秒只重算決策區，不刷新整頁。")
     else:
-        snap_path = DATA_DIR / "intraday_snapshot.csv"
-        if snap_path.exists():
-            try:
-                snap = pd.read_csv(snap_path)
-                if "代號" in snap.columns:
-                    snap["代號"] = snap["代號"].astype(str).str.replace(".0", "", regex=False).str.zfill(4)
-                    quotes_df = snap.copy()
-                    quote_source_note = "沿用 GitHub 盤中快照"
-            except Exception:
-                pass
-else:
-    st.session_state["v212_last_good_quotes_df"] = quotes_df.copy()
+        st.warning("目前 Streamlit 版本不支援 st.fragment 局部刷新；為避免整頁閃爍，已停用整頁自動重整，請用手動重新整理。")
 
-merged = universe_df.copy()
-if quotes_df.empty:
-    st.warning("目前沒有抓到盤中報價。可能是非交易時間、TWSE MIS 暫時無回應，或網路限制。")
-    for col in ["盤中現價", "盤中漲跌幅", "盤中成交量", "報價時間", "報價市場", "昨收", "開盤", "最高", "最低"]:
-        merged[col] = np.nan
-else:
-    merged = merged.merge(quotes_df, on="代號", how="left")
-    if "即時名稱" in merged.columns:
-        # Do not let MIS numeric/blank names overwrite valid market-pool or AI names.
-        merged["名稱"] = [
-            _stock_display_name(c, qn if not _is_bad_stock_name(qn, c) else old_name)
-            for c, qn, old_name in zip(merged["代號"], merged["即時名稱"], merged["名稱"])
-        ]
-    if "報價市場" in merged.columns:
-        merged["市場"] = merged["報價市場"].fillna(merged["市場"])
-    merged = normalize_stock_identity(merged)
-    if quote_source_note != "MIS即時報價":
-        st.info(f"本輪 MIS 即時報價沒有成功，已{quote_source_note}，避免決策表歸零；等下一輪即時報價恢復會自動更新。")
 
-# Core calculation chain retained, but UI no longer repeats every old section.
-live_df = compute_live_strength(merged, attack_threshold, watch_threshold, weak_drop, chase_pct)
-live_df = add_entry_timing(live_df, chase_pct=chase_pct)
-live_df, surge_df, surge_has_prev = update_surge_radar(live_df)
-live_df = add_decision_dashboard(live_df)
-live_df = add_limitup_reattack_engine(live_df, chase_pct=chase_pct)
-live_df = add_v281_three_zone_entry(live_df)
-live_df = add_entry_signal_layer(live_df, chase_pct=chase_pct)
-live_df = apply_v28_entry_signal_overrides(live_df)
-live_df, intraday_memory_df = update_intraday_memory_features(live_df)
-live_df = add_v29_left_predictive_ai(live_df, chase_pct=chase_pct)
-live_df = add_v210_trader_decision(live_df, chase_pct=chase_pct)
-live_df = add_v220_multifactor_decision(live_df, v216_context)
-v221_news_context = build_v221_news_context(live_df)
-live_df = add_v221_news_event_decision(live_df, v221_news_context)
-live_df = add_v222_event_quality_decision(live_df, v221_news_context)
-live_df = add_v223_consistency_decision(live_df, v216_context)
-live_df = add_v231_limitup_collection_features(live_df, v216_context)
-v231_current_samples_df = save_v231_limitup_feature_samples(live_df)
+# v2.23.5: AI 決策區改用 Streamlit fragment 局部刷新。
+# 這會讓下方決策表定期重算，但不再用 window.location.reload() 造成整頁刷新。
+def _render_v235_ai_decision_region():
+    v216_context = load_v216_context()
+    rank_df = load_rank()
+    with st.spinner("建立盤中掃描清單並抓取即時報價..."):
+        universe_df, universe_source = build_live_universe(rank_df, scan_mode, pool_size, tracked_codes)
+        symbols = build_symbols(universe_df)
+        quotes_df = fetch_twse_mis_quotes(symbols)
 
-# v2.23 realtime AI-selected ticker is rendered after MIS quote merge so 廣達/華通/台積電 have backend prices first.
-render_v220_realtime_ai_ticker_panel(live_df, v216_context, tick_seconds=live_tick_seconds)
-render_v223_consistency_cockpit(live_df, v216_context, top_n=top_n)
-render_v223_focus(live_df, top_n=max(top_n, 12))
-render_v231_data_quality_and_limitup_collector(live_df, v216_context, v231_current_samples_df)
-with st.expander("🧪 事件 / 多因子原始分數", expanded=False):
-    render_v222_event_quality_cockpit(live_df, v221_news_context, top_n=top_n)
-    render_v220_multifactor_cockpit(live_df, top_n=top_n)
-st.divider()
+    # v2.12.1: temporary quote outages should not make the whole page show 0/0.
+    # Prefer fresh MIS quotes; otherwise reuse the last in-session quote snapshot, then fall back to data/intraday_snapshot.csv if present.
+    quote_source_note = "MIS即時報價"
+    if quotes_df.empty or "盤中現價" not in quotes_df.columns or pd.to_numeric(quotes_df.get("盤中現價"), errors="coerce").notna().sum() == 0:
+        fallback_df = st.session_state.get("v212_last_good_quotes_df")
+        if isinstance(fallback_df, pd.DataFrame) and not fallback_df.empty:
+            quotes_df = fallback_df.copy()
+            quote_source_note = "沿用上一輪成功報價"
+        else:
+            snap_path = DATA_DIR / "intraday_snapshot.csv"
+            if snap_path.exists():
+                try:
+                    snap = pd.read_csv(snap_path)
+                    if "代號" in snap.columns:
+                        snap["代號"] = snap["代號"].astype(str).str.replace(".0", "", regex=False).str.zfill(4)
+                        quotes_df = snap.copy()
+                        quote_source_note = "沿用 GitHub 盤中快照"
+                except Exception:
+                    pass
+    else:
+        st.session_state["v212_last_good_quotes_df"] = quotes_df.copy()
 
-# v2.11 stable learning + v2.12 lifecycle state machine.
-v211_learning_log_df = update_v211_signal_learning(live_df)
-v211_missed_limit_df = build_v211_missed_limit_report(live_df, v211_learning_log_df)
-v211_summary = build_v211_learning_summary(v211_learning_log_df)
-lifecycle_df = build_v212_lifecycle(live_df, v211_learning_log_df)
-lifecycle_df = _ensure_columns(lifecycle_df, {
-    "v212優先級": 99,
-    "v212排序分": 0.0,
-    "即時強度分": 0.0,
-    "最新時間": "",
-    "學習狀態": "",
-    "v212生命週期狀態": "⚪ 候選觀察",
-    "v212目前決策": "等待",
-    "v212位置判斷": "未判斷",
-    "v212下一步": "等待下一輪刷新。",
-})
+    merged = universe_df.copy()
+    if quotes_df.empty:
+        st.warning("目前沒有抓到盤中報價。可能是非交易時間、TWSE MIS 暫時無回應，或網路限制。")
+        for col in ["盤中現價", "盤中漲跌幅", "盤中成交量", "報價時間", "報價市場", "昨收", "開盤", "最高", "最低"]:
+            merged[col] = np.nan
+    else:
+        merged = merged.merge(quotes_df, on="代號", how="left")
+        if "即時名稱" in merged.columns:
+            # Do not let MIS numeric/blank names overwrite valid market-pool or AI names.
+            merged["名稱"] = [
+                _stock_display_name(c, qn if not _is_bad_stock_name(qn, c) else old_name)
+                for c, qn, old_name in zip(merged["代號"], merged["即時名稱"], merged["名稱"])
+            ]
+        if "報價市場" in merged.columns:
+            merged["市場"] = merged["報價市場"].fillna(merged["市場"])
+        merged = normalize_stock_identity(merged)
+        if quote_source_note != "MIS即時報價":
+            st.info(f"本輪 MIS 即時報價沒有成功，已{quote_source_note}，避免決策表歸零；等下一輪即時報價恢復會自動更新。")
 
-# v2.13 / v2.14: write a robust journal, then use it for conservative auto-weighting.
-v213_signal_journal_df = update_v213_signal_journal(lifecycle_df)
-v214_weight_profile = build_v214_weight_profile(v213_signal_journal_df)
-lifecycle_df = apply_v214_auto_weights(lifecycle_df, v214_weight_profile)
-lifecycle_df = apply_v216_market_adjustment(lifecycle_df, v216_context)
-lifecycle_df = add_v219_right_entry_signal(lifecycle_df)
-lifecycle_df = add_v223_consistency_decision(lifecycle_df, v216_context)
-lifecycle_df = normalize_stock_identity(lifecycle_df)
-lifecycle_df = add_v231_limitup_collection_features(lifecycle_df, v216_context)
-v213_summary = build_v213_journal_summary(v213_signal_journal_df)
-v215_current_verified_df = build_v215_postclose_verification(v213_signal_journal_df, lifecycle_df)
-v215_existing_verified_df = _v215_load_verified_journal()
-v215_verified_journal_df = _v215_merge_verified_journals(v215_existing_verified_df, v215_current_verified_df)
-_v215_save_verified_journal(v215_verified_journal_df)
-v215_stats = build_v215_stats(v215_verified_journal_df)
+    # Core calculation chain retained, but UI no longer repeats every old section.
+    live_df = compute_live_strength(merged, attack_threshold, watch_threshold, weak_drop, chase_pct)
+    live_df = add_entry_timing(live_df, chase_pct=chase_pct)
+    live_df, surge_df, surge_has_prev = update_surge_radar(live_df)
+    live_df = add_decision_dashboard(live_df)
+    live_df = add_limitup_reattack_engine(live_df, chase_pct=chase_pct)
+    live_df = add_v281_three_zone_entry(live_df)
+    live_df = add_entry_signal_layer(live_df, chase_pct=chase_pct)
+    live_df = apply_v28_entry_signal_overrides(live_df)
+    live_df, intraday_memory_df = update_intraday_memory_features(live_df)
+    live_df = add_v29_left_predictive_ai(live_df, chase_pct=chase_pct)
+    live_df = add_v210_trader_decision(live_df, chase_pct=chase_pct)
+    live_df = add_v220_multifactor_decision(live_df, v216_context)
+    v221_news_context = build_v221_news_context(live_df)
+    live_df = add_v221_news_event_decision(live_df, v221_news_context)
+    live_df = add_v222_event_quality_decision(live_df, v221_news_context)
+    live_df = add_v223_consistency_decision(live_df, v216_context)
+    live_df = add_v231_limitup_collection_features(live_df, v216_context)
+    v231_current_samples_df = save_v231_limitup_feature_samples(live_df)
 
-if "v215_enable_gsheet" in globals() and v215_enable_gsheet and v215_auto_sync:
-    # Auto-sync only the latest rows to reduce repeated traffic. The webhook should upsert by 驗證Key.
-    try:
-        if str(v215_webhook_url or "").strip():
-            push_v215_to_google_sheet(v215_verified_journal_df.tail(60), v215_webhook_url, max_rows=60, chunk_size=20)
-    except Exception:
-        pass
+    # v2.23 realtime AI-selected ticker is rendered after MIS quote merge so 廣達/華通/台積電 have backend prices first.
+    render_v220_realtime_ai_ticker_panel(live_df, v216_context, tick_seconds=live_tick_seconds)
+    render_v223_consistency_cockpit(live_df, v216_context, top_n=top_n)
+    render_v223_focus(live_df, top_n=max(top_n, 12))
+    render_v231_data_quality_and_limitup_collector(live_df, v216_context, v231_current_samples_df)
+    with st.expander("🧪 事件 / 多因子原始分數", expanded=False):
+        render_v222_event_quality_cockpit(live_df, v221_news_context, top_n=top_n)
+        render_v220_multifactor_cockpit(live_df, top_n=top_n)
+    st.divider()
 
-if "手動加入" in lifecycle_df.columns:
-    lifecycle_df["加入來源"] = np.where(lifecycle_df["手動加入"].astype(bool), "手動監控", "自動掃描")
-else:
-    lifecycle_df["加入來源"] = "自動掃描"
+    # v2.11 stable learning + v2.12 lifecycle state machine.
+    v211_learning_log_df = update_v211_signal_learning(live_df)
+    v211_missed_limit_df = build_v211_missed_limit_report(live_df, v211_learning_log_df)
+    v211_summary = build_v211_learning_summary(v211_learning_log_df)
+    lifecycle_df = build_v212_lifecycle(live_df, v211_learning_log_df)
+    lifecycle_df = _ensure_columns(lifecycle_df, {
+        "v212優先級": 99,
+        "v212排序分": 0.0,
+        "即時強度分": 0.0,
+        "最新時間": "",
+        "學習狀態": "",
+        "v212生命週期狀態": "⚪ 候選觀察",
+        "v212目前決策": "等待",
+        "v212位置判斷": "未判斷",
+        "v212下一步": "等待下一輪刷新。",
+    })
 
-filtered = lifecycle_df[(lifecycle_df["AI總分"] >= min_ai) & (lifecycle_df["即時強度分"] >= min_strength)].copy()
+    # v2.13 / v2.14: write a robust journal, then use it for conservative auto-weighting.
+    v213_signal_journal_df = update_v213_signal_journal(lifecycle_df)
+    v214_weight_profile = build_v214_weight_profile(v213_signal_journal_df)
+    lifecycle_df = apply_v214_auto_weights(lifecycle_df, v214_weight_profile)
+    lifecycle_df = apply_v216_market_adjustment(lifecycle_df, v216_context)
+    lifecycle_df = add_v219_right_entry_signal(lifecycle_df)
+    lifecycle_df = add_v223_consistency_decision(lifecycle_df, v216_context)
+    lifecycle_df = normalize_stock_identity(lifecycle_df)
+    lifecycle_df = add_v231_limitup_collection_features(lifecycle_df, v216_context)
+    v213_summary = build_v213_journal_summary(v213_signal_journal_df)
+    v215_current_verified_df = build_v215_postclose_verification(v213_signal_journal_df, lifecycle_df)
+    v215_existing_verified_df = _v215_load_verified_journal()
+    v215_verified_journal_df = _v215_merge_verified_journals(v215_existing_verified_df, v215_current_verified_df)
+    _v215_save_verified_journal(v215_verified_journal_df)
+    v215_stats = build_v215_stats(v215_verified_journal_df)
 
-# Minimal, non-redundant summary.
-quote_ok = int(lifecycle_df["盤中現價"].notna().sum())
-can_try = int(lifecycle_df.get("v212生命週期狀態", pd.Series(dtype=str)).astype(str).str.contains("可試單|到價確認", regex=True).sum())
-arrived_wait = int(lifecycle_df.get("v212生命週期狀態", pd.Series(dtype=str)).astype(str).str.contains("到價等確認", regex=False).sum())
-early_count = int(lifecycle_df.get("v212生命週期狀態", pd.Series(dtype=str)).astype(str).str.contains("前兆|候選升溫", regex=True).sum())
-no_buy_count = int(lifecycle_df.get("v212生命週期狀態", pd.Series(dtype=str)).astype(str).str.contains("不買|錯過|取消", regex=True).sum())
-surge_count = int(len(surge_df)) if "surge_df" in globals() else 0
-best_pct = float(lifecycle_df["盤中漲跌幅"].max()) if len(lifecycle_df) else 0.0
-max_speed = float(pd.to_numeric(lifecycle_df.get("刷新漲速%", 0), errors="coerce").fillna(0).max()) if len(lifecycle_df) else 0.0
+    if "v215_enable_gsheet" in globals() and v215_enable_gsheet and v215_auto_sync:
+        # Auto-sync only the latest rows to reduce repeated traffic. The webhook should upsert by 驗證Key.
+        try:
+            if str(v215_webhook_url or "").strip():
+                push_v215_to_google_sheet(v215_verified_journal_df.tail(60), v215_webhook_url, max_rows=60, chunk_size=20)
+        except Exception:
+            pass
 
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("掃描 / 報價", f"{len(universe_df)} / {quote_ok}")
-m2.metric("可試單 / 到價等確認", f"{can_try} / {arrived_wait}")
-m3.metric("前兆 / 風險不買", f"{early_count} / {no_buy_count}")
-m4.metric("最後刷新", now_taipei().strftime("%H:%M:%S"))
+    if "手動加入" in lifecycle_df.columns:
+        lifecycle_df["加入來源"] = np.where(lifecycle_df["手動加入"].astype(bool), "手動監控", "自動掃描")
+    else:
+        lifecycle_df["加入來源"] = "自動掃描"
 
-m5, m6, m7, m8 = st.columns(4)
-m5.metric("盤中最強漲幅", f"{best_pct:.2f}%")
-m6.metric("最高刷新漲速", f"{max_speed:.2f}%")
-m7.metric("爆衝雷達", surge_count)
-m8.metric("學習紀錄 / 驗證", f"{int(v213_summary.get("total", 0))} / {int(v215_stats.get("verified", 0))}")
+    filtered = lifecycle_df[(lifecycle_df["AI總分"] >= min_ai) & (lifecycle_df["即時強度分"] >= min_strength)].copy()
 
-st.divider()
+    # Minimal, non-redundant summary.
+    quote_ok = int(lifecycle_df["盤中現價"].notna().sum())
+    can_try = int(lifecycle_df.get("v212生命週期狀態", pd.Series(dtype=str)).astype(str).str.contains("可試單|到價確認", regex=True).sum())
+    arrived_wait = int(lifecycle_df.get("v212生命週期狀態", pd.Series(dtype=str)).astype(str).str.contains("到價等確認", regex=False).sum())
+    early_count = int(lifecycle_df.get("v212生命週期狀態", pd.Series(dtype=str)).astype(str).str.contains("前兆|候選升溫", regex=True).sum())
+    no_buy_count = int(lifecycle_df.get("v212生命週期狀態", pd.Series(dtype=str)).astype(str).str.contains("不買|錯過|取消", regex=True).sum())
+    surge_count = int(len(surge_df)) if "surge_df" in globals() else 0
+    best_pct = float(lifecycle_df["盤中漲跌幅"].max()) if len(lifecycle_df) else 0.0
+    max_speed = float(pd.to_numeric(lifecycle_df.get("刷新漲速%", 0), errors="coerce").fillna(0).max()) if len(lifecycle_df) else 0.0
 
-render_v219_realtime_alert_panel(lifecycle_df, tick_seconds=live_tick_seconds if "live_tick_seconds" in globals() else tick_default, max_targets=max(top_n, 24) if "top_n" in globals() else 24)
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("掃描 / 報價", f"{len(universe_df)} / {quote_ok}")
+    m2.metric("可試單 / 到價等確認", f"{can_try} / {arrived_wait}")
+    m3.metric("前兆 / 風險不買", f"{early_count} / {no_buy_count}")
+    m4.metric("最後刷新", now_taipei().strftime("%H:%M:%S"))
 
-st.subheader("🧬 v2.15.6 真永久學習資料庫 + 盤後驗證器｜學習勝率修正版")
-st.caption("目前會先把驗證後訊號寫到 data/v215_verified_signal_journal.csv；若設定 Google Sheet Webhook，可手動或自動同步到 Google Sheet。v2.15.6 起，學習勝率以盤後驗證結果為主，避免顯示 0% 的舊版誤導。")
-vm1, vm2, vm3, vm4 = st.columns(4)
-vm1.metric("驗證樣本", int(v215_stats.get("verified", 0)))
-vm2.metric("驗證勝率", f"{float(v215_stats.get('win_rate', 0)):.1f}%")
-vm3.metric("平均驗證報酬", f"{float(v215_stats.get('avg_ret', 0)):.2f}%")
-vm4.metric("接近漲停/大漲", int(v215_stats.get("near_limit", 0)))
-vm5, vm6 = st.columns(2)
-vm5.info(f"目前較有效型態：{_safe_text(v215_stats.get('best_type'), '樣本不足')}")
-vm6.warning(f"目前較弱型態：{_safe_text(v215_stats.get('weak_type'), '樣本不足')}")
+    m5, m6, m7, m8 = st.columns(4)
+    m5.metric("盤中最強漲幅", f"{best_pct:.2f}%")
+    m6.metric("最高刷新漲速", f"{max_speed:.2f}%")
+    m7.metric("爆衝雷達", surge_count)
+    m8.metric("學習紀錄 / 驗證", f"{int(v213_summary.get("total", 0))} / {int(v215_stats.get("verified", 0))}")
 
-# v2.15.2: Sync status is always visible, so the user does not need to guess whether it is working.
-st.markdown("#### 🔁 Google Sheet 同步狀態")
-sync_status = latest_v215_sync_status()
-sm1, sm2, sm3, sm4 = st.columns(4)
-sm1.metric("同步開關", "開啟" if ('v215_enable_gsheet' in globals() and v215_enable_gsheet) else "關閉")
-sm2.metric("自動同步", "開啟" if ('v215_auto_sync' in globals() and v215_auto_sync and v215_enable_gsheet) else "關閉")
-sm3.metric("最後同步", _safe_text(sync_status.get("time"), "-"))
-sm4.metric("最後筆數", sync_status.get("rows", 0))
+    st.divider()
 
-if 'v215_enable_gsheet' in globals() and v215_enable_gsheet:
-    c_sync, c_log = st.columns([1, 2])
-    with c_sync:
-        if st.button("立即同步到 Google Sheet", type="primary"):
-            ok, msg = push_v215_to_google_sheet(v215_verified_journal_df, v215_webhook_url, max_rows=200, chunk_size=20)
-            if ok:
-                st.success("已送出 Google Sheet 同步。")
+    render_v219_realtime_alert_panel(lifecycle_df, tick_seconds=live_tick_seconds if "live_tick_seconds" in globals() else tick_default, max_targets=max(top_n, 24) if "top_n" in globals() else 24)
+
+    st.subheader("🧬 v2.15.6 真永久學習資料庫 + 盤後驗證器｜學習勝率修正版")
+    st.caption("目前會先把驗證後訊號寫到 data/v215_verified_signal_journal.csv；若設定 Google Sheet Webhook，可手動或自動同步到 Google Sheet。v2.15.6 起，學習勝率以盤後驗證結果為主，避免顯示 0% 的舊版誤導。")
+    vm1, vm2, vm3, vm4 = st.columns(4)
+    vm1.metric("驗證樣本", int(v215_stats.get("verified", 0)))
+    vm2.metric("驗證勝率", f"{float(v215_stats.get('win_rate', 0)):.1f}%")
+    vm3.metric("平均驗證報酬", f"{float(v215_stats.get('avg_ret', 0)):.2f}%")
+    vm4.metric("接近漲停/大漲", int(v215_stats.get("near_limit", 0)))
+    vm5, vm6 = st.columns(2)
+    vm5.info(f"目前較有效型態：{_safe_text(v215_stats.get('best_type'), '樣本不足')}")
+    vm6.warning(f"目前較弱型態：{_safe_text(v215_stats.get('weak_type'), '樣本不足')}")
+
+    # v2.15.2: Sync status is always visible, so the user does not need to guess whether it is working.
+    st.markdown("#### 🔁 Google Sheet 同步狀態")
+    sync_status = latest_v215_sync_status()
+    sm1, sm2, sm3, sm4 = st.columns(4)
+    sm1.metric("同步開關", "開啟" if ('v215_enable_gsheet' in globals() and v215_enable_gsheet) else "關閉")
+    sm2.metric("自動同步", "開啟" if ('v215_auto_sync' in globals() and v215_auto_sync and v215_enable_gsheet) else "關閉")
+    sm3.metric("最後同步", _safe_text(sync_status.get("time"), "-"))
+    sm4.metric("最後筆數", sync_status.get("rows", 0))
+
+    if 'v215_enable_gsheet' in globals() and v215_enable_gsheet:
+        c_sync, c_log = st.columns([1, 2])
+        with c_sync:
+            if st.button("立即同步到 Google Sheet", type="primary"):
+                ok, msg = push_v215_to_google_sheet(v215_verified_journal_df, v215_webhook_url, max_rows=200, chunk_size=20)
+                if ok:
+                    st.success("已送出 Google Sheet 同步。")
+                else:
+                    st.error("同步失敗：" + msg)
+        with c_log:
+            sync_log = load_v215_sync_log()
+            if not sync_log.empty:
+                st.caption("最近同步紀錄")
+                st.dataframe(sync_log.tail(5), use_container_width=True, hide_index=True)
             else:
-                st.error("同步失敗：" + msg)
-    with c_log:
-        sync_log = load_v215_sync_log()
-        if not sync_log.empty:
-            st.caption("最近同步紀錄")
-            st.dataframe(sync_log.tail(5), use_container_width=True, hide_index=True)
-        else:
-            st.caption("尚未有同步紀錄。")
-else:
-    st.info("尚未啟用 Google Sheet 同步；目前仍會保留本機 CSV，並可在下方下載。")
+                st.caption("尚未有同步紀錄。")
+    else:
+        st.info("尚未啟用 Google Sheet 同步；目前仍會保留本機 CSV，並可在下方下載。")
 
-# v2.14 compact weight-learning status.
-st.subheader("🧠 v2.14 / v2.15 自動調權狀態")
-wm1, wm2, wm3, wm4 = st.columns(4)
-sample_size = int(v214_weight_profile.get("sample_size", 0))
-verified_n = int(v215_stats.get("verified", 0))
-learning_ready = "資料不足" if sample_size < 30 or verified_n < 30 else "可開始參考"
-# v2.15.6: show the real post-close/verified win rate once verification samples are mature.
-# The old v2.14 success_rate can stay 0 when local runtime fields are not populated, which misleads the user.
-verified_win_rate = float(v215_stats.get('win_rate', 0) or 0)
-local_win_rate = float(v214_weight_profile.get('success_rate', 0) or 0)
-learning_win_rate_display = verified_win_rate if verified_n >= 30 else local_win_rate
-wm1.metric("學習樣本", f"{sample_size} / 30")
-wm2.metric("驗證樣本", f"{verified_n} / 30")
-wm3.metric("學習勝率", f"{learning_win_rate_display:.1f}%")
-wm4.metric("學習成熟度", learning_ready)
-wm5, wm6 = st.columns(2)
-wm5.metric("左側/資金權重", f"{float(v214_weight_profile.get('left_weight', 1)):.2f} / {float(v214_weight_profile.get('money_weight', 1)):.2f}")
-wm6.metric("前兆/風險權重", f"{float(v214_weight_profile.get('limit_weight', 1)):.2f} / {float(v214_weight_profile.get('risk_penalty', 1)):.2f}")
-st.caption(_safe_text(v214_weight_profile.get("confidence"), "") + "｜" + _safe_text(v214_weight_profile.get("note"), ""))
-if verified_n >= 30:
-    st.info("v2.15.6：學習勝率已改用盤後驗證樣本計算；有效上漲、小幅有效、接近漲停/大漲都會被納入，不再只看舊版 ✅ 標籤。")
-else:
-    st.warning("學習勝率不是每輪即時變動的『學習率』；要等盤後驗證樣本累積後才有意義。最高只會顯示 🟢 高信心小量，仍必須照防守停損執行。")
+    # v2.14 compact weight-learning status.
+    st.subheader("🧠 v2.14 / v2.15 自動調權狀態")
+    wm1, wm2, wm3, wm4 = st.columns(4)
+    sample_size = int(v214_weight_profile.get("sample_size", 0))
+    verified_n = int(v215_stats.get("verified", 0))
+    learning_ready = "資料不足" if sample_size < 30 or verified_n < 30 else "可開始參考"
+    # v2.15.6: show the real post-close/verified win rate once verification samples are mature.
+    # The old v2.14 success_rate can stay 0 when local runtime fields are not populated, which misleads the user.
+    verified_win_rate = float(v215_stats.get('win_rate', 0) or 0)
+    local_win_rate = float(v214_weight_profile.get('success_rate', 0) or 0)
+    learning_win_rate_display = verified_win_rate if verified_n >= 30 else local_win_rate
+    wm1.metric("學習樣本", f"{sample_size} / 30")
+    wm2.metric("驗證樣本", f"{verified_n} / 30")
+    wm3.metric("學習勝率", f"{learning_win_rate_display:.1f}%")
+    wm4.metric("學習成熟度", learning_ready)
+    wm5, wm6 = st.columns(2)
+    wm5.metric("左側/資金權重", f"{float(v214_weight_profile.get('left_weight', 1)):.2f} / {float(v214_weight_profile.get('money_weight', 1)):.2f}")
+    wm6.metric("前兆/風險權重", f"{float(v214_weight_profile.get('limit_weight', 1)):.2f} / {float(v214_weight_profile.get('risk_penalty', 1)):.2f}")
+    st.caption(_safe_text(v214_weight_profile.get("confidence"), "") + "｜" + _safe_text(v214_weight_profile.get("note"), ""))
+    if verified_n >= 30:
+        st.info("v2.15.6：學習勝率已改用盤後驗證樣本計算；有效上漲、小幅有效、接近漲停/大漲都會被納入，不再只看舊版 ✅ 標籤。")
+    else:
+        st.warning("學習勝率不是每輪即時變動的『學習率』；要等盤後驗證樣本累積後才有意義。最高只會顯示 🟢 高信心小量，仍必須照防守停損執行。")
 
-# 1) Primary current decision table.
-st.subheader("🧭 v2.23 最終進場決策｜一致性主表")
-st.caption("主表只顯示最終訊號與必要價格。若要看新聞、生命週期、Google Sheet、全部明細，請打開下方進階診斷。")
-main_cols = _cols_exist(lifecycle_df, [
-    "代號", "名稱", "市場", "產業", "交易型態", "v223最終訊號", "v223買賣結論", "v223最終分", "v223風險層級", "v223技術狀態", "v223籌碼確認", "v223事件修正", "v223大盤修正", "v223下一步", "v219右側精準進場", "v219右側判斷原因", "v216調整後決策", "v216環境修正", "v216大盤環境", "v216夜盤風險", "v214信心閘門", "v212生命週期狀態", "v212目前決策", "我會不會買",
-    "第一買點", "盤中現價", "v214停損距離%", "v212位置判斷", "防守停損", "右側加碼價", "追價上限",
-    "盤中漲跌幅", "刷新漲速%", "v214調權後分", "左側低吸分", "盤中資金分", "v29漲停前兆分", "v210決策分",
-    "v214下一步", "v212下一步", "還缺什麼確認", "不能買原因", "資料來源", "AI來源", "報價時間"
-])
-filtered = normalize_stock_identity(filtered)
-main_df = _safe_sort(filtered, ["v223優先級", "v223最終分", "v212優先級", "即時強度分"], ascending=[True, False, True, False]).head(top_n)
-if main_df.empty:
-    st.info("目前沒有符合篩選條件的股票。可以降低左側篩選的 AI / 即時強度門檻，或等待下一輪刷新。")
-else:
-    try:
-        st.dataframe(main_df[main_cols].style.applymap(_v212_style_signal, subset=[c for c in ["v223最終訊號", "v223風險層級", "v219右側精準進場", "v216調整後決策", "v214信心閘門", "v212生命週期狀態"] if c in main_df.columns]), use_container_width=True, hide_index=True)
-    except Exception:
-        st.dataframe(main_df[main_cols], use_container_width=True, hide_index=True)
+    # 1) Primary current decision table.
+    st.subheader("🧭 v2.23 最終進場決策｜一致性主表")
+    st.caption("主表只顯示最終訊號與必要價格。若要看新聞、生命週期、Google Sheet、全部明細，請打開下方進階診斷。")
+    main_cols = _cols_exist(lifecycle_df, [
+        "代號", "名稱", "市場", "產業", "交易型態", "v223最終訊號", "v223買賣結論", "v223最終分", "v223風險層級", "v223技術狀態", "v223籌碼確認", "v223事件修正", "v223大盤修正", "v223下一步", "v219右側精準進場", "v219右側判斷原因", "v216調整後決策", "v216環境修正", "v216大盤環境", "v216夜盤風險", "v214信心閘門", "v212生命週期狀態", "v212目前決策", "我會不會買",
+        "第一買點", "盤中現價", "v214停損距離%", "v212位置判斷", "防守停損", "右側加碼價", "追價上限",
+        "盤中漲跌幅", "刷新漲速%", "v214調權後分", "左側低吸分", "盤中資金分", "v29漲停前兆分", "v210決策分",
+        "v214下一步", "v212下一步", "還缺什麼確認", "不能買原因", "資料來源", "AI來源", "報價時間"
+    ])
+    filtered = normalize_stock_identity(filtered)
+    main_df = _safe_sort(filtered, ["v223優先級", "v223最終分", "v212優先級", "即時強度分"], ascending=[True, False, True, False]).head(top_n)
+    if main_df.empty:
+        st.info("目前沒有符合篩選條件的股票。可以降低左側篩選的 AI / 即時強度門檻，或等待下一輪刷新。")
+    else:
+        try:
+            st.dataframe(main_df[main_cols].style.applymap(_v212_style_signal, subset=[c for c in ["v223最終訊號", "v223風險層級", "v219右側精準進場", "v216調整後決策", "v214信心閘門", "v212生命週期狀態"] if c in main_df.columns]), use_container_width=True, hide_index=True)
+        except Exception:
+            st.dataframe(main_df[main_cols], use_container_width=True, hide_index=True)
 
-# 2) Focus names.
-st.subheader("🎯 核心追蹤：聯一光 / 廣達 / 華通")
-focus_df = lifecycle_df[lifecycle_df["代號"].astype(str).str.zfill(4).isin(FOCUS_CODES)].copy()
-focus_df["焦點排序"] = focus_df["代號"].map({"3441": 1, "2382": 2, "2313": 3}).fillna(9)
-focus_df = focus_df.sort_values("焦點排序")
-focus_cols = _cols_exist(focus_df, [
-    "代號", "名稱", "v219右側精準進場", "v219右側判斷原因", "v216調整後決策", "v216環境修正", "v214信心閘門", "v212生命週期狀態", "v212目前決策", "第一買點", "盤中現價", "v214停損距離%", "防守停損", "右側加碼價", "追價上限",
-    "v212位置判斷", "盤中漲跌幅", "刷新漲速%", "回檔幅度%", "v214調權後分", "左側低吸分", "盤中資金分", "v29漲停前兆分", "v214下一步", "v212下一步", "還缺什麼確認", "報價時間"
-])
-if focus_df.empty:
-    st.warning("目前沒有抓到 3441 / 2382 / 2313 的報價。")
-else:
-    st.dataframe(focus_df[focus_cols], use_container_width=True, hide_index=True)
+    # 2) Focus names.
+    st.subheader("🎯 核心追蹤：聯一光 / 廣達 / 華通")
+    focus_df = lifecycle_df[lifecycle_df["代號"].astype(str).str.zfill(4).isin(FOCUS_CODES)].copy()
+    focus_df["焦點排序"] = focus_df["代號"].map({"3441": 1, "2382": 2, "2313": 3}).fillna(9)
+    focus_df = focus_df.sort_values("焦點排序")
+    focus_cols = _cols_exist(focus_df, [
+        "代號", "名稱", "v219右側精準進場", "v219右側判斷原因", "v216調整後決策", "v216環境修正", "v214信心閘門", "v212生命週期狀態", "v212目前決策", "第一買點", "盤中現價", "v214停損距離%", "防守停損", "右側加碼價", "追價上限",
+        "v212位置判斷", "盤中漲跌幅", "刷新漲速%", "回檔幅度%", "v214調權後分", "左側低吸分", "盤中資金分", "v29漲停前兆分", "v214下一步", "v212下一步", "還缺什麼確認", "報價時間"
+    ])
+    if focus_df.empty:
+        st.warning("目前沒有抓到 3441 / 2382 / 2313 的報價。")
+    else:
+        st.dataframe(focus_df[focus_cols], use_container_width=True, hide_index=True)
 
-# 3) Lifecycle learning/tracking.
-st.subheader("🔄 訊號生命週期追蹤")
-st.caption("同一檔股票每天只保留一個目前狀態，歷程放在『訊號歷程』；不再同時顯示互相矛盾的可買/不買訊號。")
-life_cols = _cols_exist(lifecycle_df, [
-    "代號", "名稱", "v212生命週期狀態", "交易員訊號", "首次時間", "首次價格", "目前價格", "目前報酬%", "最高報酬%", "最大回撤%",
-    "學習狀態", "訊號歷程", "訊號變更次數", "錯誤歸因", "v212下一步", "最新時間"
-])
-life_df = lifecycle_df[~lifecycle_df.get("學習狀態", pd.Series(index=lifecycle_df.index, dtype=str)).isna()].copy()
-life_df = _safe_sort(life_df, ["v212優先級", "最新時間"], ascending=[True, False]).head(top_n)
-if life_df.empty:
-    st.info("目前尚未累積生命週期追蹤資料。等待訊號出現後會開始記錄。")
-else:
-    st.dataframe(life_df[life_cols], use_container_width=True, hide_index=True)
+    # 3) Lifecycle learning/tracking.
+    st.subheader("🔄 訊號生命週期追蹤")
+    st.caption("同一檔股票每天只保留一個目前狀態，歷程放在『訊號歷程』；不再同時顯示互相矛盾的可買/不買訊號。")
+    life_cols = _cols_exist(lifecycle_df, [
+        "代號", "名稱", "v212生命週期狀態", "交易員訊號", "首次時間", "首次價格", "目前價格", "目前報酬%", "最高報酬%", "最大回撤%",
+        "學習狀態", "訊號歷程", "訊號變更次數", "錯誤歸因", "v212下一步", "最新時間"
+    ])
+    life_df = lifecycle_df[~lifecycle_df.get("學習狀態", pd.Series(index=lifecycle_df.index, dtype=str)).isna()].copy()
+    life_df = _safe_sort(life_df, ["v212優先級", "最新時間"], ascending=[True, False]).head(top_n)
+    if life_df.empty:
+        st.info("目前尚未累積生命週期追蹤資料。等待訊號出現後會開始記錄。")
+    else:
+        st.dataframe(life_df[life_cols], use_container_width=True, hide_index=True)
 
-st.subheader("🧾 v2.15 訊號紀錄 + 盤後驗證")
-st.caption("這區顯示已驗證後的訊號紀錄。若 Google Sheet Webhook 已設定，請用上方按鈕同步；否則先用 CSV 下載保存。")
-journal_cols = _cols_exist(v215_verified_journal_df, [
-    "日期", "最新時間", "代號", "名稱", "股票型態", "目前狀態", "目前決策", "結果分類", "盤後驗證結果", "驗證狀態", "驗證時間",
-    "首次價格", "驗證價格", "驗證報酬%", "驗證最高報酬%", "驗證最大回撤%", "目前報酬%", "最高報酬%", "最大回撤%",
-    "左側低吸分", "盤中資金分", "漲停前兆分", "AI總分", "風險分", "狀態變更次數", "狀態歷程"
-])
-if v215_verified_journal_df.empty:
-    st.info("尚未累積 v2.15 訊號驗證紀錄。")
-else:
-    show_journal = _safe_sort(v215_verified_journal_df, ["日期", "最新時間"], ascending=[False, False]).head(top_n * 2)
-    st.dataframe(show_journal[journal_cols], use_container_width=True, hide_index=True)
-    csv_bytes = v215_verified_journal_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-    st.download_button("下載 v2.15 驗證訊號紀錄 CSV", csv_bytes, file_name=f"v215_verified_signal_journal_{now_taipei().strftime('%Y%m%d')}.csv", mime="text/csv")
+    st.subheader("🧾 v2.15 訊號紀錄 + 盤後驗證")
+    st.caption("這區顯示已驗證後的訊號紀錄。若 Google Sheet Webhook 已設定，請用上方按鈕同步；否則先用 CSV 下載保存。")
+    journal_cols = _cols_exist(v215_verified_journal_df, [
+        "日期", "最新時間", "代號", "名稱", "股票型態", "目前狀態", "目前決策", "結果分類", "盤後驗證結果", "驗證狀態", "驗證時間",
+        "首次價格", "驗證價格", "驗證報酬%", "驗證最高報酬%", "驗證最大回撤%", "目前報酬%", "最高報酬%", "最大回撤%",
+        "左側低吸分", "盤中資金分", "漲停前兆分", "AI總分", "風險分", "狀態變更次數", "狀態歷程"
+    ])
+    if v215_verified_journal_df.empty:
+        st.info("尚未累積 v2.15 訊號驗證紀錄。")
+    else:
+        show_journal = _safe_sort(v215_verified_journal_df, ["日期", "最新時間"], ascending=[False, False]).head(top_n * 2)
+        st.dataframe(show_journal[journal_cols], use_container_width=True, hide_index=True)
+        csv_bytes = v215_verified_journal_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+        st.download_button("下載 v2.15 驗證訊號紀錄 CSV", csv_bytes, file_name=f"v215_verified_signal_journal_{now_taipei().strftime('%Y%m%d')}.csv", mime="text/csv")
 
-# 4) Near limit / missed check only if relevant.
-if not v211_missed_limit_df.empty:
-    st.subheader("📌 近漲停 / 錯過檢查")
-    miss_cols = _cols_exist(v211_missed_limit_df, ["代號", "名稱", "目前價", "盤中漲跌幅", "漲停距離%", "交易員訊號", "檢查結果", "可能原因", "左側低吸分", "盤中資金分", "漲停前兆分", "AI來源"])
-    st.dataframe(v211_missed_limit_df[miss_cols].head(top_n), use_container_width=True, hide_index=True)
+    # 4) Near limit / missed check only if relevant.
+    if not v211_missed_limit_df.empty:
+        st.subheader("📌 近漲停 / 錯過檢查")
+        miss_cols = _cols_exist(v211_missed_limit_df, ["代號", "名稱", "目前價", "盤中漲跌幅", "漲停距離%", "交易員訊號", "檢查結果", "可能原因", "左側低吸分", "盤中資金分", "漲停前兆分", "AI來源"])
+        st.dataframe(v211_missed_limit_df[miss_cols].head(top_n), use_container_width=True, hide_index=True)
 
-# 5) Advanced diagnostics: collapsed by default to reduce page chaos.
-with st.expander("🧪 進階診斷 / 市場池 / 爆衝雷達 / 原始學習紀錄", expanded=(view_mode == "完整診斷")):
-    tabs = st.tabs(["爆衝雷達", "市場池前段", "學習原始紀錄", "全部快照"])
-    with tabs[0]:
-        if not surge_has_prev:
-            st.info("第一輪快照還沒有上一輪資料可比較；下一次刷新後爆衝雷達才會啟動。")
-        elif surge_df.empty:
-            st.info("目前沒有明顯爆衝或急轉弱。")
-        else:
-            surge_cols = _cols_exist(surge_df, [
-                "代號", "名稱", "市場", "產業", "爆衝警示", "刷新漲速%", "上一輪價格", "盤中現價", "量能增量", "量能跳升分", "突破日內高", "盤中漲跌幅", "即時強度分", "爆衝建議", "報價時間"
+    # 5) Advanced diagnostics: collapsed by default to reduce page chaos.
+    with st.expander("🧪 進階診斷 / 市場池 / 爆衝雷達 / 原始學習紀錄", expanded=(view_mode == "完整診斷")):
+        tabs = st.tabs(["爆衝雷達", "市場池前段", "學習原始紀錄", "全部快照"])
+        with tabs[0]:
+            if not surge_has_prev:
+                st.info("第一輪快照還沒有上一輪資料可比較；下一次刷新後爆衝雷達才會啟動。")
+            elif surge_df.empty:
+                st.info("目前沒有明顯爆衝或急轉弱。")
+            else:
+                surge_cols = _cols_exist(surge_df, [
+                    "代號", "名稱", "市場", "產業", "爆衝警示", "刷新漲速%", "上一輪價格", "盤中現價", "量能增量", "量能跳升分", "突破日內高", "盤中漲跌幅", "即時強度分", "爆衝建議", "報價時間"
+                ])
+                st.dataframe(surge_df[surge_cols].head(top_n), use_container_width=True, hide_index=True)
+        with tabs[1]:
+            market_cols = _cols_exist(lifecycle_df, [
+                "代號", "名稱", "市場", "產業", "v212生命週期狀態", "盤中現價", "盤中漲跌幅", "刷新漲速%", "即時強度分", "AI總分", "風險分", "市場池排名", "資料來源", "AI來源", "報價時間"
             ])
-            st.dataframe(surge_df[surge_cols].head(top_n), use_container_width=True, hide_index=True)
-    with tabs[1]:
-        market_cols = _cols_exist(lifecycle_df, [
-            "代號", "名稱", "市場", "產業", "v212生命週期狀態", "盤中現價", "盤中漲跌幅", "刷新漲速%", "即時強度分", "AI總分", "風險分", "市場池排名", "資料來源", "AI來源", "報價時間"
-        ])
-        st.dataframe(_safe_sort(filtered, ["v212優先級", "即時強度分"], ascending=[True, False])[market_cols].head(top_n), use_container_width=True, hide_index=True)
-    with tabs[2]:
-        if v211_learning_log_df.empty:
-            st.info("尚無學習紀錄。")
-        else:
-            learn_cols = _cols_exist(v211_learning_log_df, [
-                "首次時間", "代號", "名稱", "訊號分類", "交易員訊號", "訊號歷程", "訊號變更次數", "首次價格", "目前價格", "目前報酬%", "最高報酬%", "最大回撤%", "學習狀態", "錯誤歸因", "最新時間"
+            st.dataframe(_safe_sort(filtered, ["v212優先級", "即時強度分"], ascending=[True, False])[market_cols].head(top_n), use_container_width=True, hide_index=True)
+        with tabs[2]:
+            if v211_learning_log_df.empty:
+                st.info("尚無學習紀錄。")
+            else:
+                learn_cols = _cols_exist(v211_learning_log_df, [
+                    "首次時間", "代號", "名稱", "訊號分類", "交易員訊號", "訊號歷程", "訊號變更次數", "首次價格", "目前價格", "目前報酬%", "最高報酬%", "最大回撤%", "學習狀態", "錯誤歸因", "最新時間"
+                ])
+                st.dataframe(v211_learning_log_df[learn_cols].sort_values("最新時間", ascending=False).head(top_n * 2), use_container_width=True, hide_index=True)
+                csv_bytes = v211_learning_log_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+                st.download_button("下載 v2.12 學習紀錄 CSV", csv_bytes, file_name=f"v212_learning_{now_taipei().strftime('%Y%m%d')}.csv", mime="text/csv")
+        with tabs[3]:
+            all_cols = _cols_exist(lifecycle_df, [
+                "代號", "名稱", "市場", "產業", "v212生命週期狀態", "交易員訊號", "第一買點", "盤中現價", "防守停損", "右側加碼價", "追價上限", "盤中漲跌幅", "刷新漲速%", "左側低吸分", "盤中資金分", "v29漲停前兆分", "即時入場分", "AI總分", "風險分", "即時強度分", "資料來源", "AI來源", "報價時間"
             ])
-            st.dataframe(v211_learning_log_df[learn_cols].sort_values("最新時間", ascending=False).head(top_n * 2), use_container_width=True, hide_index=True)
-            csv_bytes = v211_learning_log_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-            st.download_button("下載 v2.12 學習紀錄 CSV", csv_bytes, file_name=f"v212_learning_{now_taipei().strftime('%Y%m%d')}.csv", mime="text/csv")
-    with tabs[3]:
-        all_cols = _cols_exist(lifecycle_df, [
-            "代號", "名稱", "市場", "產業", "v212生命週期狀態", "交易員訊號", "第一買點", "盤中現價", "防守停損", "右側加碼價", "追價上限", "盤中漲跌幅", "刷新漲速%", "左側低吸分", "盤中資金分", "v29漲停前兆分", "即時入場分", "AI總分", "風險分", "即時強度分", "資料來源", "AI來源", "報價時間"
-        ])
-        st.dataframe(lifecycle_df[all_cols], use_container_width=True, hide_index=True)
+            st.dataframe(lifecycle_df[all_cols], use_container_width=True, hide_index=True)
 
-st.caption("提醒：v2.23 的最終訊號是決策一致性層；v2.19 的前端警示是即時事件層；這仍是盤中快照與規則化風控系統，不是保證獲利或券商逐筆資料。v2.15 的目的，是把訊號結果保存並驗證，讓後續調權有根據；最高信號仍只代表「小量試單 + 嚴格停損」，不是無腦重倉。")
+    st.caption("提醒：v2.23 的最終訊號是決策一致性層；v2.19 的前端警示是即時事件層；這仍是盤中快照與規則化風控系統，不是保證獲利或券商逐筆資料。v2.15 的目的，是把訊號結果保存並驗證，讓後續調權有根據；最高信號仍只代表「小量試單 + 嚴格停損」，不是無腦重倉。")
+
+
+if ai_rerun_enabled and hasattr(st, "fragment"):
+    _render_v235_ai_decision_region = st.fragment(run_every=f"{int(refresh_seconds)}s")(_render_v235_ai_decision_region)
+
+_render_v235_ai_decision_region()
