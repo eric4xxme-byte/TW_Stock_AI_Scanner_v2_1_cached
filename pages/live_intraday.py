@@ -4734,7 +4734,7 @@ def _v220_build_ticker_payload(live_df: pd.DataFrame, ctx: Dict[str, Any], max_s
 
 
 def render_v220_realtime_ai_ticker_panel(live_df: pd.DataFrame, ctx: Dict[str, Any], tick_seconds: int = 5) -> None:
-    # v2.23.8：停用舊版前端 fetch 面板。
+    # v2.23.9：停用舊版前端 fetch 面板。
     # 原因：瀏覽器端直接抓 TWSE MIS / Yahoo 常被 CORS 或休市快取擋住，
     # 會造成畫面看似「即時更新」但數字其實不動。
     # 真正的跳動面板改由下方 st.fragment 後端抓價，只局部刷新。
@@ -6134,7 +6134,7 @@ def save_v231_limitup_feature_samples(df: pd.DataFrame, max_rows: int = 5000) ->
 
 
 def render_v231_data_quality_and_limitup_collector(df: pd.DataFrame, ctx: Dict[str, Any], sample_rows: Optional[pd.DataFrame] = None) -> None:
-    st.subheader("🧪 v2.23.8 真局部即時行情渲染修正 + 漲停前兆欄位蒐集")
+    st.subheader("🧪 v2.23.9 真局部即時行情渲染修正 + 漲停前兆欄位蒐集")
     st.caption("這一版先收集 v2.24 需要的真實樣本；這裡不是正式買賣訊號，不會取代 v2.23 最終決策。")
     if df is None or df.empty:
         st.info("目前沒有資料可以檢查。")
@@ -6179,7 +6179,7 @@ def render_v231_data_quality_and_limitup_collector(df: pd.DataFrame, ctx: Dict[s
 
 
 # -----------------------------
-# v2.23.8 true backend ticker fragment
+# v2.23.9 true backend ticker fragment
 # -----------------------------
 @st.cache_data(ttl=8, show_spinner=False)
 def _v236_fetch_yahoo_chart_server(symbol: str) -> Dict[str, Any]:
@@ -6214,11 +6214,81 @@ def _v236_fetch_yahoo_chart_server(symbol: str) -> Dict[str, Any]:
         return {}
 
 
+# v2.23.9: rescue layer when TWSE MIS briefly returns empty on Streamlit Cloud.
+def _v239_yahoo_symbols_for_stock(code: str, market: str = "") -> List[str]:
+    code = _normalize_code(code)
+    m = str(market or "")
+    # Yahoo: listed uses .TW, OTC uses .TWO. Try both if market is uncertain.
+    if "上櫃" in m or "OTC" in m.upper():
+        return [f"{code}.TWO", f"{code}.TW"]
+    if "上市" in m or "TWSE" in m.upper():
+        return [f"{code}.TW", f"{code}.TWO"]
+    return [f"{code}.TW", f"{code}.TWO"]
+
+@st.cache_data(ttl=8, show_spinner=False)
+def _v239_fetch_yahoo_stock_quote(code: str, market: str = "") -> Dict[str, Any]:
+    """Server-side fallback for stock cards.
+
+    TWSE MIS is still the first source. This fallback prevents the ticker panel
+    from showing '-' for every stock when MIS blocks one refresh from Streamlit Cloud.
+    """
+    for sym in _v239_yahoo_symbols_for_stock(code, market):
+        q = _v236_fetch_yahoo_chart_server(sym)
+        if q.get("price"):
+            q["source"] = f"Yahoo 後端備援 {sym}"
+            return q
+    return {}
+
+@st.cache_data(ttl=5, show_spinner=False)
+def _v239_fetch_twse_mi_5mins_latest() -> Dict[str, Any]:
+    """Extra fallback for TAIEX using TWSE every-5-second index report.
+
+    The official MIS index channel is still preferred. If it returns empty,
+    this tries TWSE's 5-second index report endpoints and parses the newest row.
+    """
+    today = now_taipei().strftime("%Y%m%d")
+    urls = [
+        f"https://www.twse.com.tw/rwd/zh/TAIEX/MI_5MINS_INDEX?response=json&date={today}&_={int(time.time()*1000)}",
+        f"https://www.twse.com.tw/exchangeReport/MI_5MINS_INDEX?response=json&date={today}&_={int(time.time()*1000)}",
+        f"https://www.twse.com.tw/rwd/zh/TAIEX/MI_5MINS?response=json&date={today}&_={int(time.time()*1000)}",
+    ]
+    headers = {"User-Agent":"Mozilla/5.0", "Accept":"application/json,text/plain,*/*"}
+    for url in urls:
+        try:
+            r = requests.get(url, headers=headers, timeout=6)
+            if r.status_code != 200:
+                continue
+            j = r.json()
+            data = j.get("data") or j.get("tables", [{}])[0].get("data") or []
+            fields = j.get("fields") or j.get("tables", [{}])[0].get("fields") or []
+            if not data:
+                continue
+            # newest row usually last. Find a numeric column that looks like TAIEX.
+            row = data[-1]
+            if isinstance(row, dict):
+                values = list(row.values())
+            else:
+                values = list(row)
+            nums = []
+            for v in values:
+                x = _clean_number(v, np.nan)
+                if not _is_nan(x) and x > 1000:
+                    nums.append(x)
+            if not nums:
+                continue
+            price = float(nums[0])
+            return {"price": price, "pct": np.nan, "source": "TWSE 5秒指數備援", "time": now_taipei().strftime("%H:%M:%S")}
+        except Exception:
+            continue
+    return {}
+
+
+
 @st.cache_data(ttl=3, show_spinner=False)
 def _v238_fetch_twse_mis_index_quotes() -> Dict[str, Dict[str, Any]]:
     """Fetch Taiwan market indices from TWSE MIS directly.
 
-    v2.23.8 fix:
+    v2.23.9 fix:
     Yahoo chart often lags or returns a cached daily index snapshot. During market hours,
     the ticker panel must use TWSE MIS index channels instead:
     - tse_t00.tw = 加權指數
@@ -6309,8 +6379,14 @@ def _v236_market_cards_from_context(ctx: Dict[str, Any]) -> List[Dict[str, Any]]
         return {"key": key, "label": label, "price": price, "pct": pct, "source": source, "time": ts, "kind": "market"}
 
     txf = fut.get("TXF") or night.get("TXF") or idx.get("TXF") or {}
-    # v2.23.8: TWII/TWOII use MIS first; Yahoo is fallback only, because Yahoo chart may freeze intraday.
-    twii_obj = mis_idx.get("TWII") or idx.get("TWII") or {}
+    # v2.23.9: TWII/TWOII use MIS first; if MIS misses, try TWSE 5-second report, then background/Yahoo fallback.
+    twii_obj = mis_idx.get("TWII") or {}
+    if not twii_obj:
+        twse5 = _v239_fetch_twse_mi_5mins_latest()
+        if twse5.get("price"):
+            twii_obj = {"price": twse5.get("price"), "change_pct": twse5.get("pct"), "source": twse5.get("source"), "time": twse5.get("time")}
+    if not twii_obj:
+        twii_obj = idx.get("TWII") or {}
     twoii_obj = mis_idx.get("TWOII") or idx.get("TWOII") or {}
     cards = [
         from_obj("wtx", "台指期近月 WTX&", txf, "", prefer_yahoo=False),
@@ -6351,6 +6427,7 @@ def _v236_build_stock_ticker_cards(rank_df: pd.DataFrame, tracked_codes: List[st
     uni = _v236_select_ticker_universe(rank_df, tracked_codes, top_n)
     if uni.empty:
         return []
+    # Use only the selected ticker universe here. Do not scan all 600 symbols in the visual ticker.
     quotes = fetch_twse_mis_quotes(build_symbols(uni))
     merged = uni.copy()
     if not quotes.empty:
@@ -6359,7 +6436,19 @@ def _v236_build_stock_ticker_cards(rank_df: pd.DataFrame, tracked_codes: List[st
             merged["名稱"] = [_stock_display_name(c, qn if not _is_bad_stock_name(qn, c) else old) for c, qn, old in zip(merged["代號"], merged["即時名稱"], merged["名稱"])]
         if "報價市場" in merged.columns:
             merged["市場"] = merged["報價市場"].fillna(merged["市場"])
-    # fallback to previous fragment snapshot if this single refresh misses TWSE MIS.
+
+    # v2.23.9 rescue: if MIS misses some cards, fill those few cards by server-side Yahoo.
+    for i, row in merged.iterrows():
+        px = _clean_number(row.get("盤中現價"), np.nan)
+        if _is_nan(px) or px <= 0:
+            yq = _v239_fetch_yahoo_stock_quote(row.get("代號"), row.get("市場"))
+            if yq.get("price"):
+                merged.at[i, "盤中現價"] = yq.get("price")
+                merged.at[i, "盤中漲跌幅"] = yq.get("pct")
+                merged.at[i, "報價時間"] = yq.get("time")
+                merged.at[i, "報價來源"] = yq.get("source")
+
+    # fallback to previous fragment snapshot if this single refresh misses both MIS and Yahoo.
     px_ok = pd.to_numeric(merged.get("盤中現價", pd.Series(dtype=float)), errors="coerce").fillna(0).gt(0).sum()
     if px_ok <= 0:
         old = st.session_state.get("v236_last_ticker_stock_df")
@@ -6378,7 +6467,7 @@ def _v236_build_stock_ticker_cards(rank_df: pd.DataFrame, tracked_codes: List[st
             "label": f"{name} {code}",
             "price": price,
             "pct": pct,
-            "source": "TWSE MIS 後端局部刷新" if not _is_nan(price) and price > 0 else "等待 MIS 報價",
+            "source": _safe_text(row.get("報價來源"), "TWSE MIS 後端局部刷新" if not _is_nan(price) and price > 0 else "等待 MIS/Yahoo 報價"),
             "time": _safe_text(row.get("報價時間"), now_taipei().strftime("%H:%M:%S")),
             "kind": "stock",
         })
@@ -6416,7 +6505,7 @@ def render_v236_backend_ticker_panel(ctx: Dict[str, Any], rank_df: pd.DataFrame,
 </style>
 <div class="v236-wrap">
   <div class="v236-head">
-    <div><div class="v236-title">⚡ v2.23.8 真即時大盤 MIS 局部行情面板</div><div class="v236-sub">後端每輪抓 TWSE MIS 指數 / TWSE MIS 個股 / Yahoo 期貨，只局部刷新行情面板；大盤不再只讀 Yahoo 快取。</div></div>
+    <div><div class="v236-title">⚡ v2.23.9 真即時報價救援面板</div><div class="v236-sub">後端每輪抓 TWSE MIS 指數 / TWSE MIS 個股 / Yahoo 期貨，只局部刷新行情面板；大盤不再只讀 Yahoo 快取。</div></div>
     <div class="v236-status"><span class="v236-dot"></span>局部更新 %s ｜ 約每 %s 秒</div>
   </div>
   <div class="v236-grid">
@@ -6434,7 +6523,7 @@ def render_v236_backend_ticker_panel(ctx: Dict[str, Any], rank_df: pd.DataFrame,
     </div>
 """
     html += "</div></div>"
-    # v2.23.8: use components.html, not st.markdown.
+    # v2.23.9: use components.html, not st.markdown.
     # st.markdown may treat indented HTML card lines as a Markdown code block,
     # which is why the UI showed literal <div class=...> text.
     rows = max(1, math.ceil(len(cards) / 5))
@@ -6445,10 +6534,10 @@ v216_context = load_v216_context()
 
 tick_default = _get_query_int("tick", 5, 3, 30, 1)
 
-st.title("🧩 盤中即時看盤 v2.23.8 真即時大盤 MIS 修正版｜局部刷新")
-st.caption("v2.23.8 重點：修正加權/櫃買不即時問題：大盤改優先抓 TWSE MIS t00 / OTC o00，局部刷新，不再只讀 Yahoo 背景快取。")
+st.title("🧩 盤中即時看盤 v2.23.9 盤中報價救援修正版｜局部刷新")
+st.caption("v2.23.9 重點：修正盤中個股等待 MIS、加權/櫃買不動：後端 MIS 優先，Yahoo/官方指數備援，不再讓即時盤整排空白。")
 # v2.20: realtime ticker panel is rendered after live_df is built, so stock prices can use backend MIS quotes first.
-st.info("v2.23.8：上方市場核心價格改由下方『真局部即時行情面板』更新；完整大盤 / 夜盤明細請展開診斷區，避免靜態快取誤導。")
+st.info("v2.23.9：上方行情面板改成後端 MIS 優先 + Yahoo/官方指數備援；如果 TWSE MIS 短暫失敗，不會再整排股票顯示空白。")
 st.divider()
 
 refresh_default = _get_query_int("refresh", 60, 15, 300, 15)
@@ -6570,7 +6659,7 @@ if ai_rerun_enabled:
 
 
 
-# v2.23.8: ticker itself also uses server-side fragment refresh.
+# v2.23.9: ticker itself also uses server-side fragment refresh.
 # This is the real fix for "numbers don't move": browser-side JS fetches are often blocked by CORS,
 # so the quote panel must refresh from Python backend while keeping the rest of the page stable.
 def _render_v236_realtime_ticker_region():
