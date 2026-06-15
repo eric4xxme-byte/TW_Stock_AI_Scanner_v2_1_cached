@@ -1,4 +1,4 @@
-name: v2.16.11 Scheduled Background Learning Sync
+name: v2.16.12 Auto Background Learning Sync
 
 on:
   workflow_dispatch:
@@ -13,26 +13,28 @@ on:
         default: "120"
   schedule:
     # GitHub cron uses UTC. Taiwan = UTC+8.
-    # TW regular session 09:00-13:35 = UTC 01:00-05:35, Mon-Fri.
-    # Use explicit minute list instead of */5 so the schedule is easier to verify in GitHub.
-    - cron: "0,5,10,15,20,25,30,35,40,45,50,55 1-4 * * 1-5"
-    - cron: "0,5,10,15,20,25,30,35 5 * * 1-5"
-    # Post-close verification / second verification.
+    # Taiwan 09:00-13:35, Mon-Fri, every 5 minutes.
+    - cron: "*/5 1-5 * * 1-5"
+    # Taiwan 14:10 post-close verification.
     - cron: "10 6 * * 1-5"
+    # Taiwan 15:30 second verification.
     - cron: "30 7 * * 1-5"
 
 permissions:
   contents: write
 
-# Do not cancel a run that is already committing data. Keep each run short with timeouts instead.
+env:
+  TZ: Asia/Taipei
+
 concurrency:
-  group: v21611-background-learning-sync-${{ github.ref }}
+  # Same workflow only. Do not cancel in-progress commit; we keep the whole job short instead.
+  group: v21612-auto-background-learning-sync-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  scheduled-background-sync:
+  auto-background-learning-sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 5
 
     steps:
       - name: Checkout repository
@@ -50,74 +52,103 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas numpy requests python-dateutil pytz
 
-      - name: Print schedule diagnostics
+      - name: Create run heartbeat start
         run: |
-          echo "event_name=${{ github.event_name }}"
-          echo "utc_now=$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-          TZ=Asia/Taipei date '+taipei_now=%Y-%m-%d %H:%M:%S GMT+8'
           mkdir -p data
+          python - <<'PY'
+          import json, os, datetime
+          now_tw = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).isoformat()
+          obj = {
+            "status": "running",
+            "workflow_version": "v2.16.12",
+            "event_name": os.environ.get("GITHUB_EVENT_NAME", ""),
+            "run_id": os.environ.get("GITHUB_RUN_ID", ""),
+            "run_number": os.environ.get("GITHUB_RUN_NUMBER", ""),
+            "started_at_tw": now_tw,
+            "completed_at_tw": "",
+            "note": "If this file updates automatically every 5 minutes during TW market hours, background learning schedule is alive."
+          }
+          with open("data/v21612_auto_sync_heartbeat.json", "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+          PY
 
-      - name: Update market context with timeout
+      - name: Pull latest before data generation
+        run: |
+          git pull --rebase --autostash origin main || true
+
+      - name: Update market context with strict timeout
         env:
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
         run: |
           if [ -f background_market_context.py ]; then
-            echo "Running background_market_context.py..."
-            timeout 75s python background_market_context.py || echo "background_market_context.py timeout/fail; continue."
+            echo "Running background_market_context.py with 45s timeout..."
+            timeout 45s python background_market_context.py || echo "background_market_context.py timeout/fail; continue."
           else
             echo "background_market_context.py not found; skip."
           fi
 
-      - name: Run background learning sync with timeout
+      - name: Run background learning sync with strict timeout
         env:
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
           GSHEET_WEBHOOK_URL: ${{ secrets.GSHEET_WEBHOOK_URL }}
-          FORCE_RUN: ${{ github.event.inputs.force_run || '1' }}
+          FORCE_RUN: ${{ github.event.inputs.force_run || '0' }}
           MAX_SYNC_ROWS: ${{ github.event.inputs.sync_rows || '120' }}
         run: |
           if [ -f background_learning_sync.py ]; then
-            echo "Running background_learning_sync.py..."
-            timeout 210s python background_learning_sync.py || echo "background_learning_sync.py timeout/fail; continue to commit diagnostics."
+            echo "Running background_learning_sync.py with 150s timeout..."
+            timeout 150s python background_learning_sync.py || echo "background_learning_sync.py timeout/fail; continue to commit heartbeat and data."
           else
             echo "background_learning_sync.py not found; skip."
           fi
 
-      - name: Run limit-up precursor collector with timeout
+      - name: Run limit-up precursor collector with strict timeout
         run: |
           if [ -f background_limitup_collector.py ]; then
-            echo "Running background_limitup_collector.py..."
-            timeout 60s python background_limitup_collector.py || echo "background_limitup_collector.py timeout/fail; continue."
+            echo "Running background_limitup_collector.py with 45s timeout..."
+            timeout 45s python background_limitup_collector.py || echo "background_limitup_collector.py timeout/fail; continue."
           else
             echo "background_limitup_collector.py not found; skip."
           fi
 
-      - name: Ensure minimum data files exist
+      - name: Create fallback files and heartbeat complete
         run: |
           python - <<'PY'
           import json, os, datetime
-          os.makedirs('data', exist_ok=True)
-          now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).isoformat()
+          os.makedirs("data", exist_ok=True)
+          now_tw = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).isoformat()
+          # Preserve real generated files when present; only create missing fallbacks.
           defaults = {
-            'data/v215_background_sync_meta.json': {'updated_at': now, 'status': 'fallback_created_by_v21611', 'sync': {'ok': False, 'message': 'fallback only; check workflow logs'}},
-            'data/v216_market_context.json': {'updated_at': now, 'status': 'fallback_created_by_v21611'},
-            'data/v216_night_session_context.json': {'updated_at': now, 'status': 'fallback_created_by_v21611'},
-            'data/v216_post_close_verification.json': {'updated_at': now, 'status': 'fallback_created_by_v21611'},
-            'data/v231_limitup_precursor_meta.json': {'updated_at': now, 'status': 'fallback_created_by_v21611'},
+            "data/v215_background_sync_meta.json": {"updated_at": now_tw, "status": "fallback_created_by_v21612", "sync": {"ok": False, "message": "fallback only; check workflow logs"}},
+            "data/v216_market_context.json": {"updated_at": now_tw, "status": "fallback_created_by_v21612"},
+            "data/v216_night_session_context.json": {"updated_at": now_tw, "status": "fallback_created_by_v21612"},
+            "data/v231_limitup_precursor_meta.json": {"updated_at": now_tw, "status": "fallback_created_by_v21612"}
           }
           for p, obj in defaults.items():
-              if not os.path.exists(p):
-                  with open(p, 'w', encoding='utf-8') as f:
-                      json.dump(obj, f, ensure_ascii=False, indent=2)
-          csv_path = 'data/v231_limitup_precursor_features.csv'
+            if not os.path.exists(p):
+              with open(p, "w", encoding="utf-8") as f:
+                json.dump(obj, f, ensure_ascii=False, indent=2)
+          csv_path = "data/v231_limitup_precursor_features.csv"
           if not os.path.exists(csv_path):
-              with open(csv_path, 'w', encoding='utf-8') as f:
-                  f.write('date,time,code,name,price,pct,limitup_distance_pct,precursor_score,reason\n')
+            with open(csv_path, "w", encoding="utf-8") as f:
+              f.write("date,time,code,name,price,pct,limitup_distance_pct,precursor_score,reason\n")
+          heartbeat = {
+            "status": "completed",
+            "workflow_version": "v2.16.12",
+            "event_name": os.environ.get("GITHUB_EVENT_NAME", ""),
+            "run_id": os.environ.get("GITHUB_RUN_ID", ""),
+            "run_number": os.environ.get("GITHUB_RUN_NUMBER", ""),
+            "started_at_tw": "see previous commit/log",
+            "completed_at_tw": now_tw,
+            "note": "Auto schedule is alive if this file updates without manual Run workflow."
+          }
+          with open("data/v21612_auto_sync_heartbeat.json", "w", encoding="utf-8") as f:
+            json.dump(heartbeat, f, ensure_ascii=False, indent=2)
           PY
 
-      - name: Show generated sync status
+      - name: Show sync diagnostics
         run: |
-          echo "=== data changed files ==="
-          git status --short data || true
+          echo "=== heartbeat ==="
+          cat data/v21612_auto_sync_heartbeat.json || true
           echo "=== v215 sync meta ==="
           cat data/v215_background_sync_meta.json || true
           echo "=== v231 precursor meta ==="
@@ -132,6 +163,6 @@ jobs:
             echo "No data changes to commit."
             exit 0
           fi
-          git commit -m "chore: v2.16.11 scheduled background sync data"
+          git commit -m "chore: v2.16.12 auto background learning sync"
           git pull --rebase --autostash origin main
           git push origin main
