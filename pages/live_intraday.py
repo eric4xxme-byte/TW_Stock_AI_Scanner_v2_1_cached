@@ -535,7 +535,7 @@ def build_symbols(df: pd.DataFrame) -> List[str]:
     return symbols
 
 
-@st.cache_data(ttl=10, show_spinner=False)
+@st.cache_data(ttl=1, show_spinner=False)
 def fetch_twse_mis_quotes(symbols: List[str]) -> pd.DataFrame:
     """Fetch quotes from TWSE MIS with more defensive retries.
 
@@ -6181,7 +6181,7 @@ def render_v231_data_quality_and_limitup_collector(df: pd.DataFrame, ctx: Dict[s
 # -----------------------------
 # v2.23.9 true backend ticker fragment
 # -----------------------------
-@st.cache_data(ttl=8, show_spinner=False)
+@st.cache_data(ttl=1, show_spinner=False)
 def _v236_fetch_yahoo_chart_server(symbol: str) -> Dict[str, Any]:
     """Server-side Yahoo chart quote so browser CORS will not freeze the quote panel."""
     sym = str(symbol or "").strip()
@@ -6225,7 +6225,7 @@ def _v239_yahoo_symbols_for_stock(code: str, market: str = "") -> List[str]:
         return [f"{code}.TW", f"{code}.TWO"]
     return [f"{code}.TW", f"{code}.TWO"]
 
-@st.cache_data(ttl=8, show_spinner=False)
+@st.cache_data(ttl=1, show_spinner=False)
 def _v239_fetch_yahoo_stock_quote(code: str, market: str = "") -> Dict[str, Any]:
     """Server-side fallback for stock cards.
 
@@ -6239,7 +6239,7 @@ def _v239_fetch_yahoo_stock_quote(code: str, market: str = "") -> Dict[str, Any]
             return q
     return {}
 
-@st.cache_data(ttl=5, show_spinner=False)
+@st.cache_data(ttl=1, show_spinner=False)
 def _v239_fetch_twse_mi_5mins_latest() -> Dict[str, Any]:
     """Extra fallback for TAIEX using TWSE every-5-second index report.
 
@@ -6284,7 +6284,7 @@ def _v239_fetch_twse_mi_5mins_latest() -> Dict[str, Any]:
 
 
 
-@st.cache_data(ttl=3, show_spinner=False)
+@st.cache_data(ttl=1, show_spinner=False)
 def _v238_fetch_twse_mis_index_quotes() -> Dict[str, Dict[str, Any]]:
     """Fetch Taiwan market indices from TWSE MIS directly.
 
@@ -6505,7 +6505,7 @@ def render_v236_backend_ticker_panel(ctx: Dict[str, Any], rank_df: pd.DataFrame,
 </style>
 <div class="v236-wrap">
   <div class="v236-head">
-    <div><div class="v236-title">⚡ v2.23.9 真即時報價救援面板</div><div class="v236-sub">後端每輪抓 TWSE MIS 指數 / TWSE MIS 個股 / Yahoo 期貨，只局部刷新行情面板；大盤不再只讀 Yahoo 快取。</div></div>
+    <div><div class="v236-title">⚡ v2.23.10 強制新鮮報價面板</div><div class="v236-sub">每輪強制重新抓 TWSE MIS 指數 / 個股；來源時間沒更新會明確顯示，不再假裝即時。</div></div>
     <div class="v236-status"><span class="v236-dot"></span>局部更新 %s ｜ 約每 %s 秒</div>
   </div>
   <div class="v236-grid">
@@ -6534,10 +6534,10 @@ v216_context = load_v216_context()
 
 tick_default = _get_query_int("tick", 5, 3, 30, 1)
 
-st.title("🧩 盤中即時看盤 v2.23.9 盤中報價救援修正版｜局部刷新")
-st.caption("v2.23.9 重點：修正盤中個股等待 MIS、加權/櫃買不動：後端 MIS 優先，Yahoo/官方指數備援，不再讓即時盤整排空白。")
+st.title("🧩 盤中即時看盤 v2.23.10 強制新鮮報價｜局部刷新診斷版")
+st.caption("v2.23.10 重點：把行情快取 TTL 壓到 1 秒，強制每輪抓新 MIS；若資料源本身時間不變，會顯示來源時間供判斷。")
 # v2.20: realtime ticker panel is rendered after live_df is built, so stock prices can use backend MIS quotes first.
-st.info("v2.23.9：上方行情面板改成後端 MIS 優先 + Yahoo/官方指數備援；如果 TWSE MIS 短暫失敗，不會再整排股票顯示空白。")
+st.info("v2.23.10：上方行情面板強制新鮮報價；如果卡片時間不變，代表資料源沒有回新 tick，不是 AI 決策沒跑。")
 st.divider()
 
 refresh_default = _get_query_int("refresh", 60, 15, 300, 15)
