@@ -1,0 +1,101 @@
+name: v2.24 Live Intraday Auto Sync 5min
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Max stock candidates to refresh"
+        required: false
+        default: "80"
+      focus_codes:
+        description: "Extra focus stock codes, comma separated"
+        required: false
+        default: "3441,2382,2313,6770,2409,3042,6257"
+  schedule:
+    # GitHub cron uses UTC. Taiwan = UTC+8.
+    # Avoid minute 00 because GitHub documents high load at start of hour can delay/drop scheduled jobs.
+    # TW 08:52, 08:57 pre-open warmup
+    - cron: "52,57 0 * * 1-5"
+    # TW 09:03-12:58 every 5 minutes
+    - cron: "3-58/5 1-4 * * 1-5"
+    # TW 13:03-13:33 every 5 minutes
+    - cron: "3-33/5 5 * * 1-5"
+    # TW 14:13 and 15:33 post-close verification snapshots
+    - cron: "13 6 * * 1-5"
+    - cron: "33 7 * * 1-5"
+
+permissions:
+  contents: write
+
+env:
+  TZ: Asia/Taipei
+  LIVE_LIMIT_DEFAULT: "80"
+  LIVE_FOCUS_CODES_DEFAULT: "3441,2382,2313,6770,2409,3042,6257"
+
+concurrency:
+  group: v224-live-intraday-main
+  cancel-in-progress: true
+
+jobs:
+  live-intraday:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas requests numpy python-dateutil pytz
+
+      - name: Pull latest main first
+        run: |
+          git pull --rebase --autostash origin main || true
+          mkdir -p data
+
+      - name: Run live intraday engine
+        env:
+          LIVE_LIMIT: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.limit || env.LIVE_LIMIT_DEFAULT }}
+          LIVE_FOCUS_CODES: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.focus_codes || env.LIVE_FOCUS_CODES_DEFAULT }}
+        run: |
+          python tw_live_engine.py --limit "${LIVE_LIMIT}" --focus-codes "${LIVE_FOCUS_CODES}"
+
+      - name: Validate generated files
+        run: |
+          test -f data/live_intraday.csv
+          test -f data/live_intraday_meta.json
+          python - <<'PY'
+          import json
+          import pandas as pd
+          from pathlib import Path
+          meta = json.loads(Path('data/live_intraday_meta.json').read_text(encoding='utf-8'))
+          df = pd.read_csv('data/live_intraday.csv', dtype=str)
+          print(json.dumps(meta, ensure_ascii=False, indent=2))
+          print('rows=', len(df), 'columns=', list(df.columns))
+          assert len(df) >= 1, 'live_intraday.csv has no rows'
+          assert '代號' in df.columns, 'missing 代號 column'
+          assert '盤中現價' in df.columns, 'missing 盤中現價 column'
+          PY
+
+      - name: Commit live data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/live_intraday.csv data/live_intraday_meta.json data/intraday_snapshot.csv data/intraday_meta.json
+          if git diff --cached --quiet; then
+            echo "No live data changes to commit."
+            exit 0
+          fi
+          git commit -m "chore: v2.24 live intraday auto sync"
+          git pull --rebase --autostash origin main || true
+          git push origin HEAD:main
