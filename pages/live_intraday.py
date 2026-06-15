@@ -6190,6 +6190,174 @@ def render_v224_attack_cockpit(df: pd.DataFrame, top_n: int = 12) -> None:
     if cols:
         st.dataframe(work[cols].head(top_n), use_container_width=True, hide_index=True)
 
+
+def _v2242_price_zone(row: pd.Series) -> Tuple[float, float, str]:
+    txt = row.get("第一買點", row.get("左側試單價", row.get("左側試單區", row.get("左側低吸區", ""))))
+    try:
+        lo, hi = _v219_zone_numbers(txt)
+        return lo, hi, _safe_text(txt, "-")
+    except Exception:
+        return np.nan, np.nan, _safe_text(txt, "-")
+
+
+def add_v2242_practical_attack_entry(df: pd.DataFrame, ctx: Dict[str, Any]) -> pd.DataFrame:
+    """v2.24.2 practical attack-entry layer.
+
+    This fixes the main trading problem we saw live: many rising names were kept as generic
+    observation because the old final gate was too defensive.  v2.24.2 separates three states:
+    1) 到第一買點/可小量, 2) 攻擊窗口/可小量試單, 3) 漲停攻擊中/已錯過最佳新進點.
+    The output is still small-size only; it is an entry timing assistant, not an all-in signal.
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    market_score, night_risk, market_label = _v223_market_state(ctx if isinstance(ctx, dict) else {})
+
+    sigs=[]; actions=[]; zones=[]; stops=[]; scores=[]; reasons=[]; priority=[]; phase=[]
+    for idx, row in out.iterrows():
+        code = _safe_text(row.get("代號"), "")
+        px = _v224_num(row, ["盤中現價", "目前價格", "現價"], np.nan)
+        pct = _v224_num(row, ["盤中漲跌幅", "漲跌幅"], 0)
+        high = _v224_num(row, ["最高", "盤中最高", "最高價格"], np.nan)
+        low = _v224_num(row, ["最低", "盤中最低", "最低價格"], np.nan)
+        prev = _v224_num(row, ["昨收", "參考價", "前收"], np.nan)
+        ai = _v224_num(row, ["v214調權後分", "AI總分", "盤後AI分", "市場池估分"], 50)
+        strength = _v224_num(row, ["即時強度分", "盤中強度分", "v29即時入場分"], 50)
+        capital = _v224_num(row, ["v220籌碼資金分", "盤中資金分"], 50)
+        risk = _v224_num(row, ["風險分", "v220風險估計分"], 40)
+        attack_score = _v224_num(row, ["v224攻擊分", "v231漲停前兆蒐集分", "漲停前兆分"], 0)
+        limit_dist = _v224_num(row, ["漲停距離%", "v231漲停距離%"], np.nan)
+        first_lo, first_hi, first_txt = _v2242_price_zone(row)
+        first_hit = bool((not _is_nan(px)) and px > 0 and (not _is_nan(first_lo)) and (not _is_nan(first_hi)) and first_lo > 0 and first_hi > 0 and first_lo <= px <= first_hi)
+        first_near = bool((not _is_nan(px)) and px > 0 and (not _is_nan(first_lo)) and (not _is_nan(first_hi)) and first_lo > 0 and first_hi > 0 and first_lo*0.996 <= px <= first_hi*1.006)
+        if _is_nan(limit_dist) and not _is_nan(prev) and prev > 0 and not _is_nan(px) and px > 0:
+            lim_px = _round_up_tick(prev * 1.10) if '_round_up_tick' in globals() else prev * 1.10
+            limit_dist = max(0.0, (lim_px - px) / px * 100)
+        near_high = bool((not _is_nan(px)) and (not _is_nan(high)) and high > 0 and px >= high * 0.991)
+        no_px = bool(_is_nan(px) or px <= 0)
+        env_ok = bool(market_score >= 42 and night_risk < 82)
+        hard_veto = bool(risk >= 82 or (not _is_nan(limit_dist) and limit_dist <= 0.35) or pct >= 9.4)
+        late_zone = bool((pct >= 7.8) or ((not _is_nan(limit_dist)) and limit_dist <= 1.3))
+        attack_window = bool(1.2 <= pct < 7.8 and env_ok and risk < 76 and not no_px)
+        money_ok = bool(capital >= 48 or ai >= 52 or strength >= 54)
+        accel_ok = bool(attack_score >= 50 or strength >= 58 or near_high or pct >= 3.0)
+        raw_score = 0.0
+        raw_score += max(0, pct) * 6.0
+        raw_score += max(0, strength - 45) * 0.9
+        raw_score += max(0, capital - 45) * 0.55
+        raw_score += max(0, ai - 45) * 0.45
+        raw_score += attack_score * 0.28
+        raw_score += 8 if near_high else 0
+        raw_score += 8 if first_hit else 0
+        raw_score += 4 if env_ok else -8
+        raw_score -= max(0, risk - 55) * 0.55
+        if late_zone: raw_score -= 8
+        raw_score = round(max(0, min(100, raw_score)), 1)
+
+        if no_px:
+            sig = "⚪ 等報價"
+            act = "沒有有效現價，不判斷。"
+            zone = "-"; stp = "-"; pr = 90; ph = "無報價"
+            reason = "即時價缺失"
+        elif hard_veto:
+            sig = "🔥 漲停/極右側，錯過最佳新進點"
+            act = "不要新追；有單看鎖漲停/開板承接，空手只等回測。"
+            zone = "不新進"; stp = _fmt_price(px*0.985); pr = 20; ph = "已過最佳點"
+            reason = "接近漲停或風險極高，不能再把它當一般觀察，但也不是新進買點。"
+        elif first_hit and env_ok and risk < 76 and pct < 7.8:
+            sig = "✅ 第一買點到價 / 可小量"
+            act = "可極小量試單；1～2 輪不轉強就撤，不加碼攤平。"
+            zone = first_txt if first_txt and first_txt != "-" else f"{_fmt_price(first_lo)}～{_fmt_price(first_hi)}"
+            stp_px = low if (not _is_nan(low) and low > 0 and low < px) else px * 0.982
+            stp = _fmt_price(_round_down_tick(stp_px) if '_round_down_tick' in globals() else stp_px)
+            pr = 0; ph = "到價試單"
+            reason = "現價已進第一買點區間，不能顯示普通觀察。"
+        elif attack_window and money_ok and accel_ok and raw_score >= 58:
+            sig = "✅ 攻擊窗口 / 可小量試單"
+            act = "可試第一筆極小量；等下一輪續強才保留，跌回觸發區就撤。"
+            lo = _round_down_tick(px * 0.996) if '_round_down_tick' in globals() else px * 0.996
+            hi = _round_up_tick(px * 1.003) if '_round_up_tick' in globals() else px * 1.003
+            zone = f"{_fmt_price(lo)}～{_fmt_price(hi)}"
+            stp_px = low if (not _is_nan(low) and low > 0 and low < px) else px * 0.978
+            stp = _fmt_price(_round_down_tick(stp_px) if '_round_down_tick' in globals() else stp_px)
+            pr = 1; ph = "攻擊試單"
+            reason = "漲幅、強度或資金已進攻擊窗口，系統不再保守壓成觀察。"
+        elif attack_window and (money_ok or accel_ok):
+            sig = "🚀 攻擊前兆 / 等觸發"
+            act = "盯突破日內高或回測不破；還沒到可直接試單。"
+            zone = f"突破 {_fmt_price(high) if not _is_nan(high) else '日內高'} / 或回測不破"
+            stp = _fmt_price(px * 0.982)
+            pr = 2; ph = "前兆"
+            reason = "有轉強前兆，但資金/站穩還差一個確認。"
+        elif late_zone:
+            sig = "🔴 已進追高區"
+            act = "不追；等拉回承接，或只看已有部位。"
+            zone = "等拉回"; stp = _fmt_price(px * 0.985); pr = 5; ph = "追高區"
+            reason = "已到右側後段，風報比變差。"
+        elif first_near and env_ok and risk < 76:
+            sig = "🟢 接近第一買點"
+            act = "盯到價；不要在區間外追，等進入第一買點。"
+            zone = first_txt if first_txt and first_txt != "-" else f"{_fmt_price(first_lo)}～{_fmt_price(first_hi)}"
+            stp = _fmt_price(px * 0.982); pr = 3; ph = "接近買點"
+            reason = "接近第一買點，但還不是最好的成交位置。"
+        else:
+            sig = "⚪ 不進 / 等訊號"
+            act = "不買；等到價、攻擊窗口或回測確認。"
+            zone = "-"; stp = "-"; pr = 6; ph = "等待"
+            reason = "未形成到價或攻擊窗口。"
+
+        sigs.append(sig); actions.append(act); zones.append(zone); stops.append(stp); scores.append(raw_score); reasons.append(reason); priority.append(pr); phase.append(ph)
+
+        # Force the single final decision to respect the practical entry layer.
+        if "v223最終訊號" in out.columns:
+            if sig.startswith("✅"):
+                out.at[idx, "v223最終訊號"] = sig
+                out.at[idx, "v223買賣結論"] = "可極小量試單"
+                out.at[idx, "v223下一步"] = f"{act} 入場區：{zone}；停損：{stp}"
+                out.at[idx, "v223優先級"] = pr
+                out.at[idx, "v223決策理由"] = f"v2.24.2 實戰進場層：{reason}；分數={raw_score}"
+            elif sig.startswith("🚀") and "觀察" in _safe_text(out.at[idx, "v223最終訊號"], ""):
+                out.at[idx, "v223最終訊號"] = sig
+                out.at[idx, "v223買賣結論"] = "盯盤等觸發"
+                out.at[idx, "v223下一步"] = act
+                out.at[idx, "v223優先級"] = min(pr, _v224_num(row, ["v223優先級"], 5))
+                out.at[idx, "v223決策理由"] = f"v2.24.2 實戰進場層：{reason}；分數={raw_score}"
+            elif sig.startswith("🔥"):
+                out.at[idx, "v223最終訊號"] = sig
+                out.at[idx, "v223買賣結論"] = "不新追"
+                out.at[idx, "v223下一步"] = act
+                out.at[idx, "v223優先級"] = min(4, _v224_num(row, ["v223優先級"], 6))
+                out.at[idx, "v223決策理由"] = f"v2.24.2 實戰進場層：{reason}；分數={raw_score}"
+
+    out["v2242實戰訊號"] = sigs
+    out["v2242動作"] = actions
+    out["v2242入場區"] = zones
+    out["v2242停損"] = stops
+    out["v2242進場分"] = scores
+    out["v2242階段"] = phase
+    out["v2242原因"] = reasons
+    out["v2242優先級"] = priority
+    return out
+
+
+def render_v2242_practical_entry_cockpit(df: pd.DataFrame, top_n: int = 15) -> None:
+    if df is None or df.empty or "v2242實戰訊號" not in df.columns:
+        return
+    work = df.copy()
+    work = _safe_sort(work, ["v2242優先級", "v2242進場分", "盤中漲跌幅"], ascending=[True, False, False])
+    buy_n = int(work["v2242實戰訊號"].astype(str).str.contains("可小量|攻擊窗口", regex=True).sum())
+    wait_n = int(work["v2242實戰訊號"].astype(str).str.contains("攻擊前兆|接近第一買點", regex=True).sum())
+    late_n = int(work["v2242實戰訊號"].astype(str).str.contains("追高|漲停", regex=True).sum())
+    c1, c2, c3 = st.columns(3)
+    c1.metric("✅ 可試單", buy_n)
+    c2.metric("🚀 前兆/等觸發", wait_n)
+    c3.metric("🔴 追高/漲停區", late_n)
+    cols = _cols_exist(work, ["代號", "名稱", "盤中現價", "盤中漲跌幅", "v2242實戰訊號", "v2242進場分", "v2242動作", "v2242入場區", "v2242停損", "v2242階段", "v2242原因", "v223最終訊號", "報價時間"])
+    st.markdown("### 🎯 v2.24.2 實戰進場雷達｜先抓可進窗口，不只看已漲停")
+    st.caption("這張表優先回答：現在有沒有可小量試單、哪一檔只是前兆、哪一檔已經進追高區。")
+    if cols:
+        st.dataframe(work[cols].head(top_n), use_container_width=True, hide_index=True)
+
 def add_v231_limitup_collection_features(df: pd.DataFrame, ctx: Dict[str, Any]) -> pd.DataFrame:
     """v2.23.1: collect the exact fields needed to train v2.24 later.
 
@@ -6749,7 +6917,7 @@ v216_context = load_v216_context()
 
 tick_default = _get_query_int("tick", 5, 3, 30, 1)
 
-st.title("🎯 盤中即時看盤 v2.24.1 到價即決｜第一買點修正版")
+st.title("🎯 盤中即時看盤 v2.24.2 實戰進場雷達｜攻擊窗口修正版")
 st.caption("v2.23.11 重點：即時行情面板優先刷新；AI 決策自動刷新時會限制重算池，避免卡住 5 秒行情刷新。")
 # v2.20: realtime ticker panel is rendered after live_df is built, so stock prices can use backend MIS quotes first.
 st.info("v2.23.11：上方行情面板優先刷新；若你開 AI 局部刷新，系統會自動限制 AI 重算池，避免即時行情被 600 檔大池拖慢。")
@@ -6965,11 +7133,13 @@ def _render_v235_ai_decision_region():
     live_df = add_v222_event_quality_decision(live_df, v221_news_context)
     live_df = add_v223_consistency_decision(live_df, v216_context)
     live_df = add_v224_attack_priority_decision(live_df, v216_context, chase_pct=chase_pct)
+    live_df = add_v2242_practical_attack_entry(live_df, v216_context)
     live_df = add_v231_limitup_collection_features(live_df, v216_context)
     v231_current_samples_df = save_v231_limitup_feature_samples(live_df)
 
     # v2.23 realtime AI-selected ticker is rendered after MIS quote merge so 廣達/華通/台積電 have backend prices first.
     render_v220_realtime_ai_ticker_panel(live_df, v216_context, tick_seconds=live_tick_seconds)
+    render_v2242_practical_entry_cockpit(live_df, top_n=top_n)
     render_v224_attack_cockpit(live_df, top_n=top_n)
     render_v223_consistency_cockpit(live_df, v216_context, top_n=top_n)
     render_v223_focus(live_df, top_n=max(top_n, 12))
