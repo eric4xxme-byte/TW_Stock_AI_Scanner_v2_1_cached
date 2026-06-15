@@ -6494,6 +6494,8 @@ def render_v236_backend_ticker_panel(ctx: Dict[str, Any], rank_df: pd.DataFrame,
     market_cards = _v236_market_cards_from_context(ctx)
     stock_cards = _v236_build_stock_ticker_cards(rank_df, tracked_codes, top_n=max_stocks)
     cards = market_cards + stock_cards
+    st.session_state["v236_ticker_refresh_count"] = int(st.session_state.get("v236_ticker_refresh_count", 0)) + 1
+    refresh_no = int(st.session_state.get("v236_ticker_refresh_count", 0))
     now = now_taipei().strftime("%H:%M:%S")
     html = """
 <style>
@@ -6505,11 +6507,11 @@ def render_v236_backend_ticker_panel(ctx: Dict[str, Any], rank_df: pd.DataFrame,
 </style>
 <div class="v236-wrap">
   <div class="v236-head">
-    <div><div class="v236-title">⚡ v2.23.10 強制新鮮報價面板</div><div class="v236-sub">每輪強制重新抓 TWSE MIS 指數 / 個股；來源時間沒更新會明確顯示，不再假裝即時。</div></div>
-    <div class="v236-status"><span class="v236-dot"></span>局部更新 %s ｜ 約每 %s 秒</div>
+    <div><div class="v236-title">⚡ v2.23.11 即時行情優先面板</div><div class="v236-sub">每輪強制重新抓 TWSE MIS 指數 / 個股；來源時間沒更新會明確顯示，不再假裝即時。</div></div>
+    <div class="v236-status"><span class="v236-dot"></span>局部更新 %s ｜ 約每 %s 秒 ｜ 第 %s 輪</div>
   </div>
   <div class="v236-grid">
-""" % (now, int(tick_seconds))
+""" % (now, int(tick_seconds), refresh_no)
     for c in cards:
         pct_num = _clean_number(c.get("pct"), np.nan)
         pct_cls = "v236-up" if (not _is_nan(pct_num) and pct_num > 0) else "v236-down" if (not _is_nan(pct_num) and pct_num < 0) else ""
@@ -6534,10 +6536,10 @@ v216_context = load_v216_context()
 
 tick_default = _get_query_int("tick", 5, 3, 30, 1)
 
-st.title("🧩 盤中即時看盤 v2.23.10 強制新鮮報價｜局部刷新診斷版")
-st.caption("v2.23.10 重點：把行情快取 TTL 壓到 1 秒，強制每輪抓新 MIS；若資料源本身時間不變，會顯示來源時間供判斷。")
+st.title("🧩 盤中即時看盤 v2.23.11 即時行情優先｜AI 不阻塞版")
+st.caption("v2.23.11 重點：即時行情面板優先刷新；AI 決策自動刷新時會限制重算池，避免卡住 5 秒行情刷新。")
 # v2.20: realtime ticker panel is rendered after live_df is built, so stock prices can use backend MIS quotes first.
-st.info("v2.23.10：上方行情面板強制新鮮報價；如果卡片時間不變，代表資料源沒有回新 tick，不是 AI 決策沒跑。")
+st.info("v2.23.11：上方行情面板優先刷新；若你開 AI 局部刷新，系統會自動限制 AI 重算池，避免即時行情被 600 檔大池拖慢。")
 st.divider()
 
 refresh_default = _get_query_int("refresh", 60, 15, 300, 15)
@@ -6625,6 +6627,8 @@ with st.sidebar:
         save_v215_gsheet_config(v215_webhook_url, v215_enable_gsheet, v215_auto_sync)
 
     st.caption(f"即時行情：約每 {live_tick_seconds} 秒只跳數字；AI局部刷新：{(str(refresh_seconds) + ' 秒') if ai_rerun_enabled else '關閉'}；自動同步：{'已開啟' if v215_auto_sync and v215_enable_gsheet else '未開啟'}")
+    if ai_rerun_enabled and int(pool_size) > 150:
+        st.warning("即時行情優先模式：AI 自動局部刷新時，決策重算池會暫時限制為 150 檔，避免 600 檔掃描卡住 5 秒行情跳動。")
     _sync_status_sidebar = latest_v215_sync_status()
     st.caption(f"最後同步：{_sync_status_sidebar.get('time', '-')}｜{_sync_status_sidebar.get('status', '-') }｜{_sync_status_sidebar.get('rows', 0)} 筆")
     if st.button("儲存 Google Sheet 設定", type="secondary", key="v215_save_gsheet_config_btn"):
@@ -6653,7 +6657,7 @@ _set_query_if_changed({
 
 if ai_rerun_enabled:
     if hasattr(st, "fragment"):
-        st.info(f"AI 決策局部刷新已啟用：每 {int(refresh_seconds)} 秒只重算決策區，不刷新整頁。")
+        st.info(f"AI 決策局部刷新已啟用：每 {int(refresh_seconds)} 秒只重算決策區，不刷新整頁。v2.23.11 會避免 AI 大池重算卡住行情面板。")
     else:
         st.warning("目前 Streamlit 版本不支援 st.fragment 局部刷新；為避免整頁閃爍，已停用整頁自動重整，請用手動重新整理。")
 
@@ -6680,7 +6684,12 @@ def _render_v235_ai_decision_region():
     v216_context = load_v216_context()
     rank_df = load_rank()
     with st.spinner("建立盤中掃描清單並抓取即時報價..."):
-        universe_df, universe_source = build_live_universe(rank_df, scan_mode, pool_size, tracked_codes)
+        # v2.23.11: keep realtime quote panel responsive.
+        # When AI auto-refresh is on, a 300~600 stock pool can keep the single Streamlit session busy,
+        # which prevents the 5-second quote fragment from running on time.
+        # Cap only the automatic AI refresh pool; the background collector still keeps larger samples.
+        ai_pool_size = min(int(pool_size), 150) if bool(globals().get("ai_rerun_enabled", False)) else int(pool_size)
+        universe_df, universe_source = build_live_universe(rank_df, scan_mode, ai_pool_size, tracked_codes)
         symbols = build_symbols(universe_df)
         quotes_df = fetch_twse_mis_quotes(symbols)
 
