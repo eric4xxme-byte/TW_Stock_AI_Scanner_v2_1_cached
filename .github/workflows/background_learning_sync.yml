@@ -1,36 +1,37 @@
-name: v2.16.8 Market Context + Background Learning Sync
+name: v2.16.10 Fast Background Learning Sync
 
 on:
   workflow_dispatch:
     inputs:
       force_run:
-        description: 'Force learning sync even outside Taiwan intraday/post-close window? Use 1 for manual test.'
+        description: "Force run even outside TW market session (1=yes, 0=no)"
         required: false
-        default: '1'
-        type: choice
-        options:
-          - '1'
-          - '0'
+        default: "1"
+      sync_rows:
+        description: "Max rows to sync to Google Sheet per run"
+        required: false
+        default: "120"
   schedule:
-    # Intraday learning: Taiwan 08:50-14:20 ~= UTC 00:50-06:20.
-    - cron: '*/5 0-6 * * 1-5'
-    # Post-close verification passes: Taiwan 13:30, 14:30, 16:00 ~= UTC 05:30, 06:30, 08:00.
-    - cron: '30 5,6 * * 1-5'
-    - cron: '0 8 * * 1-5'
-    # Night / next-day risk context: Taiwan 15:00-04:30 ~= UTC 07:00-20:30.
-    - cron: '*/30 7-20 * * 1-5'
+    # Taiwan time UTC+8
+    # 09:00-13:55 Mon-Fri, every 5 minutes
+    - cron: "*/5 1-5 * * 1-5"
+    # 14:10 post-close verification
+    - cron: "10 6 * * 1-5"
+    # 15:30 second post-close verification
+    - cron: "30 7 * * 1-5"
 
 permissions:
   contents: write
 
 concurrency:
-  group: v216-market-context-learning-sync
+  group: v216-background-learning-sync-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  v216-market-context-learning-sync:
+  v216-fast-background-sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 18
+    timeout-minutes: 7
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -40,88 +41,97 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas requests
+          pip install pandas numpy requests python-dateutil pytz
 
-      - name: Pull latest data before sync
-        run: |
-          git pull --rebase --autostash origin main
-
-      - name: Build v2.16 market / night context
-        env:
-          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
-        run: |
-          python background_market_context.py
-
-      - name: Run v2.16 background learning sync
-        env:
-          GSHEET_WEBHOOK_URL: ${{ secrets.GSHEET_WEBHOOK_URL }}
-          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
-          BACKGROUND_POOL_LIMIT: '180'
-          BACKGROUND_SYNC_LIMIT: '120'
-          BACKGROUND_BATCH_SIZE: '20'
-          FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force_run || '0' }}
-        run: |
-          python background_learning_sync.py
-
-      - name: Ensure optional v2.16 files exist
+      - name: Prepare data folder
         run: |
           mkdir -p data
-          if [ ! -f data/v216_post_close_verification.json ]; then
-            python - <<'PY'
-          import json
-          from datetime import datetime, timezone, timedelta
-          from pathlib import Path
-          tw = timezone(timedelta(hours=8))
-          Path('data/v216_post_close_verification.json').write_text(json.dumps({
-              'updated_at': datetime.now(tw).isoformat(),
-              'status': 'not_post_close_window',
-              'note': 'created by workflow fallback so git add will not fail'
-          }, ensure_ascii=False, indent=2), encoding='utf-8')
-          PY
+          echo "Run started at $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+
+      - name: Update market context with hard timeout
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+        run: |
+          if [ -f background_market_context.py ]; then
+            echo "Running background_market_context.py with 90s timeout..."
+            timeout 90s python background_market_context.py || echo "background_market_context.py timed out or failed; continue."
+          else
+            echo "background_market_context.py not found; skip."
           fi
 
-      - name: Show generated v2.16 files
+      - name: Run background learning sync with hard timeout
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          GSHEET_WEBHOOK_URL: ${{ secrets.GSHEET_WEBHOOK_URL }}
+          FORCE_RUN: ${{ github.event.inputs.force_run || '0' }}
+          MAX_SYNC_ROWS: ${{ github.event.inputs.sync_rows || '120' }}
+        run: |
+          if [ -f background_learning_sync.py ]; then
+            echo "Running background_learning_sync.py with 240s timeout..."
+            timeout 240s python background_learning_sync.py || echo "background_learning_sync.py timed out or failed; continue to commit any generated files."
+          else
+            echo "background_learning_sync.py not found; skip."
+          fi
+
+      - name: Run limit-up precursor collector with hard timeout
+        run: |
+          if [ -f background_limitup_collector.py ]; then
+            echo "Running background_limitup_collector.py with 90s timeout..."
+            timeout 90s python background_limitup_collector.py || echo "background_limitup_collector.py timed out or failed; continue."
+          else
+            echo "background_limitup_collector.py not found; skip."
+          fi
+
+      - name: Ensure optional v2 data files exist
+        run: |
+          python - <<'PY'
+          import json, os, datetime
+          os.makedirs('data', exist_ok=True)
+          now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+          defaults = {
+            'data/v215_background_sync_meta.json': {'updated_at': now, 'status': 'fallback_created_by_v21610', 'sync': {'ok': False, 'message': 'fallback only; check workflow logs'}},
+            'data/v216_market_context.json': {'updated_at': now, 'status': 'fallback_created_by_v21610'},
+            'data/v216_night_session_context.json': {'updated_at': now, 'status': 'fallback_created_by_v21610'},
+            'data/v216_post_close_verification.json': {'updated_at': now, 'status': 'fallback_created_by_v21610'},
+            'data/v231_limitup_precursor_meta.json': {'updated_at': now, 'status': 'fallback_created_by_v21610'},
+          }
+          for p, obj in defaults.items():
+            if not os.path.exists(p):
+              with open(p, 'w', encoding='utf-8') as f:
+                json.dump(obj, f, ensure_ascii=False, indent=2)
+          # create CSV header if collector file missing
+          csv_path = 'data/v231_limitup_precursor_features.csv'
+          if not os.path.exists(csv_path):
+            with open(csv_path, 'w', encoding='utf-8') as f:
+              f.write('date,time,code,name,price,pct,limitup_distance_pct,precursor_score,reason\n')
+          PY
+
+      - name: Show generated files
         run: |
           echo "=== data folder ==="
-          ls -la data || true
+          ls -la data | sed -n '1,200p'
+          echo "=== v215 sync meta ==="
+          cat data/v215_background_sync_meta.json || true
           echo "=== v216 market context ==="
           cat data/v216_market_context.json || true
-          echo "=== v216 night session context ==="
-          cat data/v216_night_session_context.json || true
-          echo "=== v216 post close verification ==="
-          cat data/v216_post_close_verification.json || true
-          echo "=== v215 background sync meta ==="
-          cat data/v215_background_sync_meta.json || true
-          echo "=== journal preview ==="
-          python - <<'PY'
-          import pandas as pd
-          from pathlib import Path
-          for name in ['data/v215_verified_signal_journal.csv', 'data/v216_market_context_history.csv']:
-              p = Path(name)
-              print('\n---', name, 'exists:', p.exists())
-              if p.exists():
-                  df = pd.read_csv(p, dtype=str)
-                  print('rows:', len(df))
-                  print('cols:', list(df.columns)[:12])
-                  print(df.tail(3).to_string(index=False))
-          PY
+          echo "=== v231 precursor meta ==="
+          cat data/v231_limitup_precursor_meta.json || true
 
-      - name: Commit updated v2.16 context and learning data
+      - name: Commit updated data
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A data
-          echo "=== git status before commit ==="
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git status --short
+          git add -A data
           if git diff --cached --quiet; then
-            echo "No v2.16 learning/context changes to commit."
-          else
-            git commit -m "chore: update v2.16 market context and learning data"
-            git pull --rebase --autostash origin main
-            git push
+            echo "No data changes to commit."
+            exit 0
           fi
+          git commit -m "chore: v2.16.10 fast background sync data"
+          git pull --rebase --autostash origin main
+          git push origin main
