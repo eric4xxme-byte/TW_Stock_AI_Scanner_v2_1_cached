@@ -106,19 +106,75 @@ def parse_time(s: Any) -> datetime | None:
         return None
 
 
+MODE_OPTIONS = ['前台直抓 MIS', 'GitHub 背景決策檔', 'GitHub live 即時計算']
+MODE_TO_KEY = {
+    '前台直抓 MIS': 'direct_mis',
+    'GitHub 背景決策檔': 'github_decision',
+    'GitHub live 即時計算': 'github_live',
+}
+KEY_TO_MODE = {v: k for k, v in MODE_TO_KEY.items()}
+
+
+def qp_get(name: str, default: str = '') -> str:
+    """讀取網址 query param；刷新整頁後仍能保留左側資料模式。"""
+    try:
+        v = st.query_params.get(name, default)
+        if isinstance(v, list):
+            return str(v[0]) if v else default
+        return str(v) if v is not None else default
+    except Exception:
+        try:
+            v = st.experimental_get_query_params().get(name, [default])
+            return str(v[0]) if v else default
+        except Exception:
+            return default
+
+
+def qp_set(name: str, value: str) -> None:
+    """更新網址 query param；避免每 10 秒硬刷新時 radio 跳回預設。"""
+    try:
+        if st.query_params.get(name) != value:
+            st.query_params[name] = value
+    except Exception:
+        try:
+            params = st.experimental_get_query_params()
+            params[name] = value
+            st.experimental_set_query_params(**params)
+        except Exception:
+            pass
+
+
 with st.sidebar:
     st.header('v2.25 設定')
-    mode = st.radio('資料模式', ['前台直抓 MIS', 'GitHub 背景決策檔', 'GitHub live 即時計算'], index=0)
-    limit = st.slider('掃描檔數', 30, 300, 120, 10)
-    focus = st.text_input('固定重點股', '3441,2382,2313,6770,2409,3042,6257')
-    refresh = st.slider('前台刷新秒數', 5, 60, 10, 5)
-    show_all = st.checkbox('顯示全部欄位', False)
-    st.caption('A級不等於無腦買；必須同時給入場區、追價上限、停損與失效條件。')
+    # 預設改成 GitHub live 即時計算；並用網址參數鎖住，不會因為前台 10 秒刷新跳掉。
+    mode_key = qp_get('v225_mode', st.session_state.get('v225_mode_key', 'github_live'))
+    if mode_key not in KEY_TO_MODE:
+        mode_key = 'github_live'
+    mode = st.radio(
+        '資料模式',
+        MODE_OPTIONS,
+        index=MODE_OPTIONS.index(KEY_TO_MODE[mode_key]),
+        key='v225_mode_radio',
+        help='已修正：資料模式會寫進網址 v225_mode，每次自動刷新都會保留，不會跳回預設。',
+    )
+    selected_key = MODE_TO_KEY.get(mode, 'github_live')
+    st.session_state['v225_mode_key'] = selected_key
+    qp_set('v225_mode', selected_key)
 
-hard_refresh(refresh)
+    limit = st.slider('掃描檔數', 30, 300, 120, 10, key='v225_limit')
+    focus = st.text_input('固定重點股', '3441,2382,2313,6770,2409,3042,6257', key='v225_focus')
+    refresh = st.slider('前台刷新秒數', 5, 60, 10, 5, key='v225_refresh')
+    auto_refresh = st.toggle('前台自動刷新', True, key='v225_auto_refresh')
+    show_all = st.checkbox('顯示全部欄位', False, key='v225_show_all')
+    st.caption('A級不等於無腦買；必須同時給入場區、追價上限、停損與失效條件。')
+    st.caption('v2.25.1：資料模式已鎖在網址，刷新不會跳掉。')
+
+if auto_refresh:
+    hard_refresh(refresh)
 
 st.title('🎯 v2.25 真實決策雷達｜二次確認，不再白老鼠試單')
 st.caption('修正重點：不再單靠一個 tick 叫你小單；A級需量價/位置/風險/AI 同步，並用狀態鎖定降低一分鐘內反覆翻訊號。')
+st.caption('v2.25.1：左側資料模式會保留，不會因為 10 秒自動刷新跳掉。')
 
 if st.button('立即重抓 / 清快取'):
     st.cache_data.clear()
