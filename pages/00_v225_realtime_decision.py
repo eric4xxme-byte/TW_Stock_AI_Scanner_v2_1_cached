@@ -145,19 +145,30 @@ def qp_set(name: str, value: str) -> None:
 
 
 with st.sidebar:
-    st.header('v2.25 設定')
-    # 預設改成 GitHub live 即時計算；並用網址參數鎖住，不會因為前台 10 秒刷新跳掉。
-    mode_key = qp_get('v225_mode', st.session_state.get('v225_mode_key', 'github_live'))
-    if mode_key not in KEY_TO_MODE:
-        mode_key = 'github_live'
-    mode = st.radio(
-        '資料模式',
-        MODE_OPTIONS,
-        index=MODE_OPTIONS.index(KEY_TO_MODE[mode_key]),
-        key='v225_mode_radio',
-        help='已修正：資料模式會寫進網址 v225_mode，每次自動刷新都會保留，不會跳回預設。',
-    )
-    selected_key = MODE_TO_KEY.get(mode, 'github_live')
+    st.header('v2.25.2 設定')
+
+    # v2.25.2：盤中預設鎖死 GitHub live 即時計算，避免 10 秒刷新把 radio 洗掉。
+    # 只有打開進階模式時，才允許切換到前台直抓 MIS 或背景決策檔。
+    force_github_live = st.toggle('鎖定 GitHub live 即時計算', True, key='v225_force_github_live')
+    advanced_mode = st.toggle('顯示進階資料模式', False, key='v225_advanced_mode')
+
+    if force_github_live or not advanced_mode:
+        selected_key = 'github_live'
+        mode = KEY_TO_MODE[selected_key]
+        st.info('目前鎖定：GitHub live 即時計算。自動刷新不會再跳模式。')
+    else:
+        mode_key = qp_get('v225_mode', st.session_state.get('v225_mode_key', 'github_live'))
+        if mode_key not in KEY_TO_MODE:
+            mode_key = 'github_live'
+        mode = st.radio(
+            '資料模式',
+            MODE_OPTIONS,
+            index=MODE_OPTIONS.index(KEY_TO_MODE[mode_key]),
+            key='v225_mode_radio',
+            help='進階模式才需要切換。一般盤中請鎖定 GitHub live 即時計算。',
+        )
+        selected_key = MODE_TO_KEY.get(mode, 'github_live')
+
     st.session_state['v225_mode_key'] = selected_key
     qp_set('v225_mode', selected_key)
 
@@ -167,14 +178,14 @@ with st.sidebar:
     auto_refresh = st.toggle('前台自動刷新', True, key='v225_auto_refresh')
     show_all = st.checkbox('顯示全部欄位', False, key='v225_show_all')
     st.caption('A級不等於無腦買；必須同時給入場區、追價上限、停損與失效條件。')
-    st.caption('v2.25.1：資料模式已鎖在網址，刷新不會跳掉。')
+    st.caption('v2.25.2：預設鎖定 GitHub live；刷新不會把資料模式洗掉。')
 
 if auto_refresh:
     hard_refresh(refresh)
 
-st.title('🎯 v2.25 真實決策雷達｜二次確認，不再白老鼠試單')
+st.title('🎯 v2.25.2 真實決策雷達｜鎖定 GitHub live，不再跳模式')
 st.caption('修正重點：不再單靠一個 tick 叫你小單；A級需量價/位置/風險/AI 同步，並用狀態鎖定降低一分鐘內反覆翻訊號。')
-st.caption('v2.25.1：左側資料模式會保留，不會因為 10 秒自動刷新跳掉。')
+st.caption('v2.25.2：盤中預設鎖定 GitHub live 即時計算；如果資料年齡超過 6～8 分鐘，代表 GitHub Actions 還沒有新的背景 run。')
 
 if st.button('立即重抓 / 清快取'):
     st.cache_data.clear()
@@ -204,8 +215,8 @@ c4.metric('資料年齡', f'{age}s' if age is not None else '-')
 c5.metric('有效價格', meta.get('valid_price_count', '-'))
 c6.metric('候選數', len(df) if isinstance(df, pd.DataFrame) else 0)
 
-if age is not None and mode != '前台直抓 MIS' and age > 480:
-    st.warning('GitHub 背景檔超過 8 分鐘，代表 GitHub Actions 排程可能延遲。要看當下盤中，用左側「前台直抓 MIS」。')
+if age is not None and mode != '前台直抓 MIS' and age > 360:
+    st.warning('GitHub live 資料超過 6 分鐘沒有更新：這不是前台跳掉，是 GitHub Actions 尚未產生新的背景 run。請看 Actions 最新執行時間，或手動 Run workflow。')
 elif mode == '前台直抓 MIS':
     st.success('目前使用前台直抓 MIS：不等 GitHub Actions；若這裡也不動，才是 MIS 或網路來源問題。')
 
