@@ -1,4 +1,4 @@
-name: v2.25 Live Intraday + Sheet + Stable Decision
+name: v2.25.2 Live Intraday + Sheet + Stable Decision
 
 on:
   workflow_dispatch:
@@ -17,12 +17,13 @@ on:
         default: "120"
   schedule:
     # GitHub cron uses UTC. Taiwan = UTC+8.
-    # GitHub schedule 是 best-effort，可能延遲；前台 v2.25 頁可改用「前台直抓 MIS」繞過 Actions 延遲。
-    - cron: "52,57 0 * * 1-5"       # TW 08:52, 08:57
-    - cron: "3-58/5 1-4 * * 1-5"     # TW 09:03-12:58
-    - cron: "3-33/5 5 * * 1-5"       # TW 13:03-13:33
-    - cron: "13 6 * * 1-5"           # TW 14:13
-    - cron: "33 7 * * 1-5"           # TW 15:33
+    # v2.25.2 改成標準 5 分鐘刻度，避免原本 03/08/13... 偏移讓你誤判沒同步。
+    # 注意：GitHub schedule 仍是 best-effort，可能延遲或被 drop；這是平台限制。
+    - cron: "55 0 * * 1-5"        # TW 08:55 開盤前暖機
+    - cron: "*/5 1-4 * * 1-5"     # TW 09:00-12:55，每 5 分鐘
+    - cron: "0-35/5 5 * * 1-5"    # TW 13:00-13:35，每 5 分鐘
+    - cron: "45 5 * * 1-5"        # TW 13:45 收盤後補驗證
+    - cron: "30 6 * * 1-5"        # TW 14:30 盤後學習補寫
 
 permissions:
   contents: write
@@ -128,6 +129,6 @@ jobs:
             echo "No live data or learning journal changes to commit."
             exit 0
           fi
-          git commit -m "chore: v2.25 live intraday stable decision"
+          git commit -m "chore: v2.25.2 live intraday stable decision"
           git pull --rebase --autostash origin main || true
           git push origin HEAD:main
