@@ -1,7 +1,7 @@
 {
-  "updated_at": "2026-06-20T00:20:52.716617+08:00",
+  "updated_at": "2026-06-20T00:42:22.309879+08:00",
   "session_mode": "weekend",
-  "night_risk_score": 43.3,
+  "night_risk_score": 42.1,
   "night_label": "⚪ 夜盤中性",
   "next_day_note": "隔日依個股與族群強弱判斷。",
   "night_proxies": {
@@ -38,7 +38,7 @@
       "price_type": "last_close",
       "cached": false,
       "source": "FinMind TaiwanFuturesDaily last close / settlement",
-      "updated_at": "2026-06-20 00:20:56",
+      "updated_at": "2026-06-20 00:42:25",
       "note": "休市/週末/即時源失敗時使用最近交易日收盤或結算價",
       "requested_data_id": "MTX"
     },
@@ -46,9 +46,9 @@
       "symbol": "NQ=F",
       "label": "NASDAQ 100 期貨",
       "ok": true,
-      "price": 30659.0,
+      "price": 30681.0,
       "previous_close": 30719.75,
-      "change_pct": -0.19775551558850576,
+      "change_pct": -0.1261403494494584,
       "currency": "USD",
       "exchange": "CME",
       "source": "Yahoo chart"
@@ -57,9 +57,9 @@
       "symbol": "ES=F",
       "label": "S&P 500 期貨",
       "ok": true,
-      "price": 7559.75,
+      "price": 7564.25,
       "previous_close": 7570.75,
-      "change_pct": -0.1452960406828914,
+      "change_pct": -0.08585675131261764,
       "currency": "USD",
       "exchange": "CME",
       "source": "Yahoo chart"
@@ -90,9 +90,9 @@
       "symbol": "DX-Y.NYB",
       "label": "美元指數",
       "ok": true,
-      "price": 100.808,
+      "price": 100.78,
       "previous_close": 100.849,
-      "change_pct": -0.04065484040495872,
+      "change_pct": -0.06841912165713356,
       "currency": "USD",
       "exchange": "NYB",
       "source": "Yahoo chart"
@@ -101,9 +101,9 @@
       "symbol": "CL=F",
       "label": "WTI 原油期貨",
       "ok": true,
-      "price": 76.64,
+      "price": 76.48,
       "previous_close": 75.85,
-      "change_pct": 1.0415293342122693,
+      "change_pct": 0.8305866842452335,
       "currency": "USD",
       "exchange": "NYM",
       "source": "Yahoo chart"
