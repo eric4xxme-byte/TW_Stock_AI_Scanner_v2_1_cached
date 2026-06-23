@@ -1,15 +1,15 @@
 {
-  "updated_at": "2026-06-23T03:57:54.239467+08:00",
+  "updated_at": "2026-06-23T20:17:46.769039+08:00",
   "status": "ok",
   "session_mode": "night_context",
   "pool_count": 180,
   "quote_raw_count": 171,
   "live_count": 170,
-  "journal_count": 1554,
+  "journal_count": 1579,
   "sync": {
     "ok": true,
-    "inserted": 0,
-    "updated": 120,
+    "inserted": 25,
+    "updated": 95,
     "skipped": 0,
     "sent": 120,
     "message": "1/6 ok; 2/6 ok; 3/6 ok; 4/6 ok; 5/6 ok; 6/6 ok"
