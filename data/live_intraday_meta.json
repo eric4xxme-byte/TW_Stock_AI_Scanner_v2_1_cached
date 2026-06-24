@@ -1,14 +1,14 @@
 {
-  "updated_at": "2026-06-24T20:35:13+08:00",
-  "status": "ok",
+  "updated_at": "2026-06-24T21:40:07+08:00",
+  "status": "no_valid_price",
   "session_mode": "off_hours",
   "workflow_version": "v2.24-live-intraday",
   "candidate_count": 37,
   "query_channel_count": 74,
-  "quote_raw_count": 74,
-  "valid_price_count": 37,
-  "trade_price_count": 37,
-  "quote_failed_count": 0,
+  "quote_raw_count": 0,
+  "valid_price_count": 0,
+  "trade_price_count": 0,
+  "quote_failed_count": 37,
   "focus_codes": [
     "3441",
     "2382",
@@ -18,6 +18,17 @@
     "3042",
     "6257"
   ],
-  "errors_tail": [],
+  "errors_tail": [
+    "HTTP 502 https://mis.twse.com.tw/stock/api/getStockInfo.jsp",
+    "HTTP 502 http://mis.twse.com.tw/stock/api/getStockInfo.jsp",
+    "HTTP 502 https://mis.twse.com.tw/stock/api/getStockInfo.jsp",
+    "HTTP 502 http://mis.twse.com.tw/stock/api/getStockInfo.jsp",
+    "HTTP 502 https://mis.twse.com.tw/stock/api/getStockInfo.jsp",
+    "HTTP 502 http://mis.twse.com.tw/stock/api/getStockInfo.jsp",
+    "HTTP 502 https://mis.twse.com.tw/stock/api/getStockInfo.jsp",
+    "HTTP 502 http://mis.twse.com.tw/stock/api/getStockInfo.jsp",
+    "HTTP 502 https://mis.twse.com.tw/stock/api/getStockInfo.jsp",
+    "HTTP 502 http://mis.twse.com.tw/stock/api/getStockInfo.jsp"
+  ],
   "note": "前台應以 data/live_intraday_meta.json 的 updated_at 判斷資料是否真的更新；不要只看 Streamlit rerun 時間。"
 }
