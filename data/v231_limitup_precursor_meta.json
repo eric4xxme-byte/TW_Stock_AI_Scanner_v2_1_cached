@@ -1,10 +1,10 @@
 {
-  "updated_at": "2026-07-03T19:13:03.808378+08:00",
+  "updated_at": "2026-07-03T20:28:20.547548+08:00",
   "status": "ok",
   "source_journal_exists": true,
-  "new_rows": 3048,
-  "total_rows": 3048,
+  "new_rows": 3219,
+  "total_rows": 3219,
   "hot_rows": 0,
-  "avg_quality": 94.48,
+  "avg_quality": 94.2,
   "output": "/home/runner/work/TW_Stock_AI_Scanner_v2_1_cached/TW_Stock_AI_Scanner_v2_1_cached/data/v231_limitup_precursor_features.csv"
 }
