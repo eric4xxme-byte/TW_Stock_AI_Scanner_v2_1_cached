@@ -1,13 +1,13 @@
 {
-  "updated_at": "2026-07-03T19:57:10+08:00",
-  "mode": "intraday_snapshot_v2_4_1",
+  "updated_at": "2026-07-03T20:24:10+08:00",
+  "mode": "intraday_snapshot_v2_24_live",
   "source": "TWSE MIS getStockInfo.jsp",
-  "candidate_count": 30,
-  "query_channel_count": 60,
+  "candidate_count": 35,
+  "query_channel_count": 70,
   "quote_count": 0,
   "quote_success_count": 0,
   "valid_price_count": 0,
   "trade_price_count": 0,
-  "quote_failed_count": 30,
-  "note": "盤中快照只更新現價、漲跌幅與成交量；法人與融資融券仍沿用盤後資料。若價格來源為買賣價或昨收參考，請勿視為正式成交價。"
+  "quote_failed_count": 35,
+  "note": "v2.24 live engine 寫入；若前台時間有更新但價格沒變，代表來源 MIS 該檔未回傳新成交價，不再假裝刷新。"
 }
