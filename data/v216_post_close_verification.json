@@ -1,5 +1,14 @@
 {
-  "updated_at": "2026-06-12T17:59:47.777542+08:00",
-  "status": "not_post_close_window",
-  "note": "created by workflow fallback so git add will not fail"
+  "updated_at": "2026-07-14T14:00:09.488447+08:00",
+  "status": "ok",
+  "session_mode": "post_close_verify",
+  "journal_count": 4494,
+  "sync": {
+    "ok": true,
+    "inserted": 0,
+    "updated": 120,
+    "skipped": 0,
+    "sent": 120,
+    "message": "1/6 ok; 2/6 ok; 3/6 ok; 4/6 ok; 5/6 ok; 6/6 ok"
+  }
 }
