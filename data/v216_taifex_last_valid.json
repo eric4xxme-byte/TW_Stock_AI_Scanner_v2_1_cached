@@ -12,30 +12,30 @@
     "price_type": "last_close",
     "cached": false,
     "source": "FinMind TaiwanFuturesDaily last close / settlement",
-    "updated_at": "2026-07-15 16:32:05",
+    "updated_at": "2026-07-15 17:29:38",
     "note": "休市/週末/即時源失敗時使用最近交易日收盤或結算價",
     "requested_data_id": "MTX",
-    "cached_at": "2026-07-15 16:32:05"
+    "cached_at": "2026-07-15 17:29:38"
   },
   "TXF": {
     "symbol": "WTX&",
     "label": "台指期近月",
     "ok": true,
     "source": "Yahoo WTX& direct page",
-    "price": 46066.0,
+    "price": 46100.0,
     "previous_close": 46066.0,
-    "change": 0.0,
-    "change_pct": 0.0,
-    "bid": 46065.0,
-    "ask": 46069.0,
+    "change": 34.0,
+    "change_pct": 0.07,
+    "bid": 46097.0,
+    "ask": 46100.0,
     "open": 46120.0,
     "high": 46260.0,
     "low": 46010.0,
-    "volume": 6963.0,
+    "volume": 8313.0,
     "source_url": "https://tw.stock.yahoo.com/future/WTX%26",
-    "updated_at": "2026-07-15 16:32",
+    "updated_at": "2026-07-15 17:29",
     "price_type": "live_or_last_close",
     "finmind_error": "HTTP 400: {'msg': 'Your level is register. Please update your user level. Detail information:https://finmindtrade.com/analysis/#/Sponsor/sponsor', 'status': 400, 'token_tail': '...uFQw2NL0'}",
-    "cached_at": "2026-07-15 16:32:05"
+    "cached_at": "2026-07-15 17:29:38"
   }
 }
