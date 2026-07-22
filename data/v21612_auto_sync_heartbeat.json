@@ -2,9 +2,9 @@
   "status": "completed",
   "workflow_version": "v2.16.13",
   "event_name": "schedule",
-  "run_id": "29890388912",
-  "run_number": "124",
-  "completed_at_tw": "2026-07-22T12:12:11.338243+08:00",
+  "run_id": "29897523384",
+  "run_number": "125",
+  "completed_at_tw": "2026-07-22T14:41:51.031591+08:00",
   "auto_schedule": "TW Mon-Fri 09:00-13:35 every 5 min; 14:10 and 15:30 verification",
   "note": "This heartbeat is written every run. Schedule is working only if this updates without manual Run workflow."
 }
