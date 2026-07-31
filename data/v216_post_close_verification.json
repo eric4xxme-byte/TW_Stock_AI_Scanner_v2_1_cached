@@ -1,11 +1,14 @@
 {
-  "updated_at": "2026-07-31T15:57:39.391097+08:00",
+  "updated_at": "2026-07-31T16:20:15.389117+08:00",
   "status": "ok",
   "session_mode": "post_close_verify",
   "journal_count": 6737,
   "sync": {
-    "ok": false,
-    "message": "batch 5/6 HTTP 404: <!DOCTYPE html><html lang=\"en\"><head><meta name=\"description\" content=\"Web word processing, presentations and spreadsheets\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=0\"><link rel=\"shortcut icon\" href=\"//docs.google.com/favicon.ico\"><title>Page Not Found</title><meta name=\"referrer\" content=\"origin\"><link href=\"//fonts.googleapis.com/css?family=Product+Sans\" rel=\"stylesheet\" type=\"text/css\" nonce=\"M1HaWFzdf-PBaO2Epq5P",
-    "sent": 80
+    "ok": true,
+    "inserted": 0,
+    "updated": 120,
+    "skipped": 0,
+    "sent": 120,
+    "message": "1/6 ok; 2/6 ok; 3/6 ok; 4/6 ok; 5/6 ok; 6/6 ok"
   }
 }
