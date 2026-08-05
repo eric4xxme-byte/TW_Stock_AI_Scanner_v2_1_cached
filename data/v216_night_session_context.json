@@ -1,7 +1,7 @@
 {
-  "updated_at": "2026-08-05T16:48:53.269533+08:00",
+  "updated_at": "2026-08-05T18:08:39.477225+08:00",
   "session_mode": "night_context",
-  "night_risk_score": 41.2,
+  "night_risk_score": 38.6,
   "night_label": "🟢 夜盤偏多",
   "next_day_note": "隔日 AI / 半導體 / 資金股承接機率較高。",
   "night_proxies": {
@@ -10,18 +10,18 @@
       "label": "台指期近月",
       "ok": true,
       "source": "Yahoo WTX& direct page",
-      "price": 44204.0,
+      "price": 44249.0,
       "previous_close": 44537.0,
-      "change": 333.0,
-      "change_pct": 0.75,
-      "bid": 44200.0,
-      "ask": 44205.0,
+      "change": 288.0,
+      "change_pct": 0.65,
+      "bid": 44250.0,
+      "ask": 44255.0,
       "open": 44580.0,
       "high": 44625.0,
       "low": 44131.0,
-      "volume": 8334.0,
+      "volume": 11744.0,
       "source_url": "https://tw.stock.yahoo.com/future/WTX%26",
-      "updated_at": "2026-08-05 16:48",
+      "updated_at": "2026-08-05 18:08",
       "price_type": "live_or_last_close",
       "finmind_error": "HTTP 400: {'msg': 'Your level is register. Please update your user level. Detail information:https://finmindtrade.com/analysis/#/Sponsor/sponsor', 'status': 400, 'token_tail': '...uFQw2NL0'}"
     },
@@ -38,7 +38,7 @@
       "price_type": "last_close",
       "cached": false,
       "source": "FinMind TaiwanFuturesDaily last close / settlement",
-      "updated_at": "2026-08-05 16:48:56",
+      "updated_at": "2026-08-05 18:08:43",
       "note": "休市/週末/即時源失敗時使用最近交易日收盤或結算價",
       "requested_data_id": "MTX"
     },
@@ -46,9 +46,9 @@
       "symbol": "NQ=F",
       "label": "NASDAQ 100 期貨",
       "ok": true,
-      "price": 29810.0,
+      "price": 29861.5,
       "previous_close": 29863.5,
-      "change_pct": -0.17914845882096875,
+      "change_pct": -0.006697138647512851,
       "currency": "USD",
       "exchange": "CME",
       "source": "Yahoo chart"
@@ -57,9 +57,9 @@
       "symbol": "ES=F",
       "label": "S&P 500 期貨",
       "ok": true,
-      "price": 7783.0,
+      "price": 7789.0,
       "previous_close": 7765.5,
-      "change_pct": 0.22535574013263796,
+      "change_pct": 0.302620565320971,
       "currency": "USD",
       "exchange": "CME",
       "source": "Yahoo chart"
@@ -90,9 +90,9 @@
       "symbol": "DX-Y.NYB",
       "label": "美元指數",
       "ok": true,
-      "price": 99.831,
+      "price": 99.813,
       "previous_close": 99.858,
-      "change_pct": -0.027038394520219736,
+      "change_pct": -0.04506399086703289,
       "currency": "USD",
       "exchange": "NYB",
       "source": "Yahoo chart"
@@ -101,9 +101,9 @@
       "symbol": "CL=F",
       "label": "WTI 原油期貨",
       "ok": true,
-      "price": 76.32,
+      "price": 76.47,
       "previous_close": 75.77,
-      "change_pct": 0.7258809555232905,
+      "change_pct": 0.9238484888478328,
       "currency": "USD",
       "exchange": "NYM",
       "source": "Yahoo chart"
@@ -116,6 +116,6 @@
     "nq_ok": true,
     "es_ok": true,
     "sox_ok": true,
-    "breadth_ok": true
+    "breadth_ok": false
   }
 }
