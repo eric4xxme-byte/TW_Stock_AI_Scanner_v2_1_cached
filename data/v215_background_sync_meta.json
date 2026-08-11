@@ -1,5 +1,5 @@
 {
-  "updated_at": "2026-08-11T11:00:34.971136+08:00",
+  "updated_at": "2026-08-11T11:05:09.134670+08:00",
   "status": "ok",
   "session_mode": "intraday",
   "pool_count": 120,
@@ -8,8 +8,8 @@
   "journal_count": 7865,
   "sync": {
     "ok": true,
-    "inserted": 52,
-    "updated": 68,
+    "inserted": 14,
+    "updated": 106,
     "skipped": 0,
     "sent": 120,
     "message": "1/6 ok; 2/6 ok; 3/6 ok; 4/6 ok; 5/6 ok; 6/6 ok"
