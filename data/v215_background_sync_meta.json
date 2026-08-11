@@ -1,15 +1,15 @@
 {
-  "updated_at": "2026-08-10T16:11:28.629382+08:00",
+  "updated_at": "2026-08-11T11:00:34.971136+08:00",
   "status": "ok",
-  "session_mode": "post_close_verify",
-  "pool_count": 33,
-  "quote_raw_count": 0,
-  "live_count": 36,
-  "journal_count": 7751,
+  "session_mode": "intraday",
+  "pool_count": 120,
+  "quote_raw_count": 115,
+  "live_count": 114,
+  "journal_count": 7865,
   "sync": {
     "ok": true,
-    "inserted": 5,
-    "updated": 115,
+    "inserted": 52,
+    "updated": 68,
     "skipped": 0,
     "sent": 120,
     "message": "1/6 ok; 2/6 ok; 3/6 ok; 4/6 ok; 5/6 ok; 6/6 ok"
