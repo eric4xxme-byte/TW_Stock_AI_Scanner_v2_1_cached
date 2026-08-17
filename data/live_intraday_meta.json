@@ -1,5 +1,5 @@
 {
-  "updated_at": "2026-08-17T12:59:59+08:00",
+  "updated_at": "2026-08-17T13:26:10+08:00",
   "status": "ok",
   "session_mode": "intraday",
   "workflow_version": "v2.24-live-intraday",
@@ -7,7 +7,7 @@
   "query_channel_count": 74,
   "quote_raw_count": 74,
   "valid_price_count": 37,
-  "trade_price_count": 10,
+  "trade_price_count": 37,
   "quote_failed_count": 0,
   "focus_codes": [
     "3441",
