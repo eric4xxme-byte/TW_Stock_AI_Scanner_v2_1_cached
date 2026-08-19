@@ -1,13 +1,13 @@
 {
-  "updated_at": "2026-08-18T15:11:46+08:00",
+  "updated_at": "2026-08-19T10:13:56+08:00",
   "mode": "intraday_snapshot_v2_24_live",
   "source": "TWSE MIS getStockInfo.jsp",
-  "candidate_count": 35,
-  "query_channel_count": 70,
-  "quote_count": 70,
-  "quote_success_count": 35,
-  "valid_price_count": 35,
-  "trade_price_count": 35,
+  "candidate_count": 36,
+  "query_channel_count": 72,
+  "quote_count": 72,
+  "quote_success_count": 36,
+  "valid_price_count": 36,
+  "trade_price_count": 2,
   "quote_failed_count": 0,
   "note": "v2.24 live engine 寫入；若前台時間有更新但價格沒變，代表來源 MIS 該檔未回傳新成交價，不再假裝刷新。"
 }
