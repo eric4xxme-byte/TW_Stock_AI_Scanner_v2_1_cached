@@ -1,14 +1,14 @@
 {
-  "updated_at": "2026-08-19T12:29:16.401573+08:00",
+  "updated_at": "2026-08-19T12:48:50.238026+08:00",
   "status": "ok",
   "session_mode": "intraday",
-  "pool_count": 180,
-  "quote_raw_count": 166,
-  "live_count": 165,
+  "pool_count": 120,
+  "quote_raw_count": 114,
+  "live_count": 113,
   "journal_count": 8939,
   "sync": {
     "ok": false,
-    "message": "batch 1/6 HTTP 404: <!DOCTYPE html><html lang=\"en\"><head><script nonce=\"cGfI_IwrZnTpz9pABf2BHg\">window['ppConfig'] = {productName: '26981ed0d57bbad37e728ff58134270c', deleteIsEnforced:  false , sealIsEnforced:  false , heartbeatRate:  0.5 , periodicReportingRateMillis:  60000.0 , disableAllReporting:  false };(function(){'use strict';function k(a){var b=0;return function(){return b<a.length?{done:!1,value:a[b++]}:{done:!0}}}function l(a){var b=typeof Symbol!=\"undefined\"&&Symbol.iterator&&a[Symbol.iterator];if(b)ret",
-    "sent": 0
+    "message": "batch 5/6 HTTP 404: <!DOCTYPE html><html lang=\"en\"><head><script nonce=\"1QTCuUR77da7D-mKVmn9Qw\">window['ppConfig'] = {productName: '26981ed0d57bbad37e728ff58134270c', deleteIsEnforced:  false , sealIsEnforced:  false , heartbeatRate:  0.5 , periodicReportingRateMillis:  60000.0 , disableAllReporting:  false };(function(){'use strict';function k(a){var b=0;return function(){return b<a.length?{done:!1,value:a[b++]}:{done:!0}}}function l(a){var b=typeof Symbol!=\"undefined\"&&Symbol.iterator&&a[Symbol.iterator];if(b)ret",
+    "sent": 80
   }
 }
