@@ -1,11 +1,11 @@
 {
   "status": "ok",
-  "updated_at": "2026-08-26T11:33:23+08:00",
+  "updated_at": "2026-08-26T12:21:06+08:00",
   "workflow_version": "v2.25-realtime-decision",
   "input_rows": 39,
   "output_rows": 39,
   "a_count": 0,
-  "b_count": 1,
+  "b_count": 3,
   "no_chase_count": 2,
   "note": "v2.25 用狀態鎖定與二次確認降低一分鐘內反覆打臉；A級不是無腦買，是小量試單區與停損一起給。"
 }
