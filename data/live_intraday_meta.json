@@ -1,13 +1,13 @@
 {
-  "updated_at": "2026-08-25T15:16:43+08:00",
+  "updated_at": "2026-08-26T10:20:29+08:00",
   "status": "ok",
-  "session_mode": "post_close",
+  "session_mode": "intraday",
   "workflow_version": "v2.24-live-intraday",
   "candidate_count": 39,
   "query_channel_count": 78,
   "quote_raw_count": 78,
   "valid_price_count": 39,
-  "trade_price_count": 39,
+  "trade_price_count": 3,
   "quote_failed_count": 0,
   "focus_codes": [
     "3441",
