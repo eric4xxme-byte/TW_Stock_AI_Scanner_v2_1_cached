@@ -1,7 +1,7 @@
 {
-  "updated_at": "2026-08-28T20:34:37+08:00",
+  "updated_at": "2026-08-29T00:59:19+08:00",
   "status": "ok",
-  "session_mode": "off_hours",
+  "session_mode": "weekend",
   "workflow_version": "v2.24-live-intraday",
   "candidate_count": 39,
   "query_channel_count": 78,
