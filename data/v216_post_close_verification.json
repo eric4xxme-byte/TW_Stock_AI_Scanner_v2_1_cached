@@ -1,11 +1,14 @@
 {
-  "updated_at": "2026-08-26T16:08:59.037250+08:00",
+  "updated_at": "2026-08-31T14:24:32.778158+08:00",
   "status": "ok",
   "session_mode": "post_close_verify",
-  "journal_count": 9787,
+  "journal_count": 10476,
   "sync": {
-    "ok": false,
-    "message": "batch 4/6 HTTP 404: <!DOCTYPE html><html lang=\"en\"><head><script nonce=\"nFwREMb329bhCiddqukO8Q\">window['ppConfig'] = {productName: '26981ed0d57bbad37e728ff58134270c', deleteIsEnforced:  false , sealIsEnforced:  false , heartbeatRate:  0.5 , periodicReportingRateMillis:  60000.0 , disableAllReporting:  false };(function(){'use strict';function k(a){var b=0;return function(){return b<a.length?{done:!1,value:a[b++]}:{done:!0}}}function l(a){var b=typeof Symbol!=\"undefined\"&&Symbol.iterator&&a[Symbol.iterator];if(b)ret",
-    "sent": 60
+    "ok": true,
+    "inserted": 120,
+    "updated": 0,
+    "skipped": 0,
+    "sent": 120,
+    "message": "1/6 ok; 2/6 ok; 3/6 ok; 4/6 ok; 5/6 ok; 6/6 ok"
   }
 }
