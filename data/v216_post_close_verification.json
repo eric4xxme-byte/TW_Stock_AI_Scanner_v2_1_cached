@@ -1,14 +1,20 @@
 {
-  "updated_at": "2026-08-31T14:47:52.400558+08:00",
-  "status": "ok",
-  "session_mode": "post_close_verify",
-  "journal_count": 10476,
-  "sync": {
+  "updated_at": "2026-09-01T13:51:51.671579+08:00",
+  "status": "market_context_post_close_written",
+  "market_env_score": 71.5,
+  "market_label": "🟢 大盤偏多",
+  "breadth": {
     "ok": true,
-    "inserted": 0,
-    "updated": 120,
-    "skipped": 0,
-    "sent": 120,
-    "message": "1/6 ok; 2/6 ok; 3/6 ok; 4/6 ok; 5/6 ok; 6/6 ok"
+    "source": "data/intraday_snapshot.csv",
+    "rows": 37,
+    "valid_pct_rows": 37,
+    "up_count": 19,
+    "down_count": 17,
+    "flat_count": 1,
+    "up_ratio": 0.5135,
+    "avg_pct": 0.2692,
+    "median_pct": 0.55,
+    "max_pct": 9.98,
+    "min_pct": -10.0
   }
 }
