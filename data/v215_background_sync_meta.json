@@ -1,5 +1,5 @@
 {
-  "updated_at": "2026-09-02T13:17:53.885466+08:00",
+  "updated_at": "2026-09-02T13:32:25.526951+08:00",
   "status": "ok",
   "session_mode": "intraday",
   "pool_count": 120,
@@ -9,7 +9,7 @@
   "sync": {
     "ok": true,
     "inserted": 0,
-    "updated": 100,
+    "updated": 120,
     "skipped": 0,
     "sent": 120,
     "message": "1/6 ok; 2/6 ok; 3/6 ok; 4/6 ok; 5/6 ok; 6/6 ok"
