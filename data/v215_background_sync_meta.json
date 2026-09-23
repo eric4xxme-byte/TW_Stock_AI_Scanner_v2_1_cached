@@ -1,7 +1,7 @@
 {
-  "updated_at": "2026-09-23T13:24:23.001824+08:00",
+  "updated_at": "2026-09-23T13:38:18.384765+08:00",
   "status": "ok",
-  "session_mode": "intraday",
+  "session_mode": "post_close_verify",
   "pool_count": 120,
   "quote_raw_count": 112,
   "live_count": 111,
