@@ -1,11 +1,14 @@
 {
-  "updated_at": "2026-09-28T14:09:11.124459+08:00",
+  "updated_at": "2026-09-28T14:27:33.198316+08:00",
   "status": "ok",
   "session_mode": "post_close_verify",
   "journal_count": 13890,
   "sync": {
-    "ok": false,
-    "message": "batch 3/6 exception: HTTPSConnectionPool(host='script.google.com', port=443): Read timed out. (read timeout=45)",
-    "sent": 40
+    "ok": true,
+    "inserted": 60,
+    "updated": 60,
+    "skipped": 0,
+    "sent": 120,
+    "message": "1/6 ok; 2/6 ok; 3/6 ok; 4/6 ok; 5/6 ok; 6/6 ok"
   }
 }
