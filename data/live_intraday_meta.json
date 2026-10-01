@@ -1,7 +1,7 @@
 {
-  "updated_at": "2026-10-01T14:59:08+08:00",
+  "updated_at": "2026-10-01T19:15:29+08:00",
   "status": "ok",
-  "session_mode": "post_close",
+  "session_mode": "off_hours",
   "workflow_version": "v2.24-live-intraday",
   "candidate_count": 39,
   "query_channel_count": 78,
