@@ -1,14 +1,17 @@
 {
-  "updated_at": "2026-10-07T19:25:27.625726+08:00",
+  "updated_at": "2026-10-07T19:40:14.973229+08:00",
   "status": "ok",
   "session_mode": "night_context",
-  "pool_count": 120,
-  "quote_raw_count": 114,
-  "live_count": 113,
+  "pool_count": 180,
+  "quote_raw_count": 172,
+  "live_count": 171,
   "journal_count": 15105,
   "sync": {
-    "ok": false,
-    "message": "batch 6/6 exception: HTTPSConnectionPool(host='script.google.com', port=443): Read timed out. (read timeout=45)",
-    "sent": 100
+    "ok": true,
+    "inserted": 0,
+    "updated": 100,
+    "skipped": 0,
+    "sent": 120,
+    "message": "1/6 ok; 2/6 ok; 3/6 ok; 4/6 ok; 5/6 ok; 6/6 ok"
   }
 }
