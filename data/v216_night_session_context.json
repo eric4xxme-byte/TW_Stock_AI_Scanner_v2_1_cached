@@ -1,9 +1,9 @@
 {
-  "updated_at": "2026-10-09T21:07:57.168253+08:00",
+  "updated_at": "2026-10-09T22:32:39.128094+08:00",
   "session_mode": "night_context",
-  "night_risk_score": 65.2,
-  "night_label": "🟡 夜盤偏保守",
-  "next_day_note": "隔日先看開盤承接，不急追。",
+  "night_risk_score": 50.1,
+  "night_label": "⚪ 夜盤中性",
+  "next_day_note": "隔日依個股與族群強弱判斷。",
   "night_proxies": {
     "TXF": {
       "symbol": "WTX&",
@@ -38,7 +38,7 @@
       "price_type": "last_close",
       "cached": false,
       "source": "FinMind TaiwanFuturesDaily last close / settlement",
-      "updated_at": "2026-10-09 21:08:01",
+      "updated_at": "2026-10-09 22:32:43",
       "note": "休市/週末/即時源失敗時使用最近交易日收盤或結算價",
       "requested_data_id": "MTX"
     },
@@ -46,9 +46,9 @@
       "symbol": "NQ=F",
       "label": "NASDAQ 100 期貨",
       "ok": true,
-      "price": 31175.25,
+      "price": 31034.5,
       "previous_close": 30969.5,
-      "change_pct": 0.6643633252070585,
+      "change_pct": 0.20988391804840248,
       "currency": "USD",
       "exchange": "CME",
       "source": "Yahoo chart"
@@ -57,9 +57,9 @@
       "symbol": "ES=F",
       "label": "S&P 500 期貨",
       "ok": true,
-      "price": 7838.0,
+      "price": 7840.0,
       "previous_close": 7816.25,
-      "change_pct": 0.27826643211258595,
+      "change_pct": 0.30385415000799615,
       "currency": "USD",
       "exchange": "CME",
       "source": "Yahoo chart"
@@ -68,9 +68,9 @@
       "symbol": "^SOX",
       "label": "費半指數",
       "ok": true,
-      "price": 12623.715,
-      "previous_close": 13066.149,
-      "change_pct": -3.3861086384366144,
+      "price": 12601.847,
+      "previous_close": 12623.715,
+      "change_pct": -0.17322951286527297,
       "currency": "USD",
       "exchange": "NIM",
       "source": "Yahoo chart"
@@ -79,9 +79,9 @@
       "symbol": "^TNX",
       "label": "美10年殖利率",
       "ok": true,
-      "price": 5.261,
+      "price": 5.267,
       "previous_close": 5.231,
-      "change_pct": 0.5735041101127939,
+      "change_pct": 0.6882049321353562,
       "currency": "USD",
       "exchange": "CGI",
       "source": "Yahoo chart"
@@ -90,9 +90,9 @@
       "symbol": "DX-Y.NYB",
       "label": "美元指數",
       "ok": true,
-      "price": 102.309,
+      "price": 102.302,
       "previous_close": 102.138,
-      "change_pct": 0.16742054866943964,
+      "change_pct": 0.16056707591689817,
       "currency": "USD",
       "exchange": "NYB",
       "source": "Yahoo chart"
