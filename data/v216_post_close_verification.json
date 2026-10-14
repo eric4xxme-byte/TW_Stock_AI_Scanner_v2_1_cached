@@ -1,14 +1,11 @@
 {
-  "updated_at": "2026-10-14T13:37:23.426380+08:00",
+  "updated_at": "2026-10-14T13:39:20.327539+08:00",
   "status": "ok",
   "session_mode": "post_close_verify",
   "journal_count": 15984,
   "sync": {
-    "ok": true,
-    "inserted": 120,
-    "updated": 0,
-    "skipped": 0,
-    "sent": 120,
-    "message": "1/6 ok; 2/6 ok; 3/6 ok; 4/6 ok; 5/6 ok; 6/6 ok"
+    "ok": false,
+    "message": "batch 4/6 HTTP 502: <!DOCTYPE html>\n<html lang=en>\n  <meta charset=utf-8>\n  <meta name=viewport content=\"initial-scale=1, minimum-scale=1, width=device-width\">\n  <title>Error 502 (Server Error)!!1</title>\n  <style>\n    *{margin:0;padding:0}html,code{font:15px/22px arial,sans-serif}html{background:#fff;color:#222;padding:15px}body{margin:7% auto 0;max-width:390px;min-height:180px;padding:30px 0 15px}* > body{background:url(//www.google.com/images/errors/robot.png) 100% 5px no-repeat;padding-right:205px}p{margin:11px",
+    "sent": 60
   }
 }
