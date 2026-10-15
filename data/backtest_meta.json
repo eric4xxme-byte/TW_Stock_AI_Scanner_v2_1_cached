@@ -1,8 +1,8 @@
 {
-  "updated_at": "2026-10-14T23:38:05+08:00",
+  "updated_at": "2026-10-15T23:29:41+08:00",
   "status": "ok",
-  "snapshot_count": 85,
-  "trade_rows": 850,
+  "snapshot_count": 86,
+  "trade_rows": 860,
   "summary_rows": 6,
   "top_n": 10,
   "horizons": [
