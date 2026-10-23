@@ -1,10 +1,10 @@
 {
-  "updated_at": "2026-10-23T19:30:38.779828+08:00",
+  "updated_at": "2026-10-23T20:46:45.214178+08:00",
   "session_mode": "night_context",
   "market_env_score": 25.6,
   "market_label": "⚫ 系統性風險",
   "market_action": "不追價，等待大盤止跌或隔日確認。",
-  "night_risk_score": 73.8,
+  "night_risk_score": 78.5,
   "night_label": "🔴 夜盤風險高",
   "next_day_note": "隔日開盤風險偏高，高分股也要降級。",
   "breadth": {
@@ -75,7 +75,7 @@
       "price_type": "last_close",
       "cached": false,
       "source": "FinMind TaiwanFuturesDaily last close / settlement",
-      "updated_at": "2026-10-23 19:30:42",
+      "updated_at": "2026-10-23 20:46:49",
       "note": "休市/週末/即時源失敗時使用最近交易日收盤或結算價",
       "requested_data_id": "MTX"
     }
@@ -114,7 +114,7 @@
       "price_type": "last_close",
       "cached": false,
       "source": "FinMind TaiwanFuturesDaily last close / settlement",
-      "updated_at": "2026-10-23 19:30:42",
+      "updated_at": "2026-10-23 20:46:49",
       "note": "休市/週末/即時源失敗時使用最近交易日收盤或結算價",
       "requested_data_id": "MTX"
     },
@@ -122,9 +122,9 @@
       "symbol": "NQ=F",
       "label": "NASDAQ 100 期貨",
       "ok": true,
-      "price": 29108.0,
+      "price": 29045.0,
       "previous_close": 29142.0,
-      "change_pct": -0.11667009814014138,
+      "change_pct": -0.3328529270468739,
       "currency": "USD",
       "exchange": "CME",
       "source": "Yahoo chart"
@@ -133,9 +133,9 @@
       "symbol": "ES=F",
       "label": "S&P 500 期貨",
       "ok": true,
-      "price": 7683.75,
+      "price": 7668.5,
       "previous_close": 7704.5,
-      "change_pct": -0.2693231228502823,
+      "change_pct": -0.46725939386073073,
       "currency": "USD",
       "exchange": "CME",
       "source": "Yahoo chart"
@@ -155,9 +155,9 @@
       "symbol": "^TNX",
       "label": "美10年殖利率",
       "ok": true,
-      "price": 4.953,
-      "previous_close": 5.146,
-      "change_pct": -3.750485814224633,
+      "price": 4.982,
+      "previous_close": 4.953,
+      "change_pct": 0.5855037351100325,
       "currency": "USD",
       "exchange": "CGI",
       "source": "Yahoo chart"
@@ -166,9 +166,9 @@
       "symbol": "DX-Y.NYB",
       "label": "美元指數",
       "ok": true,
-      "price": 101.792,
+      "price": 101.735,
       "previous_close": 101.607,
-      "change_pct": 0.18207406969992448,
+      "change_pct": 0.12597557254913552,
       "currency": "USD",
       "exchange": "NYB",
       "source": "Yahoo chart"
@@ -177,9 +177,9 @@
       "symbol": "CL=F",
       "label": "WTI 原油期貨",
       "ok": true,
-      "price": 101.06,
+      "price": 101.18,
       "previous_close": 99.47,
-      "change_pct": 1.5984719010757047,
+      "change_pct": 1.7191112898361394,
       "currency": "USD",
       "exchange": "NYM",
       "source": "Yahoo chart"
