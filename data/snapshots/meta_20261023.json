@@ -1,0 +1,15 @@
+{
+  "updated_at": "2026-10-23T23:23:38+08:00",
+  "candidate_source": "上市+上櫃成交金額排行｜證交所上市成交金額排行（STOCK_DAY_ALL）；櫃買中心上櫃成交金額排行（tpex_mainboard_quotes）",
+  "requested_limit": 30,
+  "candidate_count": 30,
+  "success_count": 30,
+  "skipped_count": 0,
+  "chip_detail_limit": 10,
+  "chip_fetched_count": 10,
+  "skipped_stock_ids": [],
+  "has_finmind_token": true,
+  "market_counts": {
+    "未知": 30
+  }
+}
