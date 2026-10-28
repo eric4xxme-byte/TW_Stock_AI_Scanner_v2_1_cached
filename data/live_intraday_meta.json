@@ -1,14 +1,14 @@
 {
-  "updated_at": "2026-10-28T18:53:48+08:00",
+  "updated_at": "2026-10-28T19:38:36+08:00",
   "status": "ok",
   "session_mode": "off_hours",
   "workflow_version": "v2.24-live-intraday",
   "candidate_count": 38,
   "query_channel_count": 76,
-  "quote_raw_count": 76,
-  "valid_price_count": 38,
-  "trade_price_count": 38,
-  "quote_failed_count": 0,
+  "quote_raw_count": 52,
+  "valid_price_count": 26,
+  "trade_price_count": 26,
+  "quote_failed_count": 12,
   "focus_codes": [
     "3441",
     "2382",
@@ -18,6 +18,13 @@
     "3042",
     "6257"
   ],
-  "errors_tail": [],
+  "errors_tail": [
+    "HTTPSConnectionPool(host='mis.twse.com.tw', port=443): Read timed out. (read timeout=15)",
+    "HTTPSConnectionPool(host='mis.twse.com.tw', port=443): Read timed out. (read timeout=15)",
+    "HTTPSConnectionPool(host='mis.twse.com.tw', port=443): Read timed out. (read timeout=15)",
+    "HTTPSConnectionPool(host='mis.twse.com.tw', port=443): Read timed out. (read timeout=15)",
+    "HTTPSConnectionPool(host='mis.twse.com.tw', port=443): Read timed out. (read timeout=15)",
+    "HTTPSConnectionPool(host='mis.twse.com.tw', port=443): Read timed out. (read timeout=15)"
+  ],
   "note": "前台應以 data/live_intraday_meta.json 的 updated_at 判斷資料是否真的更新；不要只看 Streamlit rerun 時間。"
 }
