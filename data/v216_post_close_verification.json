@@ -1,12 +1,12 @@
 {
-  "updated_at": "2026-11-02T15:27:41.936025+08:00",
+  "updated_at": "2026-11-03T15:22:46.586133+08:00",
   "status": "ok",
   "session_mode": "post_close_verify",
-  "journal_count": 18193,
+  "journal_count": 18373,
   "sync": {
     "ok": true,
-    "inserted": 0,
-    "updated": 120,
+    "inserted": 15,
+    "updated": 105,
     "skipped": 0,
     "sent": 120,
     "message": "1/6 ok; 2/6 ok; 3/6 ok; 4/6 ok; 5/6 ok; 6/6 ok"
