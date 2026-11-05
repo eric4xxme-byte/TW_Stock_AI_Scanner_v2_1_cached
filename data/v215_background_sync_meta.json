@@ -1,10 +1,10 @@
 {
-  "updated_at": "2026-11-05T20:51:09.064066+08:00",
+  "updated_at": "2026-11-05T21:01:42.317499+08:00",
   "status": "ok",
   "session_mode": "night_context",
-  "pool_count": 120,
-  "quote_raw_count": 112,
-  "live_count": 111,
+  "pool_count": 180,
+  "quote_raw_count": 168,
+  "live_count": 167,
   "journal_count": 18762,
   "sync": {
     "ok": true,
